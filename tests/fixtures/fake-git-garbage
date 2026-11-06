@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test double for src/git.rs: reads all of stdin, then prints something
+# that is neither an object id nor `ls-files -s -z` output, and exits 0.
+cat >/dev/null
+echo 'not an object id'
