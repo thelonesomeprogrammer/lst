@@ -9,4 +9,5 @@
 pub mod crypto;
 pub mod envfile;
 pub mod format;
+pub mod git;
 pub mod marker;
