@@ -60,6 +60,14 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
 - **`lst render` is read-only:** it never writes `.sec/`. A gen name with no entry fails with a hint to run `lst sync`.
 - **Substitution is raw text.** `render` doesn't quote or escape for YAML (it also renders non-YAML files). Generated formats are always YAML-safe as plain scalars. A marker for a manual secret that may contain `"`, `#`, `: ` or newlines must sit in a suitably quoted YAML scalar; this is documented for users, not enforced.
 
+### Pre-commit hook (decided 2026-11-06, before M2)
+- **Finding lst:** the hook script runs `lst hook run` from PATH. If `lst` isn't on PATH the commit is **blocked**, never skipped. `lst init` installs the hook (also when already initialised); other machines run `lst hook install`. A foreign pre-commit hook is never overwritten without `--force`. Installed into `git rev-parse --git-path hooks` (respects `core.hooksPath`).
+- **Source of truth is the index:** the hook reads every staged file under `stacks/<stack>/` (not only changed ones) so orphan marking stays correct; `GIT_INDEX_FILE` is honoured (`git commit -a`, partial staging).
+- **Scan scope:** every staged file under `stacks/<stack>/` carries markers (set processing, gen sync, orphans). `lst sync` uses the same scope in the working tree; `render` still renders only `compose.yaml` until M4. A `<<set:` anywhere else (outside `stacks/`, or in a non-UTF-8 file) blocks the commit.
+- **Leftover plaintext blob:** `git add` of a file with `<<set:…>>` already wrote the plaintext as a blob in `.git/objects`. The hook keeps it out of every commit, but the dangling blob stays locally until `git gc` prunes it. Accepted (local only, never pushed, same trust level as `.env`); documented, and the hook prints a `git gc --prune=now` hint after processing a set.
+- **Working-tree rewrite:** only the identical `<<set:name:VALUE>>` text is replaced by `<<secret:name>>`; if the working tree no longer holds that exact marker, it's left alone with a warning (the next commit processes it). Partial staging is preserved.
+- **Renames:** `lst rename <stack>/<old> <new>` moves a gen entry keeping its id (value unchanged) or re-encrypts a manual secret under the new name. An existing target needs `--replace` (the common case: the commit already gave the new name a fresh id). When one name disappears and one appears in the same stack, the hook prints the exact command.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).

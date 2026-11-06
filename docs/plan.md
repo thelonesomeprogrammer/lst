@@ -58,6 +58,7 @@ lst/
 | `lst deploy <stack>` / `--all` | Checks → render files → pre → `compose up --wait` → post |
 | `lst check` | Is `.sec/` current, no committed `<<set:`, all secrets resolvable? (used by CI and deploy) |
 | `lst hook install` / `lst hook run` | Install / run the pre-commit logic |
+| `lst rename <stack>/<old> <new>` | Rename keeping the value (`--replace` if the target exists) |
 | `lst rotate <stack>/<name>` | New id → new value |
 | `lst gc` | List or remove orphans (explicit) |
 
@@ -82,6 +83,8 @@ lst/
 - Process `<<set:name:VALUE>>`: encrypt → store → rewrite to `<<secret:name>>` in **both** the index (`git hash-object -w` + `git update-index --cacheinfo`, which preserves partial staging) and the working tree.
 - Block the commit on unset `<<secret:…>>` and on malformed markers.
 - `git add .sec/`, then exit 0 silently when nothing changed.
+- `lst rename <stack>/<old> <new> [--replace]` (keeps the id / re-seals), printed as a hint for one-out-one-in changes.
+- `lst sync` scans every file under `stacks/<stack>/` (same scope as the hook); `lst init` installs the hook.
 - _Done when:_ e2e tests cover new gen names, a `set` round-trip, partial staging, and the block cases.
 
 ### M3 — `deploy` + `check` + Woodpecker
