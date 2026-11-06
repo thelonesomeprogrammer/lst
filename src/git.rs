@@ -334,6 +334,14 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("could not run git"));
+        let env = Path::new(ENV_FILE);
+        for err in [
+            is_ignored_with(missing.as_os_str(), dir.path(), env).unwrap_err(),
+            is_tracked_with(missing.as_os_str(), dir.path(), env).unwrap_err(),
+            ensure_env_ignored_with(missing.as_os_str(), dir.path()).unwrap_err(),
+        ] {
+            assert!(matches!(err, GitError::Spawn(_)), "{err:?}");
+        }
     }
 
     #[test]
