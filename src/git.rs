@@ -117,6 +117,14 @@ pub fn not_found(e: &io::Error) -> bool {
     )
 }
 
+/// `fs::symlink_metadata`, with "nothing there" (see [`not_found`]) as
+/// `None` rather than an error.
+pub fn lstat(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    fs::symlink_metadata(path)
+        .map(Some)
+        .or_else(|e| if not_found(&e) { Ok(None) } else { Err(e) })
+}
+
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> GitError + '_ {
     move |source| GitError::Io {
         path: path.to_owned(),
@@ -578,10 +586,7 @@ fn worktree_files_with(
             lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
         })?;
         let full = root.join(&path);
-        let exists = fs::symlink_metadata(&full)
-            .map(|_| true)
-            .or_else(|e| if not_found(&e) { Ok(false) } else { Err(e) });
-        if exists.map_err(io_err(&full))? {
+        if lstat(&full).map_err(io_err(&full))?.is_some() {
             paths.push(path);
         }
     }
@@ -1541,6 +1546,29 @@ mod tests {
                 .contains("in the working tree is not valid UTF-8")
         );
 
+        // An index entry that can't exist in the working tree (a name longer
+        // than NAME_MAX) fails the existence check rather than vanishing.
+        let r = repo();
+        // (stacks/ must exist, or the lookup fails there with ENOENT.)
+        fs::create_dir(r.path().join("stacks")).unwrap();
+        let long = format!("stacks/{}", "x".repeat(300));
+        sh_git(
+            r.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                OID_A,
+                &long,
+            ],
+        );
+        let err = worktree_files(r.path(), "stacks/").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Io { path, .. } if path == &r.path().join(&long)),
+            "{err:?}"
+        );
+
         let dir = tempfile::tempdir().unwrap();
         let err = worktree_files(dir.path(), "stacks/").unwrap_err();
         assert!(
@@ -1562,6 +1590,14 @@ mod tests {
         assert!(!not_found(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), "").unwrap();
+        assert!(lstat(&dir.path().join("f")).unwrap().unwrap().is_file());
+        assert!(lstat(&dir.path().join("missing")).unwrap().is_none());
+        assert!(lstat(&dir.path().join("f/below-a-file")).unwrap().is_none());
+        // Any other failure is an error (a name longer than NAME_MAX).
+        assert!(lstat(&dir.path().join("x".repeat(300))).is_err());
     }
 
     #[test]

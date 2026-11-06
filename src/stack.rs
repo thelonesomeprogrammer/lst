@@ -131,14 +131,13 @@ pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
             continue;
         }
         let compose = path.join(COMPOSE_FILE);
-        match fs::symlink_metadata(&compose) {
-            Ok(m) if m.file_type().is_symlink() => {
+        match crate::git::lstat(&compose).map_err(io_err(&compose))? {
+            None => continue,
+            Some(m) if m.file_type().is_symlink() => {
                 return Err(StackError::Symlink { path: compose });
             }
-            Ok(m) if m.is_file() => {}
-            Ok(_) => return Err(StackError::ComposeNotAFile { path: compose }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(io_err(&compose)(e)),
+            Some(m) if m.is_file() => {}
+            Some(_) => return Err(StackError::ComposeNotAFile { path: compose }),
         }
         let Some(name) = file_name.to_str() else {
             return Err(StackError::NonUtf8Name { path });
