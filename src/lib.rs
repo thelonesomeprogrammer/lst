@@ -5,3 +5,5 @@
 //! environment variables; `crypto` only uses the OS random generator).
 #![forbid(unsafe_code)]
 
+
+pub mod crypto;
