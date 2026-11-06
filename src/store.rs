@@ -99,6 +99,8 @@ pub enum StoreError {
     InvalidStack(String),
     #[error("invalid secret name {0:?}")]
     InvalidName(String),
+    #[error("invalid full secret name {0:?} (expected <stack>/<name> or shared/<name>)")]
+    InvalidFullName(String),
     #[error("wrong seed: its fingerprint does not match .sec/meta.toml")]
     FingerprintMismatch,
     #[error("`{name}` is used with two different formats: {first} and {second}")]
@@ -109,8 +111,34 @@ pub enum StoreError {
     },
     #[error("`{name}` is used both as <<gen:…>> and as <<secret:…>>")]
     KindConflict { name: String },
-    #[error("`{name}`: <<set:…>> is processed by the pre-commit hook, which is not supported yet")]
+    #[error(
+        "`{name}`: <<set:…>> is processed by the pre-commit hook (it stores the value first); \
+         sync does not take values"
+    )]
     SetUnsupported { name: String },
+    #[error("`{name}` has no entry in .sec/ to rename")]
+    RenameSourceMissing { name: String },
+    #[error(
+        "`{name}` exists both as <<gen:…>> and as <<secret:…>> in .sec/, so lst cannot tell \
+         which one to rename"
+    )]
+    RenameAmbiguous { name: String },
+    #[error("cannot rename `{name}` to itself")]
+    RenameToItself { name: String },
+    #[error(
+        "`{name}` already exists in .sec/; pass --replace to overwrite it with the renamed entry"
+    )]
+    RenameTargetExists { name: String },
+    #[error(
+        "`{to}` exists in .sec/ as {existing}, but `{from}` is {moving}; lst rename only \
+         replaces an entry of the same kind"
+    )]
+    RenameKindMismatch {
+        from: String,
+        to: String,
+        moving: EntryKind,
+        existing: EntryKind,
+    },
     #[error("`{name}`: {source}")]
     Crypto {
         name: String,
@@ -135,8 +163,8 @@ pub enum ResolveError {
     #[error("`{name}` is not set; write <<set:{marker_name}:VALUE>> to set it")]
     SecretUnset { name: String, marker_name: String },
     #[error(
-        "`{name}`: <<set:…>> cannot be rendered; it is processed by the pre-commit hook \
-         (not supported yet)"
+        "`{name}`: <<set:…>> cannot be rendered; commit the file first, the pre-commit hook \
+         stores the value and rewrites the marker"
     )]
     SetMarker { name: String },
     #[error("`{name}`: {source}")]
@@ -183,6 +211,25 @@ pub fn scope(stack: &str, name: &str) -> Result<Scope, StoreError> {
 
 fn full_name(file: &str, key: &str) -> String {
     format!("{file}/{key}")
+}
+
+/// Parses a full name as errors and reports print it: `<stack>/<name>` or
+/// `shared/<name>`. The first `/` separates the file from the key, so
+/// `web/foo/bar` is key `foo/bar` of stack `web`. A stack key starting
+/// with `shared/` is refused (such names live in `shared`).
+pub fn parse_full_name(full: &str) -> Result<Scope, StoreError> {
+    let invalid = || StoreError::InvalidFullName(full.to_owned());
+    let (file, key) = full.split_once('/').ok_or_else(invalid)?;
+    let valid_file = file == SHARED || is_valid_stack(file);
+    let valid_key = is_valid_name(key) && (file == SHARED || !key.starts_with(SHARED_PREFIX));
+    if !(valid_file && valid_key) {
+        return Err(invalid());
+    }
+    Ok(Scope {
+        file: file.to_owned(),
+        key: key.to_owned(),
+        full_name: full.to_owned(),
+    })
 }
 
 /// A stack name usable as a `.sec/` file stem: `[A-Za-z0-9._-]+`, not
@@ -269,6 +316,13 @@ pub struct SyncReport {
     pub unorphaned: Vec<String>,
     /// `<<secret:…>>` names with no stored value (not an error in sync).
     pub unset: Vec<String>,
+    /// Likely renames, `(old, new)` full names: within one file (a stack or
+    /// `shared`) and one kind, exactly one entry was orphaned and exactly
+    /// one name appeared in this sync. For gen names "appeared" means
+    /// [`added`](Self::added); for manual secrets it means exactly one
+    /// [`unset`](Self::unset) name. Only a hint: both names are also in the
+    /// other lists, so [`is_empty`](Self::is_empty) ignores this list.
+    pub rename_candidates: Vec<(String, String)>,
 }
 
 impl SyncReport {
@@ -286,7 +340,52 @@ impl SyncReport {
         self.orphaned.sort();
         self.unorphaned.sort();
         self.unset.sort();
+        self.rename_candidates.sort();
     }
+}
+
+/// Names that left and entered one file and kind during a sync, for
+/// [`SyncReport::rename_candidates`].
+#[derive(Default)]
+struct Moves {
+    out: Vec<String>,
+    into: Vec<String>,
+}
+
+/// The two kinds of `.sec/` entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryKind {
+    /// A `[gen.*]` entry (generated secret).
+    Gen,
+    /// A `[secret.*]` entry (manual secret).
+    Secret,
+}
+
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EntryKind::Gen => "<<gen:…>>",
+            EntryKind::Secret => "<<secret:…>>",
+        })
+    }
+}
+
+/// What [`Store::rename`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameOutcome {
+    /// Full name before the rename.
+    pub from: String,
+    /// Full name after the rename.
+    pub to: String,
+    pub kind: EntryKind,
+    /// Whether an existing entry of `to` was overwritten.
+    pub replaced: bool,
+}
+
+/// An entry on its way to its new name.
+enum Moved {
+    Gen(GenEntry),
+    Secret(SecretEntry),
 }
 
 #[derive(Clone, Copy)]
@@ -384,6 +483,12 @@ impl Store {
         // 2. Apply to a copy, so a failure leaves `self` untouched.
         let mut files = self.files.clone();
         let mut report = SyncReport::default();
+        let mut moves: BTreeMap<(String, EntryKind), Moves> = BTreeMap::new();
+        let mut moved = |stem: &str, kind, name: &str, out: bool| {
+            let m = moves.entry((stem.to_owned(), kind)).or_default();
+            let list = if out { &mut m.out } else { &mut m.into };
+            list.push(name.to_owned());
+        };
         for (stem, keys) in &used {
             for (key, u) in keys {
                 let name = full_name(stem, key);
@@ -413,6 +518,7 @@ impl Store {
                                     format,
                                     orphan: false,
                                 });
+                                moved(stem, EntryKind::Gen, &name, false);
                                 report.added.push(name);
                             }
                         }
@@ -425,7 +531,10 @@ impl Store {
                                 report.unorphaned.push(name);
                             }
                             Some(_) => {}
-                            None => report.unset.push(name),
+                            None => {
+                                moved(stem, EntryKind::Secret, &name, false);
+                                report.unset.push(name);
+                            }
                         }
                     }
                 }
@@ -440,14 +549,23 @@ impl Store {
             for (key, e) in &mut file.generated {
                 if !e.orphan && !matches!(use_of(key), Some(Use::Gen(_))) {
                     e.orphan = true;
-                    report.orphaned.push(full_name(stem, key));
+                    let name = full_name(stem, key);
+                    moved(stem, EntryKind::Gen, &name, true);
+                    report.orphaned.push(name);
                 }
             }
             for (key, e) in &mut file.secrets {
                 if !e.orphan && !matches!(use_of(key), Some(Use::Secret)) {
                     e.orphan = true;
-                    report.orphaned.push(full_name(stem, key));
+                    let name = full_name(stem, key);
+                    moved(stem, EntryKind::Secret, &name, true);
+                    report.orphaned.push(name);
                 }
+            }
+        }
+        for m in moves.into_values() {
+            if let ([old], [new]) = (m.out.as_slice(), m.into.as_slice()) {
+                report.rename_candidates.push((old.clone(), new.clone()));
             }
         }
 
@@ -495,6 +613,103 @@ impl Store {
             }
         }
         Ok(true)
+    }
+
+    /// Renames the entry `from` to `to` (full names, see
+    /// [`parse_full_name`]), across files if needed (`web/db` →
+    /// `shared/db`).
+    ///
+    /// - A gen entry keeps its id and format, so its value is unchanged.
+    /// - A manual secret is decrypted under `from` and sealed under `to`
+    ///   (the ciphertext is bound to its name) with a fresh nonce.
+    ///
+    /// The moved entry is not an orphan. An existing `to` of the same kind
+    /// is only overwritten with `replace`; one of the other kind is never
+    /// overwritten (that would leave a gen and a secret of one name). A
+    /// source that exists as both kinds is refused as ambiguous. Other
+    /// entries are never touched. Atomic: on error the store is unchanged.
+    /// The source file stays in the store even if it becomes empty.
+    pub fn rename(
+        &mut self,
+        seed: &Seed,
+        from: &str,
+        to: &str,
+        replace: bool,
+    ) -> Result<RenameOutcome, StoreError> {
+        self.verify_seed(seed)?;
+        let from = parse_full_name(from)?;
+        let to = parse_full_name(to)?;
+        if from.full_name == to.full_name {
+            return Err(StoreError::RenameToItself {
+                name: from.full_name,
+            });
+        }
+
+        // Work on a copy, so a failure leaves `self` untouched.
+        let mut files = self.files.clone();
+        let src = files.entry(from.file.clone()).or_default();
+        let (kind, entry) = match (
+            src.generated.remove(&from.key),
+            src.secrets.remove(&from.key),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(StoreError::RenameAmbiguous {
+                    name: from.full_name,
+                });
+            }
+            (None, None) => {
+                return Err(StoreError::RenameSourceMissing {
+                    name: from.full_name,
+                });
+            }
+            (Some(g), None) => (EntryKind::Gen, Moved::Gen(g)),
+            (None, Some(s)) => (EntryKind::Secret, Moved::Secret(s)),
+        };
+
+        let dst = files.entry(to.file.clone()).or_default();
+        let has_gen = dst.generated.contains_key(&to.key);
+        let has_secret = dst.secrets.contains_key(&to.key);
+        let (same, other) = match kind {
+            EntryKind::Gen => (has_gen, has_secret.then_some(EntryKind::Secret)),
+            EntryKind::Secret => (has_secret, has_gen.then_some(EntryKind::Gen)),
+        };
+        if let Some(existing) = other {
+            return Err(StoreError::RenameKindMismatch {
+                from: from.full_name,
+                to: to.full_name,
+                moving: kind,
+                existing,
+            });
+        }
+        if same && !replace {
+            return Err(StoreError::RenameTargetExists { name: to.full_name });
+        }
+
+        match entry {
+            Moved::Gen(g) => {
+                let moved = GenEntry { orphan: false, ..g };
+                dst.generated.insert(to.key, moved);
+            }
+            Moved::Secret(s) => {
+                let key = crypto::encryption_key(seed);
+                let value = crypto::open(&key, &from.full_name, &s.sealed)
+                    .map_err(crypto_err(&from.full_name))?;
+                let sealed = crypto::seal(&key, &to.full_name, value.expose())
+                    .map_err(crypto_err(&to.full_name))?;
+                let moved = SecretEntry {
+                    sealed,
+                    orphan: false,
+                };
+                dst.secrets.insert(to.key, moved);
+            }
+        }
+        self.files = files;
+        Ok(RenameOutcome {
+            from: from.full_name,
+            to: to.full_name,
+            kind,
+            replaced: same,
+        })
     }
 
     /// The value of `marker` as used in `stack`. Read-only. Orphaned
@@ -1767,6 +1982,406 @@ orphan = false
         ));
         assert!(err.to_string().starts_with("`web/cf`: decryption failed"));
         assert_eq!(store.files()["web"].secrets["cf"], tampered);
+    }
+
+    // --- rename candidates -------------------------------------------------
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn sync_reports_one_out_one_in_as_rename_candidates() {
+        let s1 = seed(1);
+        let mut store = Store::init(&s1);
+        store
+            .sync(&uses(&[
+                ("web", vec![gen_m("db", "uuid"), gen_m("keep", "uuid")]),
+                ("app", vec![gen_m("shared/mqtt", "uuid")]),
+            ]))
+            .unwrap();
+        store.set_secret(&s1, "web", "cf", "v").unwrap();
+        store.set_secret(&s1, "app", "shared/smtp", "v").unwrap();
+        let report = store
+            .sync(&uses(&[
+                (
+                    "web",
+                    vec![
+                        gen_m("database", "uuid"),
+                        gen_m("keep", "uuid"),
+                        secret_m("cloudflare"),
+                    ],
+                ),
+                (
+                    "app",
+                    vec![gen_m("shared/broker", "uuid"), secret_m("shared/mail")],
+                ),
+            ]))
+            .unwrap();
+        assert_eq!(
+            report.rename_candidates,
+            pairs(&[
+                ("shared/mqtt", "shared/broker"),
+                ("shared/smtp", "shared/mail"),
+                ("web/cf", "web/cloudflare"),
+                ("web/db", "web/database"),
+            ])
+        );
+        // Reported once: the next sync orphans nothing.
+        let report = store
+            .sync(&uses(&[(
+                "web",
+                vec![gen_m("database", "uuid"), gen_m("keep", "uuid")],
+            )]))
+            .unwrap();
+        assert!(report.rename_candidates.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn rename_candidates_need_exactly_one_of_each_in_one_file_and_kind() {
+        let base = || {
+            let s1 = seed(1);
+            let mut store = Store::init(&s1);
+            store
+                .sync(&uses(&[(
+                    "web",
+                    vec![gen_m("a", "uuid"), gen_m("b", "uuid")],
+                )]))
+                .unwrap();
+            store.set_secret(&s1, "web", "s", "v").unwrap();
+            store
+        };
+        let none = |u: BTreeMap<String, Vec<MarkerKind>>| {
+            let report = base().sync(&u).unwrap();
+            assert!(report.rename_candidates.is_empty(), "{report:?}");
+            report
+        };
+        // Two out, one in.
+        none(uses(&[("web", vec![gen_m("c", "uuid"), secret_m("s")])]));
+        // One out, two in.
+        none(uses(&[(
+            "web",
+            vec![
+                gen_m("a", "uuid"),
+                gen_m("c", "uuid"),
+                gen_m("d", "uuid"),
+                secret_m("s"),
+            ],
+        )]));
+        // Cross-kind: a gen leaves and a secret appears, or the reverse.
+        let r = none(uses(&[(
+            "web",
+            vec![gen_m("a", "uuid"), secret_m("s"), secret_m("t")],
+        )]));
+        assert_eq!(r.orphaned, names(&["web/b"]));
+        let r = none(uses(&[(
+            "web",
+            vec![gen_m("a", "uuid"), gen_m("b", "uuid"), gen_m("t", "uuid")],
+        )]));
+        assert_eq!(r.orphaned, names(&["web/s"]));
+        // Cross-file: web/b leaves, other/b appears.
+        none(uses(&[
+            ("web", vec![gen_m("a", "uuid"), secret_m("s")]),
+            ("other", vec![gen_m("b", "uuid")]),
+        ]));
+        // Cross-file into shared.
+        none(uses(&[(
+            "web",
+            vec![gen_m("a", "uuid"), gen_m("shared/b", "uuid"), secret_m("s")],
+        )]));
+        // Candidates alone never make a report non-empty.
+        let only = SyncReport {
+            rename_candidates: pairs(&[("web/a", "web/b")]),
+            ..Default::default()
+        };
+        assert!(only.is_empty());
+    }
+
+    // --- rename --------------------------------------------------------------
+
+    #[test]
+    fn parse_full_name_rules() {
+        for (full, file, key) in [
+            ("web/db", "web", "db"),
+            ("shared/x", "shared", "x"),
+            ("web/foo/bar", "web", "foo/bar"),
+            ("shared/shared/x", "shared", "shared/x"),
+            ("web/shared", "web", "shared"),
+        ] {
+            let s = parse_full_name(full).unwrap();
+            assert_eq!((s.file.as_str(), s.key.as_str()), (file, key), "{full}");
+            assert_eq!(s.full_name, full);
+        }
+        for bad in [
+            "",
+            "db",
+            "web/",
+            "/db",
+            "web//db",
+            "web/a:b",
+            "meta/x",
+            "Shared/x",
+            ".x/y",
+            "web/shared/x",
+            "a b/c",
+        ] {
+            let err = parse_full_name(bad).unwrap_err();
+            assert!(
+                matches!(&err, StoreError::InvalidFullName(n) if n == bad),
+                "{bad:?}: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("expected <stack>/<name> or shared/<name>")
+            );
+        }
+    }
+
+    fn renamable() -> (Seed, Store) {
+        let s1 = seed(1);
+        let mut store = Store::init(&s1);
+        store
+            .sync(&uses(&[
+                (
+                    "web",
+                    vec![
+                        gen_m("db", "hex64"),
+                        gen_m("other", "uuid"),
+                        gen_m("shared/x", "alnum32"),
+                    ],
+                ),
+                ("api", vec![gen_m("db", "uuid")]),
+            ]))
+            .unwrap();
+        store.set_secret(&s1, "web", "cf", "t0ken:value").unwrap();
+        (s1, store)
+    }
+
+    fn resolved(store: &Store, seed: &Seed, stack: &str, m: &MarkerKind) -> String {
+        store.resolve(seed, stack, m).unwrap().expose().to_owned()
+    }
+
+    #[test]
+    fn rename_gen_keeps_id_and_value_and_unorphans() {
+        let (s1, mut store) = renamable();
+        let before = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        let id = gen_entry(&store, "web", "db").id;
+        store
+            .files
+            .get_mut("web")
+            .unwrap()
+            .generated
+            .get_mut("db")
+            .unwrap()
+            .orphan = true;
+        let other = store.files()["api"].clone();
+
+        let out = store.rename(&s1, "web/db", "web/database", false).unwrap();
+        assert_eq!(
+            out,
+            RenameOutcome {
+                from: "web/db".into(),
+                to: "web/database".into(),
+                kind: EntryKind::Gen,
+                replaced: false,
+            }
+        );
+        let e = gen_entry(&store, "web", "database");
+        assert_eq!((e.id, e.format, e.orphan), (id, Format::Hex(64), false));
+        assert!(!store.files()["web"].generated.contains_key("db"));
+        assert_eq!(
+            resolved(&store, &s1, "web", &gen_m("database", "hex64")),
+            before
+        );
+        // Other entries untouched.
+        assert_eq!(store.files()["api"], other);
+        assert!(store.files()["web"].generated.contains_key("other"));
+        assert!(store.files()["web"].secrets.contains_key("cf"));
+    }
+
+    #[test]
+    fn rename_gen_across_scopes() {
+        let (s1, mut store) = renamable();
+        let db = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        let x = resolved(&store, &s1, "web", &gen_m("shared/x", "alnum32"));
+
+        // stack → shared.
+        store.rename(&s1, "web/db", "shared/db", false).unwrap();
+        assert_eq!(
+            resolved(&store, &s1, "api", &gen_m("shared/db", "hex64")),
+            db
+        );
+        // shared → stack; shared.toml is left empty but kept.
+        store.rename(&s1, "shared/x", "api/x", false).unwrap();
+        assert_eq!(resolved(&store, &s1, "api", &gen_m("x", "alnum32")), x);
+        assert!(store.files()["shared"].generated.contains_key("db"));
+        store.rename(&s1, "shared/db", "web/db", false).unwrap();
+        assert_eq!(store.files()["shared"], StackFile::default());
+        assert_eq!(store.to_files()["shared.toml"], HEADER);
+        // Into a file that doesn't exist yet.
+        store.rename(&s1, "web/db", "new/db", false).unwrap();
+        assert_eq!(resolved(&store, &s1, "new", &gen_m("db", "hex64")), db);
+    }
+
+    #[test]
+    fn rename_secret_reseals_under_the_new_name() {
+        let (s1, mut store) = renamable();
+        let old = store.files()["web"].secrets["cf"].clone();
+        let mut orphaned = store.clone();
+        let key = crypto::encryption_key(&s1);
+
+        let out = store
+            .rename(&s1, "web/cf", "web/cloudflare", false)
+            .unwrap();
+        assert_eq!((out.kind, out.replaced), (EntryKind::Secret, false));
+        let e = &store.files()["web"].secrets["cloudflare"];
+        assert!(!e.orphan);
+        assert_ne!(e.sealed.nonce, old.sealed.nonce);
+        assert!(!store.files()["web"].secrets.contains_key("cf"));
+        // Bound to the new name only.
+        assert_eq!(
+            crypto::open(&key, "web/cloudflare", &e.sealed)
+                .unwrap()
+                .expose(),
+            "t0ken:value"
+        );
+        assert!(crypto::open(&key, "web/cf", &e.sealed).is_err());
+        assert_eq!(
+            resolved(&store, &s1, "web", &secret_m("cloudflare")),
+            "t0ken:value"
+        );
+
+        // Across scopes, from an orphaned entry.
+        secret_entry_mut(&mut orphaned, "web", "cf").orphan = true;
+        orphaned.rename(&s1, "web/cf", "shared/cf", false).unwrap();
+        assert!(!orphaned.files()["shared"].secrets["cf"].orphan);
+        assert_eq!(
+            resolved(&orphaned, &s1, "any", &secret_m("shared/cf")),
+            "t0ken:value"
+        );
+        orphaned.rename(&s1, "shared/cf", "api/cf", false).unwrap();
+        assert_eq!(
+            resolved(&orphaned, &s1, "api", &secret_m("cf")),
+            "t0ken:value"
+        );
+    }
+
+    #[test]
+    fn rename_replace_overwrites_an_entry_of_the_same_kind() {
+        let (s1, mut store) = renamable();
+        let db = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        let id = gen_entry(&store, "web", "db").id;
+
+        let before = store.clone();
+        let err = store.rename(&s1, "web/db", "web/other", false).unwrap_err();
+        assert!(matches!(err, StoreError::RenameTargetExists { ref name } if name == "web/other"));
+        assert_eq!(
+            err.to_string(),
+            "`web/other` already exists in .sec/; pass --replace to overwrite it with the \
+             renamed entry"
+        );
+        assert_eq!(store, before);
+
+        let out = store.rename(&s1, "web/db", "web/other", true).unwrap();
+        assert!(out.replaced);
+        // The source's id and format win.
+        let e = gen_entry(&store, "web", "other");
+        assert_eq!((e.id, e.format), (id, Format::Hex(64)));
+        assert_eq!(resolved(&store, &s1, "web", &gen_m("other", "hex64")), db);
+
+        // --replace without an existing target is just a rename.
+        let out = store.rename(&s1, "web/other", "web/db", true).unwrap();
+        assert!(!out.replaced);
+
+        // Secrets too.
+        store.set_secret(&s1, "web", "cf2", "second").unwrap();
+        let before = store.clone();
+        assert!(matches!(
+            store.rename(&s1, "web/cf", "web/cf2", false),
+            Err(StoreError::RenameTargetExists { .. })
+        ));
+        assert_eq!(store, before);
+        assert!(
+            store
+                .rename(&s1, "web/cf", "web/cf2", true)
+                .unwrap()
+                .replaced
+        );
+        assert_eq!(
+            resolved(&store, &s1, "web", &secret_m("cf2")),
+            "t0ken:value"
+        );
+    }
+
+    #[test]
+    fn rename_errors_leave_the_store_unchanged() {
+        let (s1, mut store) = renamable();
+        store.set_secret(&s1, "web", "other", "v").unwrap();
+        store.set_secret(&s1, "web", "lone", "v").unwrap();
+        let before = store.clone();
+        let check = |store: &mut Store, from: &str, to: &str, replace: bool| {
+            let err = store.rename(&s1, from, to, replace).unwrap_err();
+            assert_eq!(*store, before);
+            err
+        };
+
+        let err = store.rename(&seed(2), "web/db", "web/x", true).unwrap_err();
+        assert!(matches!(err, StoreError::FingerprintMismatch));
+        assert_eq!(store, before);
+        let err = check(&mut store, "db", "web/x", false);
+        assert!(matches!(err, StoreError::InvalidFullName(ref n) if n == "db"));
+        let err = check(&mut store, "web/db", "web/a:b", false);
+        assert!(matches!(err, StoreError::InvalidFullName(ref n) if n == "web/a:b"));
+
+        let err = check(&mut store, "web/nope", "web/x", true);
+        assert_eq!(
+            err.to_string(),
+            "`web/nope` has no entry in .sec/ to rename"
+        );
+        let err = check(&mut store, "gone/db", "web/x", true);
+        assert!(matches!(err, StoreError::RenameSourceMissing { ref name } if name == "gone/db"));
+
+        let err = check(&mut store, "web/db", "web/db", true);
+        assert_eq!(err.to_string(), "cannot rename `web/db` to itself");
+
+        // web/other exists as gen and as secret.
+        let err = check(&mut store, "web/other", "web/x", true);
+        assert!(matches!(err, StoreError::RenameAmbiguous { ref name } if name == "web/other"));
+        assert!(err.to_string().contains("cannot tell which one to rename"));
+
+        // Other kind at the target: refused even with --replace.
+        let err = check(&mut store, "web/db", "web/lone", true);
+        assert_eq!(
+            err.to_string(),
+            "`web/lone` exists in .sec/ as <<secret:…>>, but `web/db` is <<gen:…>>; lst rename \
+             only replaces an entry of the same kind"
+        );
+        let err = check(&mut store, "web/lone", "api/db", true);
+        assert!(matches!(
+            err,
+            StoreError::RenameKindMismatch {
+                moving: EntryKind::Secret,
+                existing: EntryKind::Gen,
+                ..
+            }
+        ));
+        assert!(
+            err.to_string()
+                .contains("as <<gen:…>>, but `web/lone` is <<secret:…>>")
+        );
+
+        // A ciphertext that doesn't decrypt is never moved.
+        secret_entry_mut(&mut store, "web", "cf").sealed.ciphertext[0] ^= 1;
+        let before = store.clone();
+        let err = store.rename(&s1, "web/cf", "web/x", false).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Crypto { ref name, source: CryptoError::Decrypt } if name == "web/cf"
+        ));
+        assert_eq!(store, before);
+        assert!(!format!("{err:?}").contains("t0ken"));
     }
 
     // --- resolve -----------------------------------------------------------

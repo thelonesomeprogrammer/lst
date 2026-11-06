@@ -351,7 +351,7 @@ fn sync_refuses_set_markers_without_leaking_the_value() {
     repo.compose("web", "a: <<gen:db>>\nb: <<set:cf:sup3r-s3cret>>\n");
     let before = repo.snapshot();
     let run = repo.lst(&["sync"]);
-    run.fails_with(&["`web/cf`", "pre-commit hook"]);
+    run.fails_with(&["<<set:cf:…>>", "pre-commit hook"]);
     assert!(!run.stderr.contains("sup3r"), "{run:#?}");
     assert_eq!(repo.snapshot(), before);
 
@@ -411,6 +411,310 @@ fn sync_reports_bad_stacks_and_store_conflicts() {
     repo.compose("web", "a: <<gen:db>>\nb: <<gen:db:uuid>>\n");
     repo.lst(&["sync"])
         .fails_with(&["`web/db` is used with two different formats"]);
+}
+
+// ---------------------------------------------------------------------------
+// sync: scan scope (every file under stacks/<stack>/)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sync_reads_every_file_under_a_stack() {
+    let repo = Repo::initialised();
+    repo.compose("x", "services: {}\n");
+    repo.write("stacks/x/config/app.conf", "password=<<gen:conf:hex32>>\n");
+    repo.write(
+        "stacks/x/a/b/c/deep.txt",
+        "<<gen:deep>> <<secret:shared/smtp>>\n",
+    );
+    repo.write("stacks/x/.hidden", "<<gen:dot>>\n");
+    // Skipped: .git directories, and non-UTF-8 files without <<set:.
+    repo.write("stacks/x/.git/config", "<<gen:bad name>>\n");
+    repo.write("stacks/x/sub/.git/x", "<<gen:also-skipped>>\n");
+    repo.write("stacks/x/data.bin", b"\xff\xfe<<gen:binary>>\n");
+    let run = repo.lst(&["sync"]);
+    run.ok();
+    assert_eq!(
+        run.stderr,
+        "lst: new: x/conf\nlst: new: x/deep\nlst: new: x/dot\n\
+         lst: not set: shared/smtp (render fails until it has a value)\n"
+    );
+    let store = repo.store();
+    assert_eq!(
+        store.files()["x"].generated.keys().collect::<Vec<_>>(),
+        ["conf", "deep", "dot"]
+    );
+    assert_eq!(store.files()["x"].generated["conf"].format, fmt("hex32"));
+    // render still renders only compose.yaml.
+    assert_eq!(repo.lst(&["render", "x"]).ok(), "services: {}\n");
+
+    // Deterministic: the same tree gives byte-identical .sec/ files.
+    let before = repo.snapshot();
+    repo.lst(&["sync"]).ok();
+    assert_eq!(repo.snapshot(), before);
+
+    // Removing the file orphans what only it used.
+    repo.remove("stacks/x/config/app.conf");
+    let run = repo.lst(&["sync"]);
+    run.ok();
+    assert!(
+        run.stderr
+            .contains("lst: orphaned: x/conf (no longer used; kept in .sec/)\n"),
+        "{run:#?}"
+    );
+}
+
+#[test]
+fn sync_scope_errors_name_the_real_file() {
+    let repo = Repo::initialised();
+    repo.compose("x", "a: <<gen:db>>\n");
+    let before = repo.snapshot();
+
+    // Parse errors keep path:line:col, and the first file in path order wins.
+    repo.write("stacks/x/b.conf", "<<gen:\n");
+    repo.write("stacks/x/a.conf", "ok\n  <<gen:db\n");
+    repo.lst(&["sync"])
+        .fails_with(&["lst: stacks/x/a.conf:2:3: unterminated marker"]);
+    repo.remove("stacks/x/a.conf");
+    repo.lst(&["sync"])
+        .fails_with(&["lst: stacks/x/b.conf:1:7: empty secret name"]);
+    repo.remove("stacks/x/b.conf");
+
+    // <<set: in a non-UTF-8 file blocks, without the value.
+    repo.write("stacks/x/bin/blob", b"\xff<<set:k:t0p-s3cret>>");
+    let run = repo.lst(&["sync"]);
+    run.fails_with(&["lst: stacks/x/bin/blob: not valid UTF-8 but contains `<<set:`"]);
+    assert!(!run.stderr.contains("t0p-s3cret"), "{run:#?}");
+    repo.remove("stacks/x/bin/blob");
+
+    // <<set: in any UTF-8 file: commit it, the hook stores it.
+    repo.write("stacks/x/config/app.conf", "k=<<set:k:t0p-s3cret>>\n");
+    let run = repo.lst(&["sync"]);
+    run.fails_with(&[
+        "lst: stacks/x/config/app.conf: <<set:k:…>> is stored by the pre-commit hook, not by \
+         `lst sync`: commit the file",
+        "rewrites the marker to <<secret:k>>",
+    ]);
+    assert!(!run.stderr.contains("t0p-s3cret"), "{run:#?}");
+    repo.remove("stacks/x/config/app.conf");
+
+    // A dangling symlink is an error, not a silently skipped file.
+    std::os::unix::fs::symlink("nowhere", repo.path().join("stacks/x/link")).unwrap();
+    repo.lst(&["sync"]).fails_with(&["stacks/x/link: "]);
+    repo.remove("stacks/x/link");
+
+    // None of the failures wrote anything.
+    assert_eq!(repo.snapshot(), before);
+}
+
+// ---------------------------------------------------------------------------
+// rename
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rename_keeps_a_generated_value() {
+    let repo = Repo::initialised();
+    repo.compose("web", "pw: <<gen:db>>\n");
+    repo.lst(&["sync"]).ok();
+    let old = repo.lst(&["render", "web"]).ok().to_owned();
+
+    repo.compose("web", "pw: <<gen:database>>\n");
+    let run = repo.lst(&["rename", "web/db", "database"]);
+    assert_eq!(run.ok(), "");
+    assert_eq!(
+        run.stderr,
+        "lst: renamed web/db -> web/database (generated secret; same id, so the value is \
+         unchanged)\n\
+         lst: lst rename does not edit your files: change the markers to the new name if you \
+         haven't yet, then commit .sec/\n"
+    );
+    assert_eq!(
+        repo.read("stacks/web/compose.yaml"),
+        "pw: <<gen:database>>\n"
+    );
+    assert_eq!(repo.lst(&["render", "web"]).ok(), old);
+    // .sec/ is current: sync has nothing to say.
+    let run = repo.lst(&["sync"]);
+    assert_eq!((run.ok(), run.stderr.as_str()), ("", ""));
+
+    // Across scopes and back, with a bare name for the same file.
+    repo.compose("web", "pw: <<gen:shared/pg>>\n");
+    repo.lst(&["rename", "web/database", "shared/db"]).ok();
+    repo.lst(&["rename", "shared/db", "pg"]).ok();
+    assert_eq!(repo.lst(&["render", "web"]).ok(), old);
+    repo.compose("web", "pw: <<gen:db>>\n");
+    repo.lst(&["rename", "shared/pg", "web/db"]).ok();
+    assert_eq!(repo.lst(&["render", "web"]).ok(), old);
+    // shared.toml is kept (empty), and stays deterministic.
+    assert_eq!(
+        repo.read(".sec/shared.toml"),
+        "# Managed by lst. Do not edit by hand.\n"
+    );
+}
+
+#[test]
+fn rename_after_sync_needs_replace_and_restores_the_old_value() {
+    let repo = Repo::initialised();
+    repo.compose("web", "pw: <<gen:db>>\n");
+    repo.lst(&["sync"]).ok();
+    let old = repo.lst(&["render", "web"]).ok().to_owned();
+
+    // The rename in compose gives the new name a fresh id …
+    repo.compose("web", "pw: <<gen:database>>\n");
+    let run = repo.lst(&["sync"]);
+    run.ok();
+    assert_eq!(
+        run.stderr,
+        "lst: new: web/database\n\
+         lst: orphaned: web/db (no longer used; kept in .sec/)\n\
+         lst: looks like a rename: run `lst rename web/db web/database --replace` to keep the \
+         old value\n"
+    );
+    let fresh = repo.lst(&["render", "web"]).ok().to_owned();
+    assert_ne!(fresh, old);
+
+    // … which rename only overwrites with --replace.
+    let before = repo.snapshot();
+    let run = repo.lst(&["rename", "web/db", "web/database"]);
+    run.fails_with(&["`web/database` already exists in .sec/; pass --replace"]);
+    assert_eq!(repo.snapshot(), before);
+
+    let run = repo.lst(&["rename", "web/db", "web/database", "--replace"]);
+    run.ok();
+    assert!(
+        run.stderr
+            .contains("lst: replaced the previous entry of web/database\n"),
+        "{run:#?}"
+    );
+    assert_eq!(repo.lst(&["render", "web"]).ok(), old);
+    let run = repo.lst(&["sync"]);
+    assert_eq!((run.ok(), run.stderr.as_str()), ("", ""));
+}
+
+#[test]
+fn rename_reseals_a_manual_secret() {
+    const VALUE: &str = "s3cr3t-v4lue";
+    let repo = Repo::initialised();
+    repo.compose("web", "t: <<secret:cf>>\n");
+    repo.lst(&["sync"]).ok();
+    let seed = repo.seed();
+    let mut store = repo.store();
+    store.set_secret(&seed, "web", "cf", VALUE).unwrap();
+    store.save(&repo.path().join(".sec")).unwrap();
+    let old_ct = repo.read(".sec/web.toml");
+
+    repo.compose("web", "t: <<secret:cloudflare>>\n");
+    let sync = repo.lst(&["sync"]);
+    sync.ok();
+    assert_eq!(
+        sync.stderr,
+        "lst: orphaned: web/cf (no longer used; kept in .sec/)\n\
+         lst: not set: web/cloudflare (render fails until it has a value)\n\
+         lst: looks like a rename: run `lst rename web/cf web/cloudflare --replace` to keep the \
+         old value\n"
+    );
+    let run = repo.lst(&["rename", "web/cf", "cloudflare"]);
+    run.ok();
+    assert!(
+        run.stderr.contains(
+            "renamed web/cf -> web/cloudflare (manual secret; re-encrypted under the new name)"
+        ),
+        "{run:#?}"
+    );
+    let render = repo.lst(&["render", "web"]);
+    assert_eq!(render.ok(), format!("t: {VALUE}\n"));
+    let store = repo.store();
+    assert!(!store.files()["web"].secrets.contains_key("cf"));
+    assert!(!store.files()["web"].secrets["cloudflare"].orphan);
+    assert_ne!(repo.read(".sec/web.toml"), old_ct);
+
+    // To shared/, into a file that doesn't exist yet.
+    repo.compose("web", "t: <<secret:shared/cf>>\n");
+    let run2 = repo.lst(&["rename", "web/cloudflare", "shared/cf"]);
+    run2.ok();
+    assert_eq!(repo.lst(&["render", "web"]).ok(), format!("t: {VALUE}\n"));
+
+    for r in [&sync, &run, &run2] {
+        assert!(
+            !r.stdout.contains(VALUE) && !r.stderr.contains(VALUE),
+            "{r:#?}"
+        );
+    }
+    for f in repo.snapshot().into_values() {
+        assert!(!String::from_utf8_lossy(&f).contains(VALUE));
+    }
+}
+
+#[test]
+fn rename_errors_change_nothing() {
+    let repo = Repo::initialised();
+    repo.compose("web", "a: <<gen:db>>\nb: <<gen:api>>\n");
+    repo.lst(&["sync"]).ok();
+    let mut store = repo.store();
+    store.set_secret(&repo.seed(), "web", "cf", "v").unwrap();
+    store.save(&repo.path().join(".sec")).unwrap();
+    let before = repo.snapshot();
+    for (args, needle) in [
+        (
+            &["rename", "web/nope", "x"][..],
+            "`web/nope` has no entry in .sec/ to rename",
+        ),
+        (
+            &["rename", "db", "x"],
+            "invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>)",
+        ),
+        (
+            &["rename", "web/db", "a:b"],
+            "invalid full secret name \"web/a:b\"",
+        ),
+        (
+            &["rename", "web/db", "nostack/db"],
+            "unknown stack \"nostack\" (known stacks: web)",
+        ),
+        (
+            &["rename", "web/db", "db"],
+            "cannot rename `web/db` to itself",
+        ),
+        (
+            &["rename", "web/db", "cf", "--replace"],
+            "`web/cf` exists in .sec/ as <<secret:…>>, but `web/db` is <<gen:…>>",
+        ),
+    ] {
+        repo.lst(args).fails_with(&[needle]);
+        assert_eq!(repo.snapshot(), before, "{args:?}");
+    }
+
+    // The usual guards apply.
+    repo.write(".env", format!("LST_SEED={OTHER_SEED}\n"));
+    let run = repo.lst(&["rename", "web/db", "x"]);
+    run.fails_with(&["wrong seed"]);
+    assert_no_seed(&run, OTHER_SEED);
+    repo.remove(".env");
+    repo.lst(&["rename", "web/db", "x"])
+        .fails_with(&["no .env file"]);
+
+    // Usage errors exit with 2.
+    for args in [
+        &["rename"][..],
+        &["rename", "web/db"],
+        &["rename", "a", "b", "c"],
+    ] {
+        let run = repo.lst(args);
+        assert_eq!(run.code, Some(2), "{args:?}: {run:#?}");
+        assert!(run.stderr.contains("Usage: lst rename"), "{run:#?}");
+    }
+}
+
+#[test]
+fn rename_reports_a_failing_save() {
+    let repo = Repo::initialised();
+    repo.compose("web", "a: <<gen:db>>\n");
+    repo.lst(&["sync"]).ok();
+    let web = repo.read(".sec/web.toml");
+    // save() writes .sec/.web.toml.tmp and renames it; make that impossible.
+    fs::create_dir(repo.path().join(".sec/.web.toml.tmp")).unwrap();
+    repo.lst(&["rename", "web/db", "x"])
+        .fails_with(&[".sec/web.toml: "]);
+    assert_eq!(repo.read(".sec/web.toml"), web);
 }
 
 // ---------------------------------------------------------------------------
