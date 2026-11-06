@@ -101,34 +101,50 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 ## Setup
 
 ```sh
-lst init                     # on the first machine
+lst init                     # on the first machine (also installs the pre-commit hook)
 # save the seed from .env in your password manager (this is also your backup)
-# on each other machine: clone, put the seed in .env, run `lst hook install`
+# on each other machine: clone, put the seed in .env, run `lst hook install` (or `lst init`)
 ```
 
-## Usage today (M1)
+## Usage today (M2)
 
-The hook, `deploy` and `check` don't exist yet. What works now:
+`deploy` and `check` don't exist yet. What works now:
 
 ```sh
-lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml
+lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml, pre-commit hook
 git add .gitignore .sec && git commit -m "lst init"
 # copy the LST_SEED=… line from .env into your password manager now
 
-lst sync                     # after editing compose files: ids for new <<gen:…>> names, orphans
-git add .sec && git commit
+# edit compose files, then just commit: the hook updates .sec/ and stores <<set:…>> values
+git add stacks && git commit
 
 lst render web | docker compose -p web --project-directory stacks/web -f - up -d
 ```
 
-- **`lst init`** gitignores `.env` (and refuses if `.env` is tracked), creates the seed and writes `.sec/meta.toml`. Other lines in an existing `.env` are kept. It never prints the seed. Running it again only checks that the seed in `.env` matches `.sec/`. If `.sec/` already exists but `.env` has no seed, it refuses rather than create a second seed.
-- **`lst sync`** reads every file under `stacks/<stack>/` in the working tree (not only `compose.yaml`; `.git` directories are skipped, symlinks are followed, non-UTF-8 files are skipped unless they contain `<<set:`) and updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards. `<<set:…>>` is refused: commit the file instead, and the pre-commit hook stores the value. When one name disappears and one appears in the same stack, it prints the `lst rename` command that keeps the old value.
+- **`lst init`** gitignores `.env` (and refuses if `.env` is tracked), creates the seed and writes `.sec/meta.toml`. Other lines in an existing `.env` are kept. It never prints the seed. Running it again only checks that the seed in `.env` matches `.sec/`. If `.sec/` already exists but `.env` has no seed, it refuses rather than create a second seed. As its last step it installs the pre-commit hook (see below), also when the repo is already initialised; an existing pre-commit hook that isn't lst's is left alone, with a warning.
+- **The pre-commit hook** (`lst hook run`, which git runs on every commit) checks and updates what you commit:
+  - It reads the **staged** files (the index, not the working tree): every staged file under `stacks/<stack>/`, not only the changed ones.
+  - New `<<gen:…>>` names get ids, unused names are marked as orphans, and the updated `.sec/` goes into the same commit. When one name disappears and one appears, it prints the `lst rename … --replace` command that keeps the old value.
+  - `<<set:name:VALUE>>` is encrypted into `.sec/` and rewritten to `<<secret:name>>` in the commit and in your working tree. Only that exact marker text is replaced; the rest of the file, unstaged edits included, is left alone. It then reminds you that `git add` already wrote the plaintext as a blob into `.git/objects`: no commit references it and it is never pushed, but it stays on disk until `git gc --prune=now` (or git's own pruning) removes it.
+  - It **blocks the commit** (nothing is committed or changed) on:
+    - a `<<secret:…>>` with no stored value (it names the `<<set:…>>` to write);
+    - a malformed marker, or one name set to two different values;
+    - a `<<set:` in any staged file outside a stack, or in a non-UTF-8 file;
+    - a symlinked stack directory or `compose.yaml`;
+    - unresolved merge conflicts;
+    - a wrong or missing seed, or `.env` not being gitignored;
+    - `lst` not being on `PATH`.
+  - It is silent when there is nothing to report.
+  - `git commit -a` works. `git commit <paths>` commits from a temporary index that git never copies back to your real index, so it only works when the hook has nothing to change. Otherwise it blocks and asks you to `git add` the files and run `git commit` without paths.
+- **`lst hook install [--force]`** installs the hook where git looks for it (`git rev-parse --git-path hooks`, so `core.hooksPath` is respected). Run it once in every clone (`lst init` does it too). It never replaces a pre-commit hook that isn't lst's unless you pass `--force`.
+- **`git commit --no-verify` skips the hook**, and with it the protection: a `<<set:…>>` committed that way is plaintext in your history. Don't. (From M3, deploy refuses a committed `<<set:` and tells you to rotate the secret.)
+- **`lst sync`** does by hand what the hook does on commit (you rarely need it). It reads every file under `stacks/<stack>/` in the working tree that git would stage (not only `compose.yaml`). Gitignored files, such as bind-mounted data, are skipped; symlinks are skipped rather than followed; non-UTF-8 files are skipped unless they contain `<<set:`. A symlinked `stacks/`, a symlink directly in `stacks/` and a symlinked `compose.yaml` are errors (git commits a symlink as a link, so the hook couldn't see the stack). It updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards (any commit does: the hook stages it). `<<set:…>>` is refused: commit the file instead, and the pre-commit hook stores the value. When one name disappears and one appears in the same stack, it prints the `lst rename` command that keeps the old value.
 - **`lst rename <from> <to> [--replace]`** renames an entry in `.sec/` without changing its value: a generated secret keeps its id, a manual secret is re-encrypted under the new name. `<from>` is a full name (`web/db`, `shared/mqtt`); `<to>` is a full name too, or a name without `/` in the same stack (or `shared`). Moving between a stack and `shared/` works. If `<to>` already exists (typically because a sync or commit just gave it a fresh id) pass `--replace`. It does not edit your files: change the markers yourself.
 - **`lst render <stack>`** prints the resolved compose file to stdout and nothing else; diagnostics go to stderr. It is read-only: a name that isn't in `.sec/` yet fails with a hint to run `lst sync`. Every unresolvable secret is listed in one go.
 - Marker errors point at the spot: `stacks/web/compose.yaml:3:17: …`.
 - Exit codes: `0` ok, `1` error, `2` usage error.
 
-**Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run commands as usual. (`lst init` there just confirms the seed matches `.sec/meta.toml`.) A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
+**Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run `lst hook install` (a clone doesn't bring hooks along). `lst init` works too: there it confirms the seed matches `.sec/meta.toml` and installs the hook. A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
 
 **Quoting manual secrets in YAML:** `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. A block scalar takes any single-line value as-is:
 

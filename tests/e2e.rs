@@ -9,6 +9,9 @@ mod support;
 #[path = "e2e/docker.rs"]
 mod docker;
 
+#[path = "e2e/hook.rs"]
+mod hook;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
@@ -497,13 +500,64 @@ fn sync_scope_errors_name_the_real_file() {
     assert!(!run.stderr.contains("t0p-s3cret"), "{run:#?}");
     repo.remove("stacks/x/config/app.conf");
 
-    // A dangling symlink is an error, not a silently skipped file.
-    std::os::unix::fs::symlink("nowhere", repo.path().join("stacks/x/link")).unwrap();
-    repo.lst(&["sync"]).fails_with(&["stacks/x/link: "]);
-    repo.remove("stacks/x/link");
-
     // None of the failures wrote anything.
     assert_eq!(repo.snapshot(), before);
+
+    // A symlinked compose.yaml is an error (git would commit the link, so
+    // the hook couldn't read it).
+    repo.remove("stacks/x/compose.yaml");
+    std::os::unix::fs::symlink("elsewhere.yaml", repo.path().join("stacks/x/compose.yaml"))
+        .unwrap();
+    repo.lst(&["sync"])
+        .fails_with(&["stacks/x/compose.yaml is a symlink; git stores it as a link"]);
+}
+
+#[test]
+fn sync_reads_only_what_git_would_stage() {
+    let repo = Repo::initialised();
+    repo.compose("x", "a: <<gen:db>>\n");
+    repo.write("stacks/x/.gitignore", "data/\n");
+    // Bind-mounted data: ignored, so never read (a bad marker there is fine).
+    repo.write("stacks/x/data/pg/file", b"<<gen:bad name>> \xff<<set:k:v>>");
+    repo.write("stacks/x/data/conf", "<<gen:ignored>>");
+    // A symlink (to a file with markers, or dangling) is skipped.
+    repo.write("outside.conf", "<<gen:via-link>>\n");
+    std::os::unix::fs::symlink("../../outside.conf", repo.path().join("stacks/x/link.conf"))
+        .unwrap();
+    std::os::unix::fs::symlink("nowhere", repo.path().join("stacks/x/dangling")).unwrap();
+    // So is a symlinked directory inside a stack.
+    fs::create_dir_all(repo.path().join("elsewhere")).unwrap();
+    repo.write("elsewhere/c.conf", "<<gen:via-dir-link>>\n");
+    std::os::unix::fs::symlink("../../elsewhere", repo.path().join("stacks/x/conf")).unwrap();
+    // A tracked file deleted from the working tree is not read either.
+    repo.write("stacks/x/tracked", "<<gen:gone>>\n");
+    repo.git(&["add", "stacks/x/tracked"]);
+    repo.remove("stacks/x/tracked");
+    let run = repo.lst(&["sync"]);
+    run.ok();
+    assert_eq!(run.stderr, "lst: new: x/db\n");
+    assert_eq!(
+        repo.store().files()["x"]
+            .generated
+            .keys()
+            .collect::<Vec<_>>(),
+        ["db"]
+    );
+}
+
+#[test]
+fn symlinked_stack_directories_are_errors() {
+    let repo = Repo::initialised();
+    repo.compose("real-web", "a: <<gen:db>>\n");
+    fs::create_dir_all(repo.path().join("elsewhere/web")).unwrap();
+    repo.write("elsewhere/web/compose.yaml", "a: <<gen:db>>\n");
+    std::os::unix::fs::symlink("../elsewhere/web", repo.path().join("stacks/web")).unwrap();
+    for cmd in [&["sync"][..], &["render", "real-web"]] {
+        repo.lst(cmd).fails_with(&[
+            "stacks/web is a symlink; git stores it as a link, so lst can't see its files when \
+             committing",
+        ]);
+    }
 }
 
 // ---------------------------------------------------------------------------

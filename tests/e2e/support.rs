@@ -1,6 +1,7 @@
 //! Throwaway git repositories and a runner for the real `lst` binary.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -172,6 +173,87 @@ impl Repo {
         walk(self.path(), self.path(), &mut out);
         out
     }
+}
+
+impl Repo {
+    /// `git <args>` with its output captured and no assertion on the result.
+    /// `path` replaces `PATH` if given; otherwise the directory of the `lst`
+    /// under test is put in front of it, so git hooks find that binary
+    /// (never a globally installed one).
+    pub fn git_run(&self, args: &[&str], path: Option<&OsStr>) -> Run {
+        let path = match path {
+            Some(p) => p.to_owned(),
+            None => path_with_lst(),
+        };
+        let out = git_cmd()
+            .arg("-C")
+            .arg(self.path())
+            .args(args)
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        Run::from_output(out)
+    }
+
+    /// `git <args>` that must succeed; returns its stdout.
+    #[track_caller]
+    pub fn git_stdout(&self, args: &[&str]) -> String {
+        let run = self.git_run(args, None);
+        assert_eq!(run.code, Some(0), "git {args:?}: {run:#?}");
+        run.stdout
+    }
+
+    /// `git commit -q <args>`, with the hook finding the `lst` under test.
+    pub fn commit(&self, args: &[&str]) -> Run {
+        let mut all = vec!["commit", "-q"];
+        all.extend_from_slice(args);
+        self.git_run(&all, None)
+    }
+
+    /// The number of commits on `HEAD`.
+    pub fn commit_count(&self) -> usize {
+        self.git_stdout(&["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// `git show <rev>:<path>`.
+    pub fn show(&self, rev_path: &str) -> String {
+        self.git_stdout(&["show", rev_path])
+    }
+}
+
+/// The directory holding the `lst` binary under test.
+pub fn lst_dir() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_lst"))
+        .parent()
+        .unwrap()
+        .to_owned()
+}
+
+/// `PATH` with [`lst_dir`] in front.
+pub fn path_with_lst() -> OsString {
+    let mut dirs = vec![lst_dir()];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(dirs).unwrap()
+}
+
+/// A `PATH` with git and a shell but no `lst`: the directory of the first
+/// `git` on `PATH`, plus `/bin` and `/usr/bin`.
+pub fn path_without_lst() -> OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let git_dir = std::env::split_paths(&path)
+        .find(|d| d.join("git").is_file())
+        .unwrap();
+    let dirs = [git_dir, PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+    for d in &dirs {
+        assert!(!d.join("lst").exists(), "{} has an lst", d.display());
+    }
+    std::env::join_paths(dirs).unwrap()
 }
 
 /// The real binary, with git's user/system config switched off.

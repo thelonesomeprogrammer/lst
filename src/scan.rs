@@ -88,11 +88,17 @@ pub fn parse_error(path: &str, text: &str, e: ParseError) -> ScanError {
     }
 }
 
+/// Whether `bytes` contain `<<set:` anywhere, valid marker or not (a value
+/// lst would have to keep out of a commit).
+pub fn contains_set(bytes: &[u8]) -> bool {
+    bytes.windows(SET_OPEN.len()).any(|w| w == SET_OPEN)
+}
+
 /// The markers in one file of `stack` (see the module docs for the rules).
 pub fn scan_file(stack: &str, path: &str, bytes: &[u8]) -> Result<Vec<MarkerKind>, ScanError> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         let path = path.to_owned();
-        if bytes.windows(SET_OPEN.len()).any(|w| w == SET_OPEN) {
+        if contains_set(bytes) {
             return Err(ScanError::SetInNonUtf8 { path });
         }
         if path == format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}") {
