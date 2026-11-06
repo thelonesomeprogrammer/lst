@@ -178,7 +178,7 @@ stacks/<stack>/config/…      # optional template files with markers
 
 - [x] M0: core library (marker parser, derivation, formats, encryption, frozen test vectors)
 - [x] M1: `init` + `render` (+ `sync`)
-- [ ] M2: pre-commit hook
+- [x] M2: pre-commit hook
 - [ ] M3: `deploy` + `check` + CI
 - [ ] M4: `x-deploy`
 - [ ] M5: `rotate`, `gc`, `--all`, `--dry-run`
