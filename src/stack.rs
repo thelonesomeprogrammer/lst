@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 pub const STACKS_DIR: &str = "stacks";
 pub const COMPOSE_FILE: &str = "compose.yaml";
-/// Names taken by `.sec/` itself.
-const RESERVED: &[&str] = &["shared", "meta"];
+/// Names taken by `.sec/` itself (its file stems).
+const RESERVED: &[&str] = &[crate::store::SHARED, crate::store::META];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stack {
@@ -71,7 +71,8 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StackError + '_ {
     }
 }
 
-/// Checks the stack-name rules (charset, leading `.`, reserved names).
+/// Checks the stack-name rules (charset, leading `.`, reserved names). The
+/// single source of truth: `store::is_valid_stack` delegates here.
 pub fn validate_name(name: &str) -> Result<(), StackError> {
     let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
     if name.is_empty() || name.starts_with('.') || !name.chars().all(valid_char) {

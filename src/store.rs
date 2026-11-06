@@ -186,15 +186,11 @@ fn full_name(file: &str, key: &str) -> String {
 }
 
 /// A stack name usable as a `.sec/` file stem: `[A-Za-z0-9._-]+`, not
-/// starting with `.`, and not one of the reserved stems.
+/// starting with `.`, and not one of the reserved stems (in any case).
+/// [`crate::stack::validate_name`] is the single source of truth for these
+/// rules, so discovery and the store can never disagree.
 pub fn is_valid_stack(stack: &str) -> bool {
-    !stack.is_empty()
-        && !stack.starts_with('.')
-        && stack != SHARED
-        && stack != META
-        && stack
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    crate::stack::validate_name(stack).is_ok()
 }
 
 /// A secret name as the marker grammar defines it. Checked with the marker
@@ -1031,7 +1027,9 @@ orphan = false
 
     #[test]
     fn scope_rejects_bad_stacks_and_names() {
-        for stack in ["", ".hidden", "shared", "meta", "a b", "a/b", "ü"] {
+        for stack in [
+            "", ".hidden", "shared", "meta", "Shared", "META", "a b", "a/b", "ü",
+        ] {
             assert!(matches!(scope(stack, "x"), Err(StoreError::InvalidStack(s)) if s == stack));
         }
         for stack in ["web", "Web-1", "a.b", "a_b", "x."] {
@@ -1338,7 +1336,7 @@ orphan = false
     #[test]
     fn from_files_rejects_bad_stems() {
         let meta = Store::init(&seed(1)).meta().to_toml();
-        for stem in ["meta", ".x", "a b", ""] {
+        for stem in ["meta", "Meta", "SHARED", ".x", "a b", ""] {
             let files = BTreeMap::from([(stem.to_owned(), String::new())]);
             let err = Store::from_files(&meta, &files).unwrap_err();
             assert!(
