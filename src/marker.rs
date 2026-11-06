@@ -316,6 +316,22 @@ pub fn escape(value: &str) -> SecretString {
     out
 }
 
+/// 1-based line and column of byte offset `pos` in `text`, for messages like
+/// `stacks/x/compose.yaml:3:17: …`. Lines are separated by `\n`; the column
+/// counts chars (not bytes) from the start of the line. A `pos` past the end
+/// is clamped to the end; a `pos` inside a multi-byte char gives that char's
+/// column.
+pub fn line_col(text: &str, pos: usize) -> (usize, usize) {
+    let mut pos = pos.min(text.len());
+    while !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let before = &text[..pos];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+    (line, before[line_start..].chars().count() + 1)
+}
+
 impl fmt::Display for MarkerKind {
     /// Canonical marker text. A `set` marker is shown without its value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -514,6 +530,29 @@ mod tests {
         assert_eq!(e.kind, InvalidEscape);
         assert!(!e.to_string().contains("sup3rs3cret"));
         assert!(!format!("{e:?}").contains("sup3rs3cret"));
+    }
+
+    #[test]
+    fn line_col_positions() {
+        let text = "ab\ncd\n\näö<<x\r\n";
+        assert_eq!(line_col(text, 0), (1, 1));
+        assert_eq!(line_col(text, 1), (1, 2));
+        assert_eq!(line_col(text, 2), (1, 3)); // the `\n` itself
+        assert_eq!(line_col(text, 3), (2, 1));
+        assert_eq!(line_col(text, 6), (3, 1)); // empty line
+        assert_eq!(line_col(text, 7), (4, 1));
+        // Columns count chars: `ä` and `ö` are two bytes each.
+        assert_eq!(line_col(text, 11), (4, 3));
+        // Inside `ö` (byte 10 is its continuation byte): `ö`'s column.
+        assert_eq!(line_col(text, 9), (4, 2));
+        assert_eq!(line_col(text, 10), (4, 2));
+        assert_eq!(line_col(text, text.len()), (5, 1));
+        assert_eq!(line_col(text, usize::MAX), (5, 1));
+        assert_eq!(line_col("", 5), (1, 1));
+        // Matches a real parse error.
+        let text = "a: 1\nb: \"x<<gen:bad name>>\"\n";
+        let e = parse(text).unwrap_err();
+        assert_eq!(line_col(text, e.pos), (2, 15));
     }
 
     #[test]
