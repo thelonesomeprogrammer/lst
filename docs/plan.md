@@ -53,6 +53,7 @@ lst/
 | Command | Does |
 |---|---|
 | `lst init` | Create seed → `.env`, ensure `.env` is gitignored, write `.sec/meta.toml`, install the hook |
+| `lst sync` | Update `.sec/` from the compose files (new ids, orphans); the hook runs the same logic on staged content |
 | `lst render <stack>` | Resolved compose to stdout |
 | `lst deploy <stack>` / `--all` | Checks → render files → pre → `compose up --wait` → post |
 | `lst check` | Is `.sec/` current, no committed `<<set:`, all secrets resolvable? (used by CI and deploy) |
@@ -71,6 +72,7 @@ lst/
 ### M1 — `init` + `render` (first usable version)
 - `lst init`: seed, `.env`, gitignore check/entry, fingerprint.
 - `store.rs`: create `gen` entries for new names (random id), read/write `.sec/`.
+- `lst sync`: update `.sec/` from the working-tree compose files (the M2 hook reuses this on staged content). `render` stays read-only.
 - `lst render <stack>`: resolve `gen` and `secret`; fail on a missing seed, a fingerprint mismatch or an unset secret.
 - _Done when:_ `lst render test | docker compose -p test --project-directory stacks/test -f - up -d` works for a test stack with a Postgres plus an app sharing `<<gen:db>>`.
 

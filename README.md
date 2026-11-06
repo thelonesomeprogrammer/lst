@@ -89,6 +89,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 | Command | Does |
 |---|---|
 | `lst init` | Create the seed, gitignore `.env`, write `.sec/meta.toml`, install the hook |
+| `lst sync` | Update `.sec/` from your compose files (the hook does this for you) |
 | `lst render <stack>` | Print the resolved compose file to stdout |
 | `lst deploy <stack>` / `--all` | Check → render files → `pre` → `compose up --wait` → `post` |
 | `lst check` | Verify `.sec/` is current, no `<<set:` committed, all secrets resolvable |

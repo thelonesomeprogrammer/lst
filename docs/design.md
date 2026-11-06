@@ -53,6 +53,13 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
   - Minimum of at least 128 bits of randomness: hex N ≥ 32, base64 N ≥ 22, alnum N ≥ 22; otherwise an error. Maximum N = 256.
   - Bytes are always consumed from the start of the XOF stream, in order.
 
+### On-disk formats and M1 behaviour (decided 2026-11-06, raised by Claude Code before M1)
+- **`.env`:** the seed is one line `LST_SEED=<64 lowercase hex chars>`. Other lines in `.env` are preserved untouched. Uppercase hex, wrong length or a duplicate `LST_SEED` line is an error.
+- **`.sec/` encoding:** nonces and ciphertexts are lowercase hex, like ids.
+- **`lst sync`:** updates `.sec/` from the compose files (in M1: the working tree). It creates ids for new gen names, marks vanished names as orphans and un-orphans names that come back. The M2 pre-commit hook runs the same logic on staged content.
+- **`lst render` is read-only:** it never writes `.sec/`. A gen name with no entry fails with a hint to run `lst sync`.
+- **Substitution is raw text.** `render` doesn't quote or escape for YAML (it also renders non-YAML files). Generated formats are always YAML-safe as plain scalars. A marker for a manual secret that may contain `"`, `#`, `: ` or newlines must sit in a suitably quoted YAML scalar; this is documented for users, not enforced.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).
