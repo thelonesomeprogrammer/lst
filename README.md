@@ -105,6 +105,39 @@ lst init                     # on the first machine
 # on each other machine: clone, put the seed in .env, run `lst hook install`
 ```
 
+## Usage today (M1)
+
+The hook, `deploy` and `check` don't exist yet. What works now:
+
+```sh
+lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml
+git add .gitignore .sec && git commit -m "lst init"
+# copy the LST_SEED=… line from .env into your password manager now
+
+lst sync                     # after editing compose files: ids for new <<gen:…>> names, orphans
+git add .sec && git commit
+
+lst render web | docker compose -p web --project-directory stacks/web -f - up -d
+```
+
+- **`lst init`** gitignores `.env` (and refuses if `.env` is tracked), creates the seed and writes `.sec/meta.toml`. Other lines in an existing `.env` are kept. It never prints the seed. Running it again only checks that the seed in `.env` matches `.sec/`. If `.sec/` already exists but `.env` has no seed, it refuses rather than create a second seed.
+- **`lst sync`** reads every `stacks/<stack>/compose.yaml` in the working tree and updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards. `<<set:…>>` is refused until the pre-commit hook (M2) exists.
+- **`lst render <stack>`** prints the resolved compose file to stdout and nothing else; diagnostics go to stderr. It is read-only: a name that isn't in `.sec/` yet fails with a hint to run `lst sync`. Every unresolvable secret is listed in one go.
+- Marker errors point at the spot: `stacks/web/compose.yaml:3:17: …`.
+- Exit codes: `0` ok, `1` error, `2` usage error.
+
+**Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run commands as usual. (`lst init` there just confirms the seed matches `.sec/meta.toml`.) A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
+
+**Quoting manual secrets in YAML:** `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. A block scalar takes any single-line value as-is:
+
+```yaml
+environment:
+  SMTP_PASSWORD: |-
+    <<secret:smtp>>
+```
+
+A single-quoted scalar (`TOKEN: '<<secret:cf>>'`) works if the value can't contain `'`. A value with newlines only stays valid YAML if every line after the first is indented like the marker, which raw substitution doesn't do, so keep multi-line secrets out of compose YAML (or in a non-YAML file).
+
 **Repo layout:**
 
 ```
