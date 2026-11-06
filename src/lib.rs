@@ -11,3 +11,4 @@ pub mod envfile;
 pub mod format;
 pub mod git;
 pub mod marker;
+pub mod stack;
