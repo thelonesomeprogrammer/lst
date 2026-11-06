@@ -159,7 +159,7 @@ stacks/<stack>/config/…      # optional template files with markers
 ## Roadmap
 
 - [x] M0: core library (marker parser, derivation, formats, encryption, frozen test vectors)
-- [ ] M1: `init` + `render`
+- [x] M1: `init` + `render` (+ `sync`)
 - [ ] M2: pre-commit hook
 - [ ] M3: `deploy` + `check` + CI
 - [ ] M4: `x-deploy`
