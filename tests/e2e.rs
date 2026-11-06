@@ -6,6 +6,9 @@
 #[path = "e2e/support.rs"]
 mod support;
 
+#[path = "e2e/docker.rs"]
+mod docker;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
