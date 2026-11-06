@@ -1,0 +1,18 @@
+#!/bin/sh
+# Test double for src/git.rs: `ls-files` lists nothing; `check-ignore`
+# answers "not ignored" (exit 1) while <dir>/.gitignore does not exist and
+# fails (exit 128) once it does, <dir> being the `-C <dir>` lst passes
+# first. Anything else fails.
+[ "$1" = "-C" ] || exit 2
+dir=$2
+for arg in "$@"; do
+    case "$arg" in
+        ls-files) exit 0 ;;
+        check-ignore)
+            [ -e "$dir/.gitignore" ] || exit 1
+            echo "fatal: simulated failure" >&2
+            exit 128
+            ;;
+    esac
+done
+exit 2

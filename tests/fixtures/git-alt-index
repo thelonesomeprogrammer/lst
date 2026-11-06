@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test wrapper for src/git.rs: runs the real git with GIT_INDEX_FILE set to
+# <dir>/.git/alt-index, where <dir> is the `-C <dir>` lst always passes
+# first. Stands in for the environment git gives a pre-commit hook during
+# `git commit -a` / `git commit <path>`, without changing the environment
+# of the (parallel) test process itself.
+[ "$1" = "-C" ] || exit 2
+GIT_INDEX_FILE="$2/.git/alt-index" exec git "$@"
