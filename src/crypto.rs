@@ -47,6 +47,9 @@ pub enum CryptoError {
     Decrypt,
     #[error("decrypted value is not valid UTF-8")]
     NotUtf8,
+    /// Deliberately carries no detail: the input may be (most of) a seed.
+    #[error("invalid seed: expected 64 lowercase hex characters")]
+    InvalidSeed,
 }
 
 fn random_fill(buf: &mut [u8]) -> Result<(), CryptoError> {
@@ -80,6 +83,37 @@ impl Seed {
 
     pub fn as_bytes(&self) -> &[u8; SEED_LEN] {
         &self.0
+    }
+
+    /// 64 lowercase hex characters (the `.env` representation). Returned as
+    /// a [`SecretString`] so the hex copy is zeroized too.
+    pub fn to_hex(&self) -> SecretString {
+        let mut s = SecretString::new(String::with_capacity(SEED_LEN * 2));
+        // Capacity is reserved up front, so push_hex never reallocates and
+        // leaves no unzeroized partial copy behind.
+        push_hex(s.as_mut_string(), &self.0[..]);
+        s
+    }
+
+    /// Parses exactly 64 lowercase hex characters. Decodes straight into the
+    /// zeroizing seed buffer; the error never contains the input.
+    pub fn from_hex(s: &str) -> Result<Seed, CryptoError> {
+        fn nibble(c: u8) -> Result<u8, CryptoError> {
+            match c {
+                b'0'..=b'9' => Ok(c - b'0'),
+                b'a'..=b'f' => Ok(c - b'a' + 10),
+                _ => Err(CryptoError::InvalidSeed),
+            }
+        }
+        let s = s.as_bytes();
+        if s.len() != SEED_LEN * 2 {
+            return Err(CryptoError::InvalidSeed);
+        }
+        let mut seed = Seed(Zeroizing::new([0; SEED_LEN]));
+        for (out, pair) in seed.0.iter_mut().zip(s.chunks_exact(2)) {
+            *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Ok(seed)
     }
 }
 
@@ -441,6 +475,36 @@ mod tests {
                 CryptoError::InvalidId,
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn seed_hex_round_trip() {
+        let mut bytes = [0u8; SEED_LEN];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37) ^ 0xa5;
+        }
+        let s = Seed::from_bytes(bytes);
+        let hex = s.to_hex();
+        assert_eq!(hex.expose().len(), 64);
+        assert_eq!(Seed::from_hex(hex.expose()).unwrap().as_bytes(), &bytes);
+        let good = hex.expose().to_owned();
+        let bad_inputs = [
+            String::new(),
+            good[..62].to_owned(),
+            format!("{good}0"),
+            good.to_uppercase(),
+            format!("g{}", &good[1..]),
+            format!("{}g", &good[..63]),
+            format!(" {}", &good[1..]),
+            // 64 bytes, but not 64 ASCII hex characters.
+            format!("é{}", &good[2..]),
+        ];
+        for bad in &bad_inputs {
+            let err = Seed::from_hex(bad).unwrap_err();
+            assert_eq!(err, CryptoError::InvalidSeed);
+            let msg = format!("{err} {err:?}");
+            assert!(!msg.contains(&good[..8]));
         }
     }
 

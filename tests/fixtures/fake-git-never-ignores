@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test double for src/git.rs: `ls-files` lists nothing and `check-ignore`
+# always answers "not ignored" (exit 1). Anything else fails.
+for arg in "$@"; do
+    case "$arg" in
+        ls-files) exit 0 ;;
+        check-ignore) exit 1 ;;
+    esac
+done
+exit 2

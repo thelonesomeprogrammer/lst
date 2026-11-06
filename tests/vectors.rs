@@ -184,3 +184,24 @@ fn decryption_vector() {
     assert!(open(&key, "test/smtp2", &sealed).is_err());
     assert!(open(&key, "shared/smtp", &sealed).is_err());
 }
+
+/// Added in M1 (not an M0 vector): the `.env` hex encoding of the seed.
+#[test]
+fn seed_hex_vectors() {
+    assert_eq!(
+        seed().to_hex().expose(),
+        "4242424242424242424242424242424242424242424242424242424242424242"
+    );
+    assert_eq!(Seed::from_hex(&"42".repeat(32)).unwrap().as_bytes(), &SEED);
+
+    let mut seq = [0u8; 32];
+    for (i, b) in seq.iter_mut().enumerate() {
+        *b = i as u8 * 8;
+    }
+    let hex = Seed::from_bytes(seq).to_hex();
+    assert_eq!(
+        hex.expose(),
+        "0008101820283038404850586068707880889098a0a8b0b8c0c8d0d8e0e8f0f8"
+    );
+    assert_eq!(Seed::from_hex(hex.expose()).unwrap().as_bytes(), &seq);
+}
