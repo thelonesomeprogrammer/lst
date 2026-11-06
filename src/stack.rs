@@ -13,24 +13,20 @@
 //! - Only `compose.yaml` counts (not `compose.yml` or
 //!   `docker-compose.yaml`). Directories without it are not stacks and are
 //!   skipped, whatever their name.
-//! - Entries starting with `.` are skipped. So are non-directories.
-//! - Symlinks (to a stack directory or to `compose.yaml`) are followed: it
-//!   is the user's repository. A dangling or looping symlink is an error
-//!   rather than silently dropping what may be a stack.
+//! - Entries starting with `.` are skipped. So are regular files and other
+//!   non-directories.
+//! - Symlinks are **not** followed (changed in M2; M1 followed them). git
+//!   stores a symlink as a link, so the pre-commit hook, which reads the
+//!   index, can't see what it points to. To keep `sync`, `render` and the
+//!   hook seeing the same stacks, a symlinked `stacks/` directory, a symlink
+//!   directly in `stacks/` (whatever it points to, dangling included) and a
+//!   symlinked `compose.yaml` are errors rather than silently skipped.
 //! - A directory that has a `compose.yaml` but whose name is not valid
 //!   UTF-8, or not a valid stack name, is an error rather than skipped, so
 //!   a stack never silently disappears from `sync`/`render`.
 //!
-//! # Files of a stack ([`files`])
-//! Every regular file anywhere under `stacks/<name>/`: the scope `lst sync`
-//! scans for markers.
-//! - Directories named `.git` are skipped; every other name, dotfiles
-//!   included, is listed.
-//! - Symlinks are followed, as above: a dangling or looping symlink is an
-//!   error. So is a symlinked directory that leads back to one of its own
-//!   ancestors (the walk would never end).
-//! - Entries that are neither files nor directories (sockets, FIFOs,
-//!   devices) are skipped: they can't be committed.
+//! Which files of a stack `lst sync` reads is decided by git
+//! (`git::worktree_files`: the files git would stage), not here.
 
 use std::fs;
 use std::io;
@@ -73,8 +69,12 @@ pub enum StackError {
     ComposeNotAFile { path: PathBuf },
     #[error("unknown stack {name:?} (known stacks: {known})")]
     Unknown { name: String, known: String },
-    #[error("{}: symlink loop (it leads back to a directory that contains it)", path.display())]
-    SymlinkLoop { path: PathBuf },
+    #[error(
+        "{} is a symlink; git stores it as a link, so lst can't see its files when committing. \
+         Replace it with the real directory or file",
+        path.display()
+    )]
+    Symlink { path: PathBuf },
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StackError + '_ {
@@ -105,6 +105,10 @@ pub fn validate_name(name: &str) -> Result<(), StackError> {
 /// `stacks/` directory means no stacks.
 pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
     let dir = root.join(STACKS_DIR);
+    let is_link = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link(&dir) {
+        return Err(StackError::Symlink { path: dir });
+    }
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -118,12 +122,19 @@ pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
             continue;
         }
         let path = entry.path();
-        // fs::metadata follows symlinks.
-        if !fs::metadata(&path).map_err(io_err(&path))?.is_dir() {
+        // DirEntry::file_type does not follow symlinks.
+        let file_type = entry.file_type().map_err(io_err(&path))?;
+        if file_type.is_symlink() {
+            return Err(StackError::Symlink { path });
+        }
+        if !file_type.is_dir() {
             continue;
         }
         let compose = path.join(COMPOSE_FILE);
-        match fs::metadata(&compose) {
+        match fs::symlink_metadata(&compose) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(StackError::Symlink { path: compose });
+            }
             Ok(m) if m.is_file() => {}
             Ok(_) => return Err(StackError::ComposeNotAFile { path: compose }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -140,19 +151,28 @@ pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
         });
     }
     stacks.sort_by(|a, b| a.name.cmp(&b.name));
+    check_case_collisions(stacks.iter().map(|s| s.name.as_str()))?;
+    Ok(stacks)
+}
 
-    let mut folded: Vec<(String, &str)> = stacks
-        .iter()
-        .map(|s| (s.name.to_ascii_lowercase(), s.name.as_str()))
+/// Fails if two of `names` differ only in ASCII case (they would share a
+/// `.sec/` file on a case-insensitive filesystem). Reports the first such
+/// pair in case-folded order.
+pub fn check_case_collisions<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), StackError> {
+    let mut folded: Vec<(String, &str)> = names
+        .into_iter()
+        .map(|n| (n.to_ascii_lowercase(), n))
         .collect();
     folded.sort();
-    if let Some(w) = folded.windows(2).find(|w| w[0].0 == w[1].0) {
-        return Err(StackError::CaseCollision {
+    match folded.windows(2).find(|w| w[0].0 == w[1].0) {
+        Some(w) => Err(StackError::CaseCollision {
             first: w[0].1.to_owned(),
             second: w[1].1.to_owned(),
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(stacks)
 }
 
 /// The stack called `name`. The name is validated before touching the
@@ -177,53 +197,6 @@ pub fn find(root: &Path, name: &str) -> Result<Stack, StackError> {
                 known
             },
         })
-}
-
-/// Every regular file under `stack.dir` (see the module docs), as paths
-/// relative to it, sorted by their bytes (the order git uses).
-pub fn files(stack: &Stack) -> Result<Vec<PathBuf>, StackError> {
-    let mut out = Vec::new();
-    walk(&stack.dir, Path::new(""), &mut Vec::new(), &mut out)?;
-    out.sort_by(|a, b| {
-        a.as_os_str()
-            .as_encoded_bytes()
-            .cmp(b.as_os_str().as_encoded_bytes())
-    });
-    Ok(out)
-}
-
-/// Collects the files of `dir` (which is `rel` below the stack directory)
-/// into `out`. `ancestors` holds the canonical paths of the directories
-/// being walked, to catch symlink loops.
-fn walk(
-    dir: &Path,
-    rel: &Path,
-    ancestors: &mut Vec<PathBuf>,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), StackError> {
-    let real = fs::canonicalize(dir).map_err(io_err(dir))?;
-    if ancestors.contains(&real) {
-        return Err(StackError::SymlinkLoop {
-            path: dir.to_owned(),
-        });
-    }
-    ancestors.push(real);
-    for entry in fs::read_dir(dir).map_err(io_err(dir))? {
-        let entry = entry.map_err(io_err(dir))?;
-        let name = entry.file_name();
-        let path = entry.path();
-        // fs::metadata follows symlinks.
-        let meta = fs::metadata(&path).map_err(io_err(&path))?;
-        if meta.is_dir() {
-            if name != ".git" {
-                walk(&path, &rel.join(&name), ancestors, out)?;
-            }
-        } else if meta.is_file() {
-            out.push(rel.join(&name));
-        }
-    }
-    ancestors.pop();
-    Ok(())
 }
 
 #[cfg(test)]
@@ -300,50 +273,67 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn follows_symlinks() {
+    fn symlinks_are_errors_not_followed() {
         use std::os::unix::fs::symlink;
-        let r = root();
         let elsewhere = root();
         let real = elsewhere.path().join("real");
         fs::create_dir(&real).unwrap();
         fs::write(real.join(COMPOSE_FILE), "").unwrap();
-        fs::create_dir(r.path().join(STACKS_DIR)).unwrap();
-        symlink(&real, r.path().join("stacks/linked")).unwrap();
 
-        add_stack(r.path(), "plain");
-        let file_link = r.path().join("stacks/file-link");
-        fs::create_dir(&file_link).unwrap();
-        symlink(real.join(COMPOSE_FILE), file_link.join(COMPOSE_FILE)).unwrap();
-        // A symlink to a file directly in stacks/ is not a stack.
-        symlink(real.join(COMPOSE_FILE), r.path().join("stacks/file")).unwrap();
-
-        let stacks = discover(r.path()).unwrap();
-        let got: Vec<&str> = stacks.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(got, ["file-link", "linked", "plain"]);
-        assert_eq!(stacks[1].dir, r.path().join("stacks/linked"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_and_looping_symlinks_are_errors() {
-        use std::os::unix::fs::symlink;
+        // A symlink directly in stacks/: to a stack directory, to a file,
+        // or dangling.
+        for target in [real.clone(), real.join(COMPOSE_FILE), real.join("nowhere")] {
+            let r = root();
+            add_stack(r.path(), "plain");
+            let link = r.path().join("stacks/linked");
+            symlink(&target, &link).unwrap();
+            let err = discover(r.path()).unwrap_err();
+            assert!(
+                matches!(&err, StackError::Symlink { path } if path == &link),
+                "{target:?}: {err:?}"
+            );
+            assert!(
+                err.to_string().ends_with(
+                    "stacks/linked is a symlink; git stores it as a link, so lst can't see its \
+                     files when committing. Replace it with the real directory or file"
+                ),
+                "{err}"
+            );
+        }
+        // A dot-entry is skipped before it is looked at.
         let r = root();
-        fs::create_dir(r.path().join(STACKS_DIR)).unwrap();
-        let dangling = r.path().join("stacks/gone");
-        symlink(r.path().join("nowhere"), &dangling).unwrap();
-        let err = discover(r.path()).unwrap_err();
-        assert!(
-            matches!(&err, StackError::Io { path, .. } if path == &dangling),
-            "{err:?}"
-        );
-        fs::remove_file(&dangling).unwrap();
+        add_stack(r.path(), "plain");
+        symlink(&real, r.path().join("stacks/.hidden")).unwrap();
+        assert_eq!(names(r.path()), ["plain"]);
 
-        let dir = r.path().join("stacks/loop");
-        fs::create_dir(&dir).unwrap();
-        symlink(dir.join(COMPOSE_FILE), dir.join(COMPOSE_FILE)).unwrap();
+        // A symlinked compose.yaml: to a file, dangling, or looping.
+        for target in [
+            real.join(COMPOSE_FILE),
+            real.join("nowhere"),
+            PathBuf::new(),
+        ] {
+            let r = root();
+            let dir = r.path().join("stacks/file-link");
+            fs::create_dir_all(&dir).unwrap();
+            let target = if target.as_os_str().is_empty() {
+                dir.join(COMPOSE_FILE)
+            } else {
+                target
+            };
+            symlink(&target, dir.join(COMPOSE_FILE)).unwrap();
+            let err = discover(r.path()).unwrap_err();
+            assert!(
+                matches!(&err, StackError::Symlink { path } if path == &dir.join(COMPOSE_FILE)),
+                "{err:?}"
+            );
+        }
+
+        // A symlinked stacks/ directory.
+        let r = root();
+        symlink(elsewhere.path(), r.path().join(STACKS_DIR)).unwrap();
         let err = discover(r.path()).unwrap_err();
         assert!(
-            matches!(&err, StackError::Io { path, .. } if path == &dir.join(COMPOSE_FILE)),
+            matches!(&err, StackError::Symlink { path } if path == &r.path().join(STACKS_DIR)),
             "{err:?}"
         );
     }
@@ -436,6 +426,14 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("differ only in case"));
+
+        // The check on its own (the hook uses it on staged stack names).
+        check_case_collisions(["a", "b", "A-1"]).unwrap();
+        check_case_collisions([]).unwrap();
+        assert!(matches!(
+            check_case_collisions(["web", "x", "WEB"]).unwrap_err(),
+            StackError::CaseCollision { first, second } if first == "WEB" && second == "web"
+        ));
     }
 
     #[test]
@@ -477,108 +475,6 @@ mod tests {
             find(r.path(), "Web").unwrap_err(),
             StackError::Unknown { .. }
         ));
-    }
-
-    fn file_list(stack: &Stack) -> Vec<String> {
-        files(stack)
-            .unwrap()
-            .iter()
-            .map(|p| p.to_str().unwrap().to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn files_lists_everything_nested_sorted_by_bytes() {
-        let r = root();
-        add_stack(r.path(), "web");
-        let web = find(r.path(), "web").unwrap();
-        for rel in [
-            "a/b",
-            "a.b",
-            "config/app.conf",
-            "config/deep/er/x",
-            ".env",
-            "sub/.git/config",
-            ".git/HEAD",
-        ] {
-            let p = web.dir.join(rel);
-            fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(p, "").unwrap();
-        }
-        fs::create_dir_all(web.dir.join("empty/dir")).unwrap();
-        // Byte order: '.' (0x2e) < '/' (0x2f), so a.b comes before a/b.
-        assert_eq!(
-            file_list(&web),
-            [
-                ".env",
-                "a.b",
-                "a/b",
-                "compose.yaml",
-                "config/app.conf",
-                "config/deep/er/x"
-            ]
-        );
-        // A regular file named .git is an ordinary file.
-        fs::write(web.dir.join("sub/.gitx"), "").unwrap();
-        fs::remove_dir_all(web.dir.join("sub/.git")).unwrap();
-        fs::write(web.dir.join("sub/.git"), "gitdir: x\n").unwrap();
-        let got = file_list(&web);
-        assert!(got.contains(&"sub/.git".to_owned()), "{got:?}");
-        assert!(got.contains(&"sub/.gitx".to_owned()), "{got:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn files_follows_symlinks_and_skips_special_files() {
-        use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
-        let r = root();
-        let elsewhere = root();
-        fs::create_dir_all(elsewhere.path().join("conf")).unwrap();
-        fs::write(elsewhere.path().join("conf/a"), "").unwrap();
-        fs::write(elsewhere.path().join("file"), "").unwrap();
-        add_stack(r.path(), "web");
-        let web = find(r.path(), "web").unwrap();
-        symlink(elsewhere.path().join("conf"), web.dir.join("linked")).unwrap();
-        symlink(elsewhere.path().join("file"), web.dir.join("f")).unwrap();
-        // Two links to one directory (no loop) list it twice.
-        symlink(elsewhere.path().join("conf"), web.dir.join("linked2")).unwrap();
-        let _sock = UnixListener::bind(web.dir.join("sock")).unwrap();
-        assert_eq!(
-            file_list(&web),
-            ["compose.yaml", "f", "linked/a", "linked2/a"]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn files_reports_dangling_and_looping_symlinks() {
-        use std::os::unix::fs::symlink;
-        let r = root();
-        add_stack(r.path(), "web");
-        let web = find(r.path(), "web").unwrap();
-        let dangling = web.dir.join("gone");
-        symlink(r.path().join("nowhere"), &dangling).unwrap();
-        let err = files(&web).unwrap_err();
-        assert!(
-            matches!(&err, StackError::Io { path, .. } if path == &dangling),
-            "{err:?}"
-        );
-        fs::remove_file(&dangling).unwrap();
-
-        // A link back to an ancestor.
-        let sub = web.dir.join("a/b");
-        fs::create_dir_all(&sub).unwrap();
-        symlink(web.dir.join("a"), sub.join("up")).unwrap();
-        let err = files(&web).unwrap_err();
-        assert!(
-            matches!(&err, StackError::SymlinkLoop { path } if path == &sub.join("up")),
-            "{err:?}"
-        );
-        assert!(
-            err.to_string()
-                .ends_with("a/b/up: symlink loop (it leads back to a directory that contains it)")
-        );
     }
 
     #[test]

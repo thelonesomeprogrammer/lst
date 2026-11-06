@@ -24,6 +24,9 @@
 //! never touches the working tree, and because the environment is
 //! inherited it operates on whichever index `GIT_INDEX_FILE` names (git
 //! points it at a temporary index for `git commit -a` / `git commit <path>`).
+//!
+//! `worktree_files` is the working-tree counterpart for `lst sync`: the
+//! files git would stage, so sync and the hook see the same files.
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -87,6 +90,8 @@ pub enum GitError {
     Unmerged { path: String },
     #[error("staged path {lossy:?} is not valid UTF-8, which lst does not support")]
     NonUtf8IndexPath { lossy: String },
+    #[error("path {lossy:?} in the working tree is not valid UTF-8, which lst does not support")]
+    NonUtf8WorktreePath { lossy: String },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -101,6 +106,15 @@ pub enum IgnoreOutcome {
     AlreadyIgnored,
     /// `/.env` was appended to `<root>/.gitignore`.
     Added,
+}
+
+/// Whether `e` means "there is nothing at this path": `NotFound`, or
+/// `NotADirectory` when a parent directory has become a file.
+pub fn not_found(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> GitError + '_ {
@@ -522,6 +536,58 @@ fn add_with(program: &OsStr, root: &Path, rel_path: &Path) -> Result<(), GitErro
         return Err(failed(&args, out.status, &out.stderr));
     }
     Ok(())
+}
+
+/// The working-tree paths at or under `prefix` (a non-empty file or
+/// directory path, matched literally) that git would stage: tracked files
+/// and untracked files that aren't ignored (`git ls-files --cached
+/// --others --exclude-standard`). Sorted, without duplicates (git lists an
+/// unmerged path once per stage), and only paths that exist in the working
+/// tree (a tracked file deleted there is left out).
+///
+/// Paths are repo-relative and `/`-separated. Symlinks and directories are
+/// listed too (a symlink as itself, never followed; an untracked nested
+/// repository as `dir/`), so callers check what each path is. Nothing in
+/// a `.git` directory is ever listed.
+pub fn worktree_files(root: &Path, prefix: &str) -> Result<Vec<String>, GitError> {
+    worktree_files_with(OsStr::new(GIT), root, prefix)
+}
+
+fn worktree_files_with(
+    program: &OsStr,
+    root: &Path,
+    prefix: &str,
+) -> Result<Vec<String>, GitError> {
+    let args = [
+        OsStr::new("--literal-pathspecs"),
+        OsStr::new("ls-files"),
+        OsStr::new("-z"),
+        OsStr::new("--cached"),
+        OsStr::new("--others"),
+        OsStr::new("--exclude-standard"),
+        OsStr::new("--"),
+        OsStr::new(prefix),
+    ];
+    let out = run(program, root, &args)?;
+    if !out.status.success() {
+        return Err(failed(&args, out.status, &out.stderr));
+    }
+    let mut paths = Vec::new();
+    for rec in out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let path = String::from_utf8(rec.to_vec()).map_err(|e| GitError::NonUtf8WorktreePath {
+            lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })?;
+        let full = root.join(&path);
+        let exists = fs::symlink_metadata(&full)
+            .map(|_| true)
+            .or_else(|e| if not_found(&e) { Ok(false) } else { Err(e) });
+        if exists.map_err(io_err(&full))? {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// The directory git runs hooks from (`git rev-parse --git-path hooks`):
@@ -1380,6 +1446,122 @@ mod tests {
             add(root, Path::new("*")).unwrap_err(),
             GitError::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn worktree_files_lists_what_git_would_stage() {
+        let r = committed_repo();
+        let root = r.path();
+        write(root, ".gitignore", "data/\n*.log\n");
+        write(root, "stacks/web/compose.yaml", "c");
+        write(root, "stacks/web/gone", "g");
+        write(root, "stacks/webx/compose.yaml", "other stack");
+        sh_git(root, &["add", "."]);
+        sh_git(root, &["commit", "-q", "-m", "stacks"]);
+        write(root, "stacks/web/untracked.conf", "u");
+        write(root, "stacks/web/data/db/file", "ignored");
+        write(root, "stacks/web/x.log", "ignored");
+        write(root, "stacks/web/.git/config", "never listed");
+        fs::remove_file(root.join("stacks/web/gone")).unwrap();
+        // Tracked but ignored is still listed (it is tracked).
+        write(root, "stacks/web/forced.log", "f");
+        sh_git(root, &["add", "-f", "stacks/web/forced.log"]);
+        // An untracked nested repository is listed as a directory.
+        sh_git(&root.join("stacks/web"), &["init", "-q", "nested"]);
+        // A tracked directory that became a file: its old entry is gone.
+        write(root, "stacks/web/conf/a", "a");
+        sh_git(root, &["add", "stacks/web/conf/a"]);
+        fs::remove_dir_all(root.join("stacks/web/conf")).unwrap();
+        write(root, "stacks/web/conf", "now a file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("nowhere", root.join("stacks/web/link")).unwrap();
+
+        let got = worktree_files(root, "stacks/web/").unwrap();
+        let mut want = vec![
+            "stacks/web/compose.yaml",
+            "stacks/web/conf",
+            "stacks/web/forced.log",
+            "stacks/web/nested/",
+            "stacks/web/untracked.conf",
+        ];
+        #[cfg(unix)]
+        want.push("stacks/web/link");
+        want.sort();
+        assert_eq!(got, want);
+        // Literal and directory-bounded: `stacks/web` doesn't match webx.
+        assert_eq!(worktree_files(root, "stacks/web").unwrap(), want);
+        assert_eq!(
+            worktree_files(root, "stacks/*").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn worktree_files_dedupes_unmerged_paths() {
+        let r = committed_repo();
+        let root = r.path();
+        write(root, "stacks/a/compose.yaml", "base\n");
+        sh_git(root, &["add", "."]);
+        sh_git(root, &["commit", "-q", "-m", "base"]);
+        sh_git(root, &["checkout", "-q", "-b", "side"]);
+        write(root, "stacks/a/compose.yaml", "side\n");
+        sh_git(root, &["commit", "-q", "-am", "side"]);
+        sh_git(root, &["checkout", "-q", "-"]);
+        write(root, "stacks/a/compose.yaml", "main\n");
+        sh_git(root, &["commit", "-q", "-am", "main"]);
+        let st = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge", "-q", "side"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!st.success(), "the merge must conflict");
+        assert_eq!(
+            worktree_files(root, "stacks/").unwrap(),
+            ["stacks/a/compose.yaml"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_files_errors() {
+        use std::os::unix::ffi::OsStrExt;
+        let r = repo();
+        fs::create_dir_all(r.path().join("stacks")).unwrap();
+        fs::write(r.path().join(OsStr::from_bytes(b"stacks/bad-\xff")), "x").unwrap();
+        let err = worktree_files(r.path(), "stacks/").unwrap_err();
+        assert!(
+            matches!(&err, GitError::NonUtf8WorktreePath { lossy } if lossy == "stacks/bad-\u{fffd}"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("in the working tree is not valid UTF-8")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = worktree_files(dir.path(), "stacks/").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, .. } if command
+                == "--literal-pathspecs ls-files -z --cached --others --exclude-standard -- stacks/"),
+            "{err:?}"
+        );
+        let missing = dir.path().join("no-such-git");
+        assert!(matches!(
+            worktree_files_with(missing.as_os_str(), dir.path(), "x").unwrap_err(),
+            GitError::Spawn(_)
+        ));
+    }
+
+    #[test]
+    fn not_found_kinds() {
+        assert!(not_found(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(not_found(&io::Error::from(io::ErrorKind::NotADirectory)));
+        assert!(!not_found(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
     }
 
     #[test]

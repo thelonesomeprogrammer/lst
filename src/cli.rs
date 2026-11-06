@@ -52,7 +52,8 @@ pub enum Command {
     Init,
     /// Update .sec/ from the stack files in the working tree.
     ///
-    /// Reads every file under stacks/<stack>/ (not only compose.yaml). Gives
+    /// Reads every file under stacks/<stack>/ that git would stage (not only
+    /// compose.yaml; gitignored files and symlinks are skipped). Gives
     /// new <<gen:…>> names an id, marks names that are no longer used as
     /// orphans (never deletes them) and un-orphans names that come back.
     Sync,
@@ -315,16 +316,24 @@ fn read_compose(stack: &Stack) -> Result<(String, Zeroizing<String>), CliError> 
 /// `<<set:…>>` may hold a plaintext value).
 type Contents = Zeroizing<Vec<u8>>;
 
-/// Every file of every stack in the working tree, keyed by stack name (the
-/// scope of [`scan::collect`]; see [`stack::files`] for what is read).
+/// Every file of every stack in the working tree that git would stage,
+/// keyed by stack name (the scope of [`scan::collect`], the same files the
+/// pre-commit hook sees once they are staged). Gitignored files (bind-mounted
+/// data, say) are not read. Symlinks are skipped, not followed: git commits
+/// them as links, so the hook never sees what they point to
+/// ([`stack::discover`] already refused a symlinked `compose.yaml`).
+/// Directories (an untracked nested repository) are skipped too.
 fn read_stack_files(root: &Path) -> Result<scan::StackFiles<Contents>, CliError> {
     let mut out = BTreeMap::new();
     for s in stack::discover(root)? {
         let mut files = Vec::new();
-        for rel in stack::files(&s)? {
-            let path = format!("{STACKS_DIR}/{}/{}", s.name, rel.to_string_lossy());
-            let bytes = fs::read(s.dir.join(&rel)).map_err(io_err(Path::new(&path)))?;
-            files.push((path, Zeroizing::new(bytes)));
+        for path in git::worktree_files(root, &format!("{STACKS_DIR}/{}/", s.name))? {
+            let full = root.join(&path);
+            let meta = fs::symlink_metadata(&full).map_err(io_err(Path::new(&path)))?;
+            if meta.is_file() {
+                let bytes = fs::read(&full).map_err(io_err(Path::new(&path)))?;
+                files.push((path, Zeroizing::new(bytes)));
+            }
         }
         out.insert(s.name, files);
     }
