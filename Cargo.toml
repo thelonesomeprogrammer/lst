@@ -1,0 +1,17 @@
+[package]
+name = "lst"
+version = "0.1.0"
+edition = "2024"
+description = "Lazy Secret Tool: fill secret markers in Docker Compose files at deploy time"
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+blake3 = { version = "1.8", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.4"
+thiserror = "2"
+zeroize = "1.9"
+
+[dev-dependencies]
+proptest = "1.12"
