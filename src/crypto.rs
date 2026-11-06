@@ -366,6 +366,39 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_non_utf8_plaintext() {
+        // seal() only takes &str, so build a valid ciphertext of invalid
+        // UTF-8 directly with the same AD layout.
+        let key = encryption_key(&seed(1));
+        let nonce = [7u8; NONCE_LEN];
+        let ad = associated_data("s/n").unwrap();
+        let ciphertext = cipher(&key)
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: &[0xff, 0xfe],
+                    aad: &ad,
+                },
+            )
+            .unwrap();
+        let sealed = Sealed { nonce, ciphertext };
+        assert_eq!(
+            open(&key, "s/n", &sealed).unwrap_err(),
+            CryptoError::NotUtf8
+        );
+    }
+
+    #[test]
+    fn nul_in_name_is_rejected_by_open_too() {
+        let key = encryption_key(&seed(1));
+        let sealed = seal(&key, "s/n", "v").unwrap();
+        assert_eq!(
+            open(&key, "s\0n", &sealed).unwrap_err(),
+            CryptoError::InvalidName
+        );
+    }
+
+    #[test]
     fn nul_in_name_is_rejected() {
         let key = encryption_key(&seed(1));
         assert_eq!(

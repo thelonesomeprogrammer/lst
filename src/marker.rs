@@ -291,10 +291,9 @@ fn unescape(raw: &str) -> SecretString {
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            // Validated: always followed by `\` or `>`.
-            if let Some(e) = chars.next() {
-                s.push(e);
-            }
+            // Validated: always followed by `\` or `>`, so this pushes
+            // exactly one char.
+            s.extend(chars.next());
         } else {
             s.push(c);
         }
@@ -389,6 +388,13 @@ mod tests {
         assert_eq!(m.span, 2..18);
         assert_eq!(m.kind.name(), "smtp");
         assert_eq!(set_value("<<set:smtp:p:w>>"), "p:w");
+    }
+
+    #[test]
+    fn name_accessor() {
+        assert_eq!(one("<<gen:shared/a:uuid>>").kind.name(), "shared/a");
+        assert_eq!(one("<<secret:b.c_d-e>>").kind.name(), "b.c_d-e");
+        assert_eq!(one("<<set:f:v>>").kind.name(), "f");
     }
 
     #[test]
