@@ -91,6 +91,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 | `lst init` | Create the seed, gitignore `.env`, write `.sec/meta.toml`, install the hook |
 | `lst sync` | Update `.sec/` from your compose files (the hook does this for you) |
 | `lst render <stack>` | Print the resolved compose file to stdout |
+| `lst rename <stack>/<old> <new>` | Rename a secret keeping its value (`--replace` if the new name exists) |
 | `lst deploy <stack>` / `--all` | Check → render files → `pre` → `compose up --wait` → `post` |
 | `lst check` | Verify `.sec/` is current, no `<<set:` committed, all secrets resolvable |
 | `lst hook install` / `run` | Install / run the pre-commit logic |
@@ -121,7 +122,8 @@ lst render web | docker compose -p web --project-directory stacks/web -f - up -d
 ```
 
 - **`lst init`** gitignores `.env` (and refuses if `.env` is tracked), creates the seed and writes `.sec/meta.toml`. Other lines in an existing `.env` are kept. It never prints the seed. Running it again only checks that the seed in `.env` matches `.sec/`. If `.sec/` already exists but `.env` has no seed, it refuses rather than create a second seed.
-- **`lst sync`** reads every `stacks/<stack>/compose.yaml` in the working tree and updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards. `<<set:…>>` is refused until the pre-commit hook (M2) exists.
+- **`lst sync`** reads every file under `stacks/<stack>/` in the working tree (not only `compose.yaml`; `.git` directories are skipped, symlinks are followed, non-UTF-8 files are skipped unless they contain `<<set:`) and updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards. `<<set:…>>` is refused: commit the file instead, and the pre-commit hook stores the value. When one name disappears and one appears in the same stack, it prints the `lst rename` command that keeps the old value.
+- **`lst rename <from> <to> [--replace]`** renames an entry in `.sec/` without changing its value: a generated secret keeps its id, a manual secret is re-encrypted under the new name. `<from>` is a full name (`web/db`, `shared/mqtt`); `<to>` is a full name too, or a name without `/` in the same stack (or `shared`). Moving between a stack and `shared/` works. If `<to>` already exists (typically because a sync or commit just gave it a fresh id) pass `--replace`. It does not edit your files: change the markers yourself.
 - **`lst render <stack>`** prints the resolved compose file to stdout and nothing else; diagnostics go to stderr. It is read-only: a name that isn't in `.sec/` yet fails with a hint to run `lst sync`. Every unresolvable secret is listed in one go.
 - Marker errors point at the spot: `stacks/web/compose.yaml:3:17: …`.
 - Exit codes: `0` ok, `1` error, `2` usage error.

@@ -23,10 +23,10 @@ use zeroize::Zeroizing;
 use crate::crypto::{CryptoError, Seed};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
-use crate::marker::{self, ParseError, ParseErrorKind};
 use crate::render::{self, RenderError};
+use crate::scan::{self, ScanError};
 use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, Stack, StackError};
-use crate::store::{META, ResolveError, Store, StoreError, SyncReport};
+use crate::store::{self, EntryKind, META, ResolveError, SHARED, Store, StoreError, SyncReport};
 
 /// The store directory, relative to the repository root.
 pub const SEC_DIR: &str = ".sec";
@@ -50,11 +50,27 @@ pub enum Command {
     /// On a second machine, put the seed from your password manager into
     /// .env as LST_SEED=… instead; `lst init` then only checks it.
     Init,
-    /// Update .sec/ from the compose files in the working tree.
+    /// Update .sec/ from the stack files in the working tree.
     ///
-    /// Gives new <<gen:…>> names an id, marks names that are no longer used
-    /// as orphans (never deletes them) and un-orphans names that come back.
+    /// Reads every file under stacks/<stack>/ (not only compose.yaml). Gives
+    /// new <<gen:…>> names an id, marks names that are no longer used as
+    /// orphans (never deletes them) and un-orphans names that come back.
     Sync,
+    /// Rename a secret in .sec/, keeping its value.
+    ///
+    /// A generated secret keeps its id; a manual secret is re-encrypted under
+    /// the new name. Does not edit your files: change the markers yourself.
+    Rename {
+        /// The current full name: <stack>/<name> or shared/<name>.
+        from: String,
+        /// The new name: a full name (<stack>/<name> or shared/<name>), or a
+        /// name without `/` for the same stack (or shared) as FROM.
+        to: String,
+        /// Overwrite an existing entry of the new name (e.g. the fresh id a
+        /// sync or commit just gave it).
+        #[arg(long)]
+        replace: bool,
+    },
     /// Print the resolved compose file of a stack to stdout.
     ///
     /// Read-only: never writes .sec/ or .env.
@@ -104,13 +120,14 @@ pub enum CliError {
     SecWithoutMeta,
     #[error("could not create a seed: {0}")]
     Seed(CryptoError),
-    #[error("{path}:{line}:{col}: {kind}")]
-    Parse {
-        path: String,
-        line: usize,
-        col: usize,
-        kind: ParseErrorKind,
-    },
+    #[error(transparent)]
+    Scan(#[from] ScanError),
+    #[error(
+        "{path}: <<set:{name}:…>> is stored by the pre-commit hook, not by `lst sync`: commit \
+         the file, and the hook encrypts the value into .sec/ and rewrites the marker to \
+         <<secret:{name}>>"
+    )]
+    SetInWorkingTree { path: String, name: String },
     #[error("{path}: {source}")]
     Render {
         path: String,
@@ -139,6 +156,7 @@ pub fn run(
     match cli.command {
         Command::Init => init(&root, stderr),
         Command::Sync => sync(&root, stderr),
+        Command::Rename { from, to, replace } => rename(&root, &from, &to, replace, stderr),
         Command::Render { stack } => render_stack(&root, &stack, stdout),
     }
 }
@@ -293,25 +311,36 @@ fn read_compose(stack: &Stack) -> Result<(String, Zeroizing<String>), CliError> 
     Ok((path, Zeroizing::new(text)))
 }
 
-fn parse_err(path: &str, text: &str, e: ParseError) -> CliError {
-    let (line, col) = marker::line_col(text, e.pos);
-    CliError::Parse {
-        path: path.to_owned(),
-        line,
-        col,
-        kind: e.kind,
+/// The contents of a stack file (zeroized on drop: an uncommitted
+/// `<<set:…>>` may hold a plaintext value).
+type Contents = Zeroizing<Vec<u8>>;
+
+/// Every file of every stack in the working tree, keyed by stack name (the
+/// scope of [`scan::collect`]; see [`stack::files`] for what is read).
+fn read_stack_files(root: &Path) -> Result<scan::StackFiles<Contents>, CliError> {
+    let mut out = BTreeMap::new();
+    for s in stack::discover(root)? {
+        let mut files = Vec::new();
+        for rel in stack::files(&s)? {
+            let path = format!("{STACKS_DIR}/{}/{}", s.name, rel.to_string_lossy());
+            let bytes = fs::read(s.dir.join(&rel)).map_err(io_err(Path::new(&path)))?;
+            files.push((path, Zeroizing::new(bytes)));
+        }
+        out.insert(s.name, files);
     }
+    Ok(out)
 }
 
 fn sync(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
     let (_seed, mut store) = open_store(root)?;
-    let mut uses = BTreeMap::new();
-    for s in stack::discover(root)? {
-        let (path, text) = read_compose(&s)?;
-        let markers = marker::parse(&text).map_err(|e| parse_err(&path, &text, e))?;
-        uses.insert(s.name, markers.into_iter().map(|m| m.kind).collect());
+    let scan = scan::collect(&read_stack_files(root)?)?;
+    if let Some(site) = scan.sets.into_iter().next() {
+        return Err(CliError::SetInWorkingTree {
+            path: site.path,
+            name: site.name,
+        });
     }
-    let report = store.sync(&uses)?;
+    let report = store.sync(&scan.uses)?;
     store.save(&root.join(SEC_DIR))?;
     print_report(stderr, &report);
     Ok(())
@@ -346,6 +375,60 @@ fn print_report(stderr: &mut dyn Write, r: &SyncReport) {
             &format!("not set: {name} (render fails until it has a value)"),
         );
     }
+    for (old, new) in &r.rename_candidates {
+        note(
+            stderr,
+            &format!(
+                "looks like a rename: run `lst rename {old} {new} --replace` to keep the old value"
+            ),
+        );
+    }
+}
+
+/// `lst rename FROM TO [--replace]`. TO without `/` is a name in FROM's
+/// file (its stack, or `shared`); with `/` it is a full name. A target
+/// stack must exist (catches typos); the source stack may be gone (e.g.
+/// after renaming the stack directory).
+fn rename(
+    root: &Path,
+    from: &str,
+    to: &str,
+    replace: bool,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (seed, mut store) = open_store(root)?;
+    let source = store::parse_full_name(from)?;
+    let to = if to.contains('/') {
+        to.to_owned()
+    } else {
+        format!("{}/{to}", source.file)
+    };
+    let target = store::parse_full_name(&to)?;
+    if target.file != SHARED {
+        stack::find(root, &target.file)?;
+    }
+    let done = store.rename(&seed, &source.full_name, &target.full_name, replace)?;
+    store.save(&root.join(SEC_DIR))?;
+    let how = match done.kind {
+        EntryKind::Gen => "generated secret; same id, so the value is unchanged",
+        EntryKind::Secret => "manual secret; re-encrypted under the new name",
+    };
+    note(
+        stderr,
+        &format!("renamed {} -> {} ({how})", done.from, done.to),
+    );
+    if done.replaced {
+        note(
+            stderr,
+            &format!("replaced the previous entry of {}", done.to),
+        );
+    }
+    note(
+        stderr,
+        "lst rename does not edit your files: change the markers to the new name if you \
+         haven't yet, then commit .sec/",
+    );
+    Ok(())
 }
 
 fn render_stack(root: &Path, name: &str, stdout: &mut dyn Write) -> Result<(), CliError> {
@@ -354,7 +437,7 @@ fn render_stack(root: &Path, name: &str, stdout: &mut dyn Write) -> Result<(), C
     let (path, text) = read_compose(&s)?;
     let rendered =
         render::render(&text, |m| store.resolve(&seed, &s.name, m)).map_err(|e| match e {
-            RenderError::Parse(p) => parse_err(&path, &text, p),
+            RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
             source => CliError::Render {
                 path: path.clone(),
                 source,
