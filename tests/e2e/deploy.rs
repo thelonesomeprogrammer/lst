@@ -290,6 +290,7 @@ fn deploys_from_a_subdirectory() {
         .unwrap();
     let run = Run::from_output(out);
     assert_eq!(run.ok(), "");
+    assert_eq!(run.stderr, deployed_stderr(&["a"], 1));
     assert_eq!(repo.snapshot(), before);
     // Still run in the repository root.
     let calls = fake.calls();

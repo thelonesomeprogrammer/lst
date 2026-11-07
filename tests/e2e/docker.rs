@@ -244,7 +244,10 @@ fn lst_deploy(repo: &Repo, args: &[&str]) -> Run {
 }
 
 /// A second stack: one container of the same image, so nothing new has to
-/// be pulled.
+/// be pulled. The image's `VOLUME` gets a named volume: the test recreates
+/// this container, and Docker hands an anonymous volume on to the new
+/// container in a way `down -v` no longer removes, while a named volume
+/// carries the project label `down -v` goes by.
 fn idle_stack(image: &str) -> String {
     format!(
         "\
@@ -254,6 +257,10 @@ services:
     environment:
       TOKEN: <<gen:token>>
     command: [\"sleep\", \"infinity\"]
+    volumes:
+      - data:/var/lib/postgresql/data
+volumes:
+  data:
 "
     )
 }
@@ -315,5 +322,28 @@ fn docker_lst_deploy() {
     let idle = containers(&other);
     assert_eq!(idle.len(), 1, "{idle:?}");
     assert!(idle[0].ends_with(" running"), "{idle:?}");
+
+    // A change to the existing other stack: only it is deployed (and its
+    // container recreated, since its configuration changed).
+    repo.compose(
+        &other,
+        &idle_stack(&image).replace("      TOKEN:", "      MODE: changed\n      TOKEN:"),
+    );
+    repo.git(&["add", "-A"]);
+    assert_eq!(repo.commit(&["-m", "other changed"]).code, Some(0));
+    let run = lst_deploy(&repo, &["--changed-since", "HEAD~1"]);
+    assert!(
+        run.stderr.ends_with(&format!("lst: deployed {other}\n")),
+        "{run:#?}"
+    );
+    assert!(
+        !run.stderr.contains(&format!("deployed {main}")),
+        "{run:#?}"
+    );
+    assert_eq!(containers(&main), first);
+    let recreated = containers(&other);
+    assert_eq!(recreated.len(), 1, "{recreated:?}");
+    assert!(recreated[0].ends_with(" running"), "{recreated:?}");
+    assert_ne!(recreated, idle, "the changed stack was not recreated");
     assert_client_logs_in(&main, &dir, &rendered);
 }
