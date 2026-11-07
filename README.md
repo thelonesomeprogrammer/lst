@@ -90,7 +90,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 |---|---|
 | `lst init` | Create the seed, gitignore `.env`, write `.sec/meta.toml`, install the hook |
 | `lst sync` | Update `.sec/` from your compose files (the hook does this for you) |
-| `lst render <stack>` | Print the resolved compose file to stdout |
+| `lst render <stack>` | Print the resolved compose file to stdout (`--file FROM`: one rendered `x-deploy` file) |
 | `lst rename <stack>/<old> <new>` | Rename a secret keeping its value (`--replace` if the new name exists) |
 | `lst deploy <stack>…` / `--changed-since REV` | Check, then render and `compose up --wait` each stack (`x-deploy` steps: M4; `--all`: M5) |
 | `lst check` | Verify `.sec/` is current, no `<<set:` committed, all secrets resolvable |
@@ -108,7 +108,7 @@ lst init                     # on the first machine (also installs the pre-commi
 
 ## Usage today (M3)
 
-`x-deploy`, `rotate`, `gc` and `--all` don't exist yet. What works now:
+`rotate`, `gc` and `--all` don't exist yet, and `lst deploy` doesn't run `x-deploy` steps or write `render:` files yet (M4 in progress; `lst render` and `lst check` already handle `x-deploy`). What works now:
 
 ```sh
 lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml, pre-commit hook
@@ -142,6 +142,12 @@ lst deploy web               # check, render, docker compose up (or: lst render 
 - **`lst sync`** does by hand what the hook does on commit (you rarely need it). It reads every file under `stacks/<stack>/` in the working tree that git would stage (not only `compose.yaml`). Gitignored files, such as bind-mounted data, are skipped; symlinks are skipped rather than followed; non-UTF-8 files are skipped unless they contain `<<set:`. A symlinked `stacks/`, a symlink directly in `stacks/` and a symlinked `compose.yaml` are errors (git commits a symlink as a link, so the hook couldn't see the stack). It updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards (any commit does: the hook stages it). `<<set:…>>` is refused: commit the file instead, and the pre-commit hook stores the value. When one name disappears and one appears in the same stack, it prints the `lst rename` command that keeps the old value.
 - **`lst rename <from> <to> [--replace]`** renames an entry in `.sec/` without changing its value: a generated secret keeps its id, a manual secret is re-encrypted under the new name. `<from>` is a full name (`web/db`, `shared/mqtt`); `<to>` is a full name too, or a name without `/` in the same stack (or `shared`). Moving between a stack and `shared/` works. If `<to>` already exists (typically because a sync or commit just gave it a fresh id) pass `--replace`. It does not edit your files: change the markers yourself.
 - **`lst render <stack>`** prints the resolved compose file to stdout and nothing else; diagnostics go to stderr. It is read-only: a name that isn't in `.sec/` yet fails with a hint to run `lst sync`. Every unresolvable secret is listed in one go.
+- **Stacks with `x-deploy`** (a line starting with `x-deploy:` in `compose.yaml`) are rendered through YAML instead of as raw text: markers are substituted inside the parsed strings (so values are quoted correctly, whatever they contain), `x-deploy` is removed, merge keys (`<<: *anchor`) are applied, and every service with rendered inputs gets an `lst.render-hash` label. Comments and formatting are not kept. Stacks without it render byte for byte as before. `lst render <stack> --file <from>` prints one rendered `render:` file instead (`from` as written in `x-deploy`); `lst render` never writes the `to:` files.
+  - `render: [{from, to, mode}]`: `from` is relative to `stacks/<stack>/` and must be a file `lst sync` reads (not gitignored, not a symlink, UTF-8); `to` is an absolute path without `..`; `mode` is a quoted octal string, default `"0600"`, at most `"0777"`.
+  - `pre: [{with, run, when}]` / `post: [{exec, run, when}]`: `with`/`exec` name a service of the stack; `run` is a string (`sh -c`) or a list (exec form, no shell); `when` is `always` (default) or `on-change`. Markers are rendered in `run` only.
+  - A service gets the label if it bind-mounts a rendered `to:` file or a parent directory of it (absolute host paths; short `/host:/ctr[:ro]` or long `type: bind` syntax; named volumes, relative paths and paths with `$VAR` don't count), or if a step targets it. The hash is keyed with the seed, so it reveals nothing. Don't set `lst.render-hash` yourself.
+  - Unknown keys and every rule above are errors; YAML errors show only line and column (the parser's message could quote a secret). `lst check` reports them too, also without a seed.
+  - Write markers literally: a marker that only appears through YAML escapes (`"\x3c<gen:a>>"`) isn't seen by `lst sync`.
 - **`lst check`** lists every problem at once and exits 1 if there is any (read-only):
   - `.sec/` is current for the working tree (what `lst sync` would change: new or orphaned names, a stale format);
   - no file committed in `HEAD` contains `<<set:` (it is in the history: rotate the secret), and no `<<set:` waits in the working tree;
@@ -161,7 +167,7 @@ lst deploy web               # check, render, docker compose up (or: lst render 
 
 **Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run `lst hook install` (a clone doesn't bring hooks along). `lst init` works too: there it confirms the seed matches `.sec/meta.toml` and installs the hook. A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
 
-**Quoting manual secrets in YAML:** `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. A block scalar takes any single-line value as-is:
+**Quoting manual secrets in YAML** (stacks without `x-deploy`; with it, the serializer quotes values for you): `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. A block scalar takes any single-line value as-is:
 
 ```yaml
 environment:
