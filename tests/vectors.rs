@@ -6,10 +6,14 @@
 //! update a vector to make a test pass: every deployed secret depends on
 //! these exact outputs.
 
+use std::path::Path;
+
 use lst::crypto::{
-    GenId, Sealed, Seed, derive_gen, encryption_key, fingerprint, open, render_hash_key,
+    GenId, Sealed, SecretString, Seed, derive_gen, encryption_key, fingerprint, open,
+    render_hash_key,
 };
 use lst::format::{Format, generate};
+use lst::xdeploy::{Phase, Run, Step, When, service_hash};
 
 const SEED: [u8; 32] = [0x42; 32];
 const ID_ZERO: [u8; 16] = [0x00; 16];
@@ -226,5 +230,53 @@ fn render_hash_key_vector() {
     assert_eq!(
         hash(b""),
         "f2dba65f855f80fcd14b5567a5e26014cf6573430df1ffbe1d62bfeffa57dc90"
+    );
+}
+
+/// Added in M4 (2026-11-07): the canonical encoding of a service's inputs
+/// under the render-hash key (`xdeploy::service_hash`; its doc comment has
+/// the layout). Cross-checked with an independent Python encoder of that
+/// layout and the Python `blake3` bindings. Changing it would recreate
+/// every labelled container once.
+#[test]
+fn render_hash_encoding_vector() {
+    let key = render_hash_key(&seed());
+    let s = |v: &str| SecretString::new(v.to_owned());
+    let pre = Step {
+        service: "mosquitto".into(),
+        run: Run::Shell(s(
+            "mosquitto_passwd -b -c /mosquitto/config/passwd z2m s3cret",
+        )),
+        when: When::Always,
+    };
+    let post = Step {
+        service: "mosquitto".into(),
+        run: Run::Exec(vec![
+            s("mongosh"),
+            s("--eval"),
+            s("db.createUser({user: \"a\", pwd: \"b\"})"),
+        ]),
+        when: When::OnChange,
+    };
+    let passwd = "user z2m\npassword päss:w0rd\n";
+    // Given unsorted: the encoding sorts files by `to`.
+    let files: [(&Path, &[u8]); 2] = [
+        (
+            Path::new("/srv/mosquitto/config/passwd.conf"),
+            passwd.as_bytes(),
+        ),
+        (
+            Path::new("/srv/mosquitto/config/mosquitto.conf"),
+            b"listener 1883\nallow_anonymous false\n",
+        ),
+    ];
+    let steps = [(Phase::Pre, &pre), (Phase::Post, &post)];
+    assert_eq!(
+        service_hash(&key, &files, &steps),
+        "99b040a957ecc1d4ec517fb54ee506c49febbd71cd8b6b6d02659c65d2ed9b39"
+    );
+    assert_eq!(
+        service_hash(&key, &[], &[]),
+        "0073f3d919158ec425ecf7b63a28da7dbbd225a82a464e85dc3edc3d942dc4b2"
     );
 }

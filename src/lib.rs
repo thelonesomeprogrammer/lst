@@ -2,7 +2,7 @@
 //! with seed-derived or encrypted values at deploy time.
 //!
 //! `marker`, `crypto`, `format`, `envfile`, `render`, `scan`, `hook`,
-//! `check` and `deploy::affected_stacks` are pure (no filesystem,
+//! `check`, `xdeploy` and `deploy::affected_stacks` are pure (no filesystem,
 //! subprocesses or environment variables; `crypto` only uses the OS random
 //! generator). `git`, `stack`, `store::{load, read_files, save}`,
 //! `deploy::run_compose` and `cli` (the commands behind the binary) do the
@@ -22,3 +22,4 @@ pub mod render;
 pub mod scan;
 pub mod stack;
 pub mod store;
+pub mod xdeploy;

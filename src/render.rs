@@ -4,7 +4,8 @@
 //! as-is, without YAML quoting or escaping, and every byte outside a marker
 //! is copied verbatim. Text without markers renders byte-identically.
 //!
-//! `x-deploy` stripping and `lst.render-hash` labels are M4.
+//! Stacks with `x-deploy` take the YAML path in [`crate::xdeploy`] instead
+//! (which uses this for its `render:` files and for every string scalar).
 
 use std::collections::BTreeMap;
 use std::fmt;
