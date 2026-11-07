@@ -130,6 +130,37 @@ impl Repo {
         self.lst_in(self.path(), args)
     }
 
+    /// `lst <args>` with `LST_SEED=<value>` in its environment (only in the
+    /// child's: the test process's environment is never changed).
+    pub fn lst_env(&self, args: &[&str], value: impl AsRef<OsStr>) -> Run {
+        let out = lst_cmd(self.path(), args)
+            .env("LST_SEED", value)
+            .output()
+            .unwrap();
+        Run::from_output(out)
+    }
+
+    /// A `git clone` of this repository into a new temp dir, as CI checks
+    /// it out: committed files only (no `.env`, no hooks), with a local
+    /// identity for commits.
+    pub fn clone_repo(&self) -> Repo {
+        let repo = Repo {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        let st = git_cmd()
+            .args(["clone", "-q"])
+            .arg(self.path())
+            .arg(repo.path())
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "git clone");
+        repo.git(&["config", "user.name", "lst test"]);
+        repo.git(&["config", "user.email", "lst-test@example.invalid"]);
+        repo.git(&["config", "core.excludesFile", "/dev/null"]);
+        repo
+    }
+
     /// The seed in `.env`.
     pub fn seed(&self) -> Seed {
         envfile::parse_seed(&self.read(".env")).unwrap().unwrap()
@@ -190,6 +221,7 @@ impl Repo {
             .arg(self.path())
             .args(args)
             .env("PATH", path)
+            .env_remove("LST_SEED")
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -209,6 +241,22 @@ impl Repo {
         let mut all = vec!["commit", "-q"];
         all.extend_from_slice(args);
         self.git_run(&all, None)
+    }
+
+    /// `git commit -q <args>` with `LST_SEED=<seed_hex>` in git's (and so
+    /// the hook's) environment.
+    pub fn commit_env(&self, args: &[&str], seed_hex: &str) -> Run {
+        let out = git_cmd()
+            .arg("-C")
+            .arg(self.path())
+            .args(["commit", "-q"])
+            .args(args)
+            .env("PATH", path_with_lst())
+            .env("LST_SEED", seed_hex)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        Run::from_output(out)
     }
 
     /// The number of commits on `HEAD`.
@@ -256,13 +304,15 @@ pub fn path_without_lst() -> OsString {
     std::env::join_paths(dirs).unwrap()
 }
 
-/// The real binary, with git's user/system config switched off.
+/// The real binary, with git's user/system config switched off and no
+/// `LST_SEED` inherited from the test runner's environment.
 pub fn lst_cmd(cwd: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_lst"));
     c.current_dir(cwd)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("LST_SEED")
         .stdin(Stdio::null());
     c
 }

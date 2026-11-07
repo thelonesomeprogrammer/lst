@@ -12,6 +12,12 @@ mod docker;
 #[path = "e2e/hook.rs"]
 mod hook;
 
+#[path = "e2e/seed_env.rs"]
+mod seed_env;
+
+#[path = "e2e/check.rs"]
+mod check;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;

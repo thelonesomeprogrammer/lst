@@ -797,6 +797,14 @@ impl Store {
 
     /// Reads `.sec/`. Files not ending in `.toml` are ignored.
     pub fn load(sec_dir: &Path) -> Result<Store, StoreError> {
+        let (meta, files) = Store::read_files(sec_dir)?;
+        Store::from_files(&meta, &files)
+    }
+
+    /// The text [`Store::load`] parses: `meta.toml`, and every other
+    /// `.toml` file of `sec_dir` by stem. (`lst check` compares it with
+    /// what [`Store::to_files`] would write.)
+    pub fn read_files(sec_dir: &Path) -> Result<(String, BTreeMap<String, String>), StoreError> {
         let meta_path = sec_dir.join(format!("{META}.toml"));
         let meta = match fs::read_to_string(&meta_path) {
             Ok(text) => text,
@@ -824,7 +832,7 @@ impl Store {
             let text = fs::read_to_string(&path).map_err(io_err(&path))?;
             files.insert(stem.to_owned(), text);
         }
-        Store::from_files(&meta, &files)
+        Ok((meta, files))
     }
 
     /// Writes `.sec/` (creating the directory if needed). Only writes files
@@ -2592,6 +2600,30 @@ orphan = false
         let loaded = Store::load(sec).unwrap();
         assert_eq!(loaded.files()["extra"], StackFile::default());
         assert_eq!(loaded.files().len(), store.files().len() + 1);
+    }
+
+    #[test]
+    fn read_files_returns_the_text_load_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let sec = dir.path();
+        let (_, store) = populated();
+        store.save(sec).unwrap();
+        // Not as lst writes it, but valid: read as is, byte for byte.
+        let web = fs::read_to_string(sec.join("web.toml")).unwrap();
+        let edited = web.replace("orphan = false", "orphan=false");
+        fs::write(sec.join("web.toml"), &edited).unwrap();
+        fs::write(sec.join("notes.txt"), "ignored").unwrap();
+        let (meta, files) = Store::read_files(sec).unwrap();
+        let written = store.to_files();
+        assert_eq!(meta, written["meta.toml"]);
+        assert_eq!(files["web"], edited);
+        assert_eq!(files.len(), written.len() - 1);
+        assert!(!files.contains_key("meta") && !files.contains_key("notes"));
+        assert_eq!(Store::from_files(&meta, &files).unwrap(), store);
+        assert!(matches!(
+            Store::read_files(&sec.join("missing")).unwrap_err(),
+            StoreError::NotInitialized { .. }
+        ));
     }
 
     #[test]

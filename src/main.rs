@@ -28,6 +28,7 @@ fn run(args: Cli) -> anyhow::Result<()> {
     cli::run(
         args,
         &cwd,
+        std::env::var_os("LST_SEED"),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     )
