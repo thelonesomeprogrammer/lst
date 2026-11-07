@@ -11,13 +11,21 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
 use crate::support::{Repo, Run, lst_cmd};
 
 /// Plaintext values these tests set; never in lst's output.
-const PLAINTEXTS: &[&str] = &["d3pl0y-t0k", "5mtp-v4l", "n3w-t0k", "n3w-5mtp", "l34k-v4l"];
+const PLAINTEXTS: &[&str] = &[
+    "d3pl0y-t0k",
+    "5mtp-v4l",
+    "n3w-t0k",
+    "n3w-5mtp",
+    "l34k-v4l",
+    "n0te-v4l",
+];
 
 const OTHER_SEED: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
@@ -81,8 +89,18 @@ impl Fake {
                 seed: String::from_utf8(read("seed")).unwrap(),
             });
         }
-        // Nothing else was recorded.
-        let files = fs::read_dir(dir).unwrap().count();
+        // Nothing else was recorded (`ps.*` are a test's scripted answers).
+        let files = fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("call-")
+            })
+            .count();
         assert_eq!(files, out.len() * 4);
         out
     }
@@ -124,12 +142,15 @@ struct Opts<'a> {
     path: Option<OsString>,
     /// More environment variables for lst (and so the fake).
     env: &'a [(&'a str, &'a str)],
+    /// The umask lst runs with, if not the inherited one.
+    umask: Option<&'a str>,
 }
 
 const DEFAULT: Opts<'static> = Opts {
     seed: None,
     path: None,
     env: &[],
+    umask: None,
 };
 
 /// `lst deploy <args>` in `repo` with the fake docker. Asserts that it
@@ -141,11 +162,28 @@ fn deploy(repo: &Repo, fake: &Fake, args: &[&str], seed_hex: &str, opts: Opts<'_
     let before = repo.snapshot();
     let mut all = vec!["deploy"];
     all.extend_from_slice(args);
-    let mut cmd = lst_cmd(repo.path(), &all);
+    let mut cmd = match opts.umask {
+        None => lst_cmd(repo.path(), &all),
+        Some(umask) => {
+            // `sh` sets the umask, then becomes lst, with lst_cmd's
+            // environment.
+            let mut c = Command::new("sh");
+            c.args(["-c", "umask \"$0\" && exec \"$@\"", umask])
+                .arg(env!("CARGO_BIN_EXE_lst"))
+                .args(&all)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("LST_SEED")
+                .stdin(Stdio::null());
+            c
+        }
+    };
     cmd.env("PATH", opts.path.unwrap_or_else(|| fake.path()))
         .env("LST_FAKE_DOCKER_DIR", fake.record.path())
         .env_remove("LST_FAKE_DOCKER_EXIT")
         .env_remove("LST_FAKE_DOCKER_FAIL_PROJECT")
+        .env_remove("LST_FAKE_DOCKER_FAIL_SUBCOMMAND")
         .envs(opts.env.iter().copied());
     if let Some(s) = opts.seed {
         cmd.env("LST_SEED", s);
@@ -797,4 +835,596 @@ fn repo_change_a(repo: &Repo) {
         &svc("      PW: <<gen:db>>\n      MQTT: <<gen:shared/mqtt:hex64>>\n      Z: 2\n"),
     );
     commit_all(repo, "a");
+}
+
+// ---------------------------------------------------------------------------
+// x-deploy: render: files, pre/post steps, on-change
+// ---------------------------------------------------------------------------
+
+/// The manual secret of the x-deploy stack: `"`, `#` and `: ` (in
+/// PLAINTEXTS through its prefix).
+const NOTE: &str = "n0te-v4l\"ue #1: x";
+
+const MOSQUITTO_CONF: &str =
+    "listener 1883\npassword_file /mosquitto/config/passwd\n# z2m <<gen:shared/mqtt-z2m>>\n";
+const EXTRA: &str = "note=<<secret:note>>\n";
+
+/// The compose file of the `mq` stack, its `to:` paths under `out`.
+fn mq_compose(out: &Path) -> String {
+    let d = out.display();
+    format!(
+        "\
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - \"18883:1883\"
+    volumes:
+      - {d}/mosquitto:/mosquitto/config
+  db:
+    image: postgres:17-alpine
+    environment:
+      NOTE: '<<set:note:{NOTE}>>'
+  app:
+    image: busybox
+    environment:
+      PW: <<gen:app-pw>>
+x-deploy:
+  render:
+    - from: config/mosquitto.conf
+      to: {d}/mosquitto/mosquitto.conf
+      mode: \"0644\"
+    - from: ./config//extra.txt
+      to: {d}/extra/extra.txt
+  pre:
+    - with: mosquitto
+      run: mosquitto_passwd -b -c /mosquitto/config/passwd z2m <<gen:shared/mqtt-z2m>>
+    - with: mosquitto
+      run: [chown, \"1883:1883\", /mosquitto/config/passwd]
+      when: on-change
+  post:
+    - exec: db
+      run: psql -U postgres -c \"ALTER ROLE app1 PASSWORD '<<gen:pg-app1>>'\"
+      when: on-change
+    - exec: app
+      run: [echo, <<gen:app-pw>>]
+"
+    )
+}
+
+/// A repository with the x-deploy stack `mq` (render targets under a temp
+/// dir) and the plain stacks `a` and `z`, committed through the hook.
+struct XRepo {
+    repo: Repo,
+    out: TempDir,
+}
+
+/// What one call of the fake should have been, for stack `mq`.
+enum Want {
+    Ps(&'static str),
+    Pre(usize),
+    Up,
+    Post(usize),
+}
+
+/// Every call of a full deploy of `mq` with nothing skipped.
+const ALL: [Want; 7] = [
+    Want::Ps("db"),
+    Want::Ps("mosquitto"),
+    Want::Pre(0),
+    Want::Pre(1),
+    Want::Up,
+    Want::Post(0),
+    Want::Post(1),
+];
+
+impl XRepo {
+    fn new() -> XRepo {
+        let repo = Repo::initialised();
+        let out = tempfile::tempdir().unwrap();
+        repo.compose("mq", &mq_compose(out.path()));
+        repo.write("stacks/mq/config/mosquitto.conf", MOSQUITTO_CONF);
+        repo.write("stacks/mq/config/extra.txt", EXTRA);
+        repo.compose("a", &svc("      X: <<gen:x>>\n"));
+        repo.compose("z", &svc("      X: <<gen:x>>\n"));
+        commit_all(&repo, "stacks");
+        assert!(
+            repo.read("stacks/mq/compose.yaml")
+                .contains("'<<secret:note>>'")
+        );
+        XRepo { repo, out }
+    }
+
+    fn conf(&self) -> PathBuf {
+        self.out.path().join("mosquitto/mosquitto.conf")
+    }
+
+    fn extra(&self) -> PathBuf {
+        self.out.path().join("extra/extra.txt")
+    }
+
+    fn gen_value(&self, file: &str, key: &str) -> String {
+        self.repo
+            .expected_gen(file, key, "alnum32".parse().unwrap())
+    }
+
+    /// Every generated value of the repo; none may be in lst's output.
+    fn gens(&self) -> Vec<String> {
+        vec![
+            self.gen_value("shared", "mqtt-z2m"),
+            self.gen_value("mq", "pg-app1"),
+            self.gen_value("mq", "app-pw"),
+            self.gen_value("a", "x"),
+        ]
+    }
+
+    /// The `lst.render-hash` `lst render mq` gives `service`.
+    fn hash(&self, service: &str) -> String {
+        let rendered = render(&self.repo, "mq");
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&rendered).unwrap();
+        v["services"][service]["labels"]["lst.render-hash"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// `lst deploy <args>` (see [`deploy`]), also asserting that no
+    /// generated value is in its output.
+    #[track_caller]
+    fn deploy(&self, fake: &Fake, args: &[&str], opts: Opts<'_>) -> Run {
+        let run = deploy(&self.repo, fake, args, &self.repo.seed_hex(), opts);
+        for g in self.gens() {
+            assert!(
+                !run.stderr.contains(&g),
+                "a generated value leaked: {run:#?}"
+            );
+        }
+        run
+    }
+
+    /// The exact arguments of `want`.
+    fn args(&self, want: &Want) -> Vec<String> {
+        let run = ["run", "--rm", "--no-deps", "-T"];
+        let exec = ["exec", "-T"];
+        match want {
+            Want::Ps(service) => ps_args("mq", service),
+            Want::Pre(0) => {
+                let z2m = self.gen_value("shared", "mqtt-z2m");
+                let cmd = format!("mosquitto_passwd -b -c /mosquitto/config/passwd z2m {z2m}");
+                step_args(&run, "mosquitto", &["sh", "-c", &cmd])
+            }
+            Want::Pre(_) => step_args(
+                &run,
+                "mosquitto",
+                &["chown", "1883:1883", "/mosquitto/config/passwd"],
+            ),
+            Want::Up => compose_args("mq"),
+            Want::Post(0) => {
+                let pg = self.gen_value("mq", "pg-app1");
+                let cmd = format!("psql -U postgres -c \"ALTER ROLE app1 PASSWORD '{pg}'\"");
+                step_args(&exec, "db", &["sh", "-c", &cmd])
+            }
+            Want::Post(_) => step_args(&exec, "app", &["echo", &self.gen_value("mq", "app-pw")]),
+        }
+    }
+
+    /// Asserts that `calls` are exactly `wants`: arguments, the compose
+    /// file on stdin (nothing for `ps`), the repository root as working
+    /// directory and no seed.
+    #[track_caller]
+    fn assert_calls(&self, calls: &[Call], wants: &[Want]) {
+        let rendered = render(&self.repo, "mq");
+        assert_eq!(calls.len(), wants.len(), "{calls:#?}");
+        for (c, w) in calls.iter().zip(wants) {
+            assert_eq!(c.args, self.args(w));
+            let stdin: &[u8] = match w {
+                Want::Ps(_) => b"",
+                _ => rendered.as_bytes(),
+            };
+            assert!(c.stdin == stdin, "{c:#?}");
+            assert_eq!(c.cwd, self.repo.path().canonicalize().unwrap());
+            assert_eq!(c.seed, "<unset>");
+        }
+    }
+}
+
+/// Scripts the fake's `docker ps` answer for `service` of `mq`.
+fn ps_answer(fake: &Fake, service: &str, answer: &str) {
+    let file = fake.record.path().join(format!("ps.mq.{service}"));
+    fs::write(file, answer).unwrap();
+}
+
+/// The exact `docker ps` arguments for the render hash of `service`.
+fn ps_args(stack: &str, service: &str) -> Vec<String> {
+    let project = format!("label=com.docker.compose.project={stack}");
+    let svc = format!("label=com.docker.compose.service={service}");
+    [
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        &project,
+        "--filter",
+        &svc,
+        "--filter",
+        "label=com.docker.compose.oneoff=False",
+        "--format",
+        "{{.ID}} {{.Label \"lst.render-hash\"}}",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// `compose -p mq --project-directory stacks/mq -f - <sub> -- <service> <cmd>`.
+fn step_args(sub: &[&str], service: &str, cmd: &[&str]) -> Vec<String> {
+    let mut args = compose_args("mq")[..7].to_vec();
+    args.extend(sub.iter().map(|s| s.to_string()));
+    args.push("--".into());
+    args.push(service.into());
+    args.extend(cmd.iter().map(|s| s.to_string()));
+    args
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// The fake's two lines for call `n` of `mq` that prints to stdout (`run`,
+/// `up`, `exec`).
+fn noisy(n: usize) -> String {
+    format!("fake-docker: stdout of call {n} (mq)\nfake-docker: stderr of call {n} (mq)\n")
+}
+
+/// The fake's line for `ps` call `n` (its stdout is lst's to read).
+fn quiet(n: usize) -> String {
+    format!("fake-docker: stderr of call {n} (mq)\n")
+}
+
+/// `lst render mq --file <from>`.
+fn render_file(repo: &Repo, from: &str) -> String {
+    repo.lst(&["render", "mq", "--file", from]).ok().to_owned()
+}
+
+#[test]
+fn x_deploy_first_deploy_runs_everything_in_order() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let opts = Opts {
+        umask: Some("077"),
+        ..DEFAULT
+    };
+    let run = x.deploy(&fake, &["mq"], opts);
+    run.ok();
+    // The on-change services' hashes are read first (sorted), then the
+    // files are written, then pre, up, post.
+    let (conf, extra) = (x.conf(), x.extra());
+    let want = format!(
+        "{}{}lst: wrote {}\nlst: wrote {}\n{}{}{}{}{}lst: deployed mq\n",
+        quiet(1),
+        quiet(2),
+        conf.display(),
+        extra.display(),
+        noisy(3),
+        noisy(4),
+        noisy(5),
+        noisy(6),
+        noisy(7),
+    );
+    assert_eq!(run.stderr, want);
+    x.assert_calls(&fake.calls(), &ALL);
+
+    // The files: what `lst render --file` prints, with the requested mode
+    // whatever the umask (077 would have made 0644 into 0600).
+    assert_eq!(
+        fs::read_to_string(&conf).unwrap(),
+        render_file(&x.repo, "config/mosquitto.conf")
+    );
+    assert_eq!(
+        fs::read_to_string(&extra).unwrap(),
+        render_file(&x.repo, "config/extra.txt")
+    );
+    assert_eq!(
+        fs::read_to_string(&extra).unwrap(),
+        format!("note={NOTE}\n")
+    );
+    assert_eq!(mode_of(&conf), 0o644);
+    assert_eq!(mode_of(&extra), 0o600);
+    // Nothing else was written there (no temporary files left).
+    let names = |dir: &Path| -> Vec<_> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect()
+    };
+    assert_eq!(names(x.out.path()).len(), 2);
+    assert_eq!(names(conf.parent().unwrap()), ["mosquitto.conf"]);
+    assert_eq!(names(extra.parent().unwrap()), ["extra.txt"]);
+}
+
+#[test]
+fn x_deploy_again_skips_on_change_steps_when_the_hash_is_unchanged() {
+    let x = XRepo::new();
+    x.deploy(&Fake::new(), &["mq"], DEFAULT).ok();
+    let (conf, extra) = (x.conf(), x.extra());
+    let written = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
+    let before = (written(&conf), written(&extra));
+
+    // The containers carry the new hashes: on-change steps are skipped,
+    // the files are left alone, always steps run.
+    let fake = Fake::new();
+    ps_answer(&fake, "db", &format!("0123abc {}\n", x.hash("db")));
+    let mosquitto = format!("4567def {}\n", x.hash("mosquitto"));
+    ps_answer(&fake, "mosquitto", &mosquitto);
+    let run = x.deploy(&fake, &["mq"], DEFAULT);
+    run.ok();
+    assert_eq!(
+        run.stderr,
+        format!(
+            "{}{}{}lst: skipped x-deploy.pre[1] (mosquitto): inputs unchanged\n{}lst: skipped \
+             x-deploy.post[0] (db): inputs unchanged\n{}lst: deployed mq\n",
+            quiet(1),
+            quiet(2),
+            noisy(3),
+            noisy(4),
+            noisy(5),
+        )
+    );
+    x.assert_calls(
+        &fake.calls(),
+        &[
+            Want::Ps("db"),
+            Want::Ps("mosquitto"),
+            Want::Pre(0),
+            Want::Up,
+            Want::Post(1),
+        ],
+    );
+    assert_eq!((written(&conf), written(&extra)), before);
+
+    // Another hash, no label, no container, or replicas that disagree:
+    // changed, so the step runs.
+    let other = "0".repeat(64);
+    for (db, mosquitto) in [
+        (format!("0123abc {other}\n"), "4567def \n".to_owned()),
+        (
+            String::new(),
+            format!("a {}\nb {other}\n", x.hash("mosquitto")),
+        ),
+    ] {
+        let fake = Fake::new();
+        ps_answer(&fake, "db", &db);
+        ps_answer(&fake, "mosquitto", &mosquitto);
+        let run = x.deploy(&fake, &["mq"], DEFAULT);
+        run.ok();
+        assert!(!run.stderr.contains("skipped"), "{run:#?}");
+        x.assert_calls(&fake.calls(), &ALL);
+    }
+    // One unchanged, one without a container: only that one is skipped.
+    let fake = Fake::new();
+    ps_answer(&fake, "db", &format!("0123abc {}\n", x.hash("db")));
+    let run = x.deploy(&fake, &["mq"], DEFAULT);
+    run.ok();
+    assert!(
+        run.stderr.contains("skipped x-deploy.post[0] (db)"),
+        "{run:#?}"
+    );
+    assert!(!run.stderr.contains("skipped x-deploy.pre"), "{run:#?}");
+    x.assert_calls(
+        &fake.calls(),
+        &[
+            Want::Ps("db"),
+            Want::Ps("mosquitto"),
+            Want::Pre(0),
+            Want::Pre(1),
+            Want::Up,
+            Want::Post(1),
+        ],
+    );
+}
+
+#[test]
+fn x_deploy_rewrites_changed_files_and_fixes_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let x = XRepo::new();
+    x.deploy(&Fake::new(), &["mq"], DEFAULT).ok();
+    let (conf, extra) = (x.conf(), x.extra());
+
+    // A changed file is rewritten, a wrong mode fixed, the rest left alone.
+    fs::write(&conf, "edited by hand\n").unwrap();
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o666)).unwrap();
+    let run = x.deploy(&Fake::new(), &["mq"], DEFAULT);
+    run.ok();
+    assert!(
+        run.stderr.contains(&format!(
+            "\nlst: wrote {}\nlst: mode fixed {}\n",
+            conf.display(),
+            extra.display()
+        )),
+        "{run:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&conf).unwrap(),
+        render_file(&x.repo, "config/mosquitto.conf")
+    );
+    assert_eq!(mode_of(&extra), 0o600);
+
+    // A target lst refuses: nothing runs after the hash reads.
+    fs::remove_file(&extra).unwrap();
+    fs::create_dir(&extra).unwrap();
+    let fake = Fake::new();
+    let run = x.deploy(&fake, &["mq"], DEFAULT);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert!(
+        run.stderr.ends_with(&format!(
+            "lst: refusing to write the rendered file {}: it is not a regular file (deployed: \
+             none; failed: mq; not attempted: none)\n",
+            extra.display()
+        )),
+        "{run:#?}"
+    );
+    x.assert_calls(&fake.calls(), &[Want::Ps("db"), Want::Ps("mosquitto")]);
+}
+
+#[test]
+fn x_deploy_pre_failure_stops_before_up() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let opts = Opts {
+        env: &[("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "run")],
+        ..DEFAULT
+    };
+    let run = x.deploy(&fake, &["mq", "z", "a"], opts);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert!(
+        run.stderr.ends_with(
+            "lst: x-deploy.pre[0] (service \"mosquitto\") of stack \"mq\" failed (exit status: \
+             1), so `docker compose up` did not run for this stack (deployed: a; failed: mq; not \
+             attempted: z)\n"
+        ),
+        "{run:#?}"
+    );
+    let calls = fake.calls();
+    assert_eq!(calls[0].args, compose_args("a"));
+    x.assert_calls(
+        &calls[1..],
+        &[Want::Ps("db"), Want::Ps("mosquitto"), Want::Pre(0)],
+    );
+    // The files written before the failing step stay.
+    assert!(x.conf().is_file() && x.extra().is_file());
+}
+
+#[test]
+fn x_deploy_post_failure_is_an_error_after_up() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let opts = Opts {
+        env: &[("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "exec")],
+        ..DEFAULT
+    };
+    let run = x.deploy(&fake, &["mq"], opts);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert!(
+        run.stderr.ends_with(
+            "lst: x-deploy.post[0] (service \"db\") of stack \"mq\" failed (exit status: 1); the \
+             stack is up (`docker compose up` succeeded), but its remaining post steps did not \
+             run (deployed: none; failed: mq; not attempted: none)\n"
+        ),
+        "{run:#?}"
+    );
+    x.assert_calls(&fake.calls(), &ALL[..6]);
+}
+
+#[test]
+fn x_deploy_failure_in_the_second_of_three_stacks() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let opts = Opts {
+        env: &[
+            ("LST_FAKE_DOCKER_FAIL_PROJECT", "mq"),
+            ("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "exec"),
+        ],
+        ..DEFAULT
+    };
+    let run = x.deploy(&fake, &["z", "mq", "a"], opts);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert!(
+        run.stderr.starts_with(&deployed_stderr(&["a"], 1)),
+        "{run:#?}"
+    );
+    assert!(
+        run.stderr.ends_with(
+            "remaining post steps did not run (deployed: a; failed: mq; not attempted: z)\n"
+        ),
+        "{run:#?}"
+    );
+    let calls = fake.calls();
+    // a: exactly the M3 call; z never ran.
+    assert_eq!(calls[0].args, compose_args("a"));
+    assert_eq!(calls[0].stdin, render(&x.repo, "a").as_bytes());
+    x.assert_calls(&calls[1..], &ALL[..6]);
+}
+
+#[test]
+fn x_deploy_next_to_plain_stacks() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let run = x.deploy(&fake, &["z", "mq", "a"], DEFAULT);
+    run.ok();
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 9);
+    // The plain stacks: one `up` each, exactly as in M3.
+    for (c, s) in [(&calls[0], "a"), (&calls[8], "z")] {
+        assert_eq!(c.args, compose_args(s));
+        assert_eq!(c.stdin, render(&x.repo, s).as_bytes());
+        assert_eq!(c.seed, "<unset>");
+    }
+    assert!(
+        run.stderr.starts_with(&deployed_stderr(&["a"], 1)),
+        "{run:#?}"
+    );
+    assert!(
+        run.stderr.ends_with(&deployed_stderr(&["z"], 9)),
+        "{run:#?}"
+    );
+    x.assert_calls(&calls[1..8], &ALL);
+}
+
+#[test]
+fn x_deploy_hash_query_failure_changes_nothing() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    let opts = Opts {
+        env: &[("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "ps")],
+        ..DEFAULT
+    };
+    let run = x.deploy(&fake, &["mq"], opts);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert!(
+        run.stderr.ends_with(
+            "lst: `docker ps` for service \"db\" of stack \"mq\" failed (exit status: 1) \
+             (deployed: none; failed: mq; not attempted: none)\n"
+        ),
+        "{run:#?}"
+    );
+    x.assert_calls(&fake.calls(), &[Want::Ps("db")]);
+    assert!(!x.out.path().join("mosquitto").exists());
+}
+
+#[test]
+fn x_deploy_checks_service_names_before_anything_runs() {
+    let x = XRepo::new();
+    // A service name YAML and the model accept, but compose doesn't.
+    let text = x
+        .repo
+        .read("stacks/mq/compose.yaml")
+        .replace("  app:\n", "  \"my app\":\n")
+        .replace("    - exec: app\n", "    - exec: my app\n");
+    x.repo.compose("mq", &text);
+    commit_all(&x.repo, "bad service name");
+    let fake = Fake::new();
+    let run = x.deploy(&fake, &["mq"], DEFAULT);
+    run.fails_with(&[
+        "service name \"my app\" of stack \"mq\" is not a valid docker compose service name",
+        "(deployed: none; failed: mq; not attempted: none)",
+    ]);
+    assert!(fake.calls().is_empty());
+    assert!(!x.out.path().join("mosquitto").exists());
+}
+
+#[test]
+fn x_deploy_without_on_change_steps_queries_nothing() {
+    let x = XRepo::new();
+    let text = x
+        .repo
+        .read("stacks/mq/compose.yaml")
+        .replace("      when: on-change\n", "");
+    x.repo.compose("mq", &text);
+    commit_all(&x.repo, "always");
+    let fake = Fake::new();
+    // Even with containers carrying the new hashes: `always` runs.
+    ps_answer(&fake, "db", &format!("0123abc {}\n", x.hash("db")));
+    let run = x.deploy(&fake, &["mq"], DEFAULT);
+    run.ok();
+    x.assert_calls(&fake.calls(), &ALL[2..]);
 }

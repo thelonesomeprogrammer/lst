@@ -356,10 +356,15 @@ fn check_reports_x_deploy_problems() {
 }
 
 /// `lst deploy` pipes the same YAML-path text `lst render` prints into
-/// compose (the fake docker records it).
+/// compose (the fake docker records it). The render: target goes into a
+/// temp dir here, since deploy writes it (tests/e2e/deploy.rs has the
+/// x-deploy deploy tests).
 #[test]
 fn deploy_pipes_the_rendered_yaml() {
     let repo = repo();
+    let target = tempfile::tempdir().unwrap();
+    let target_dir = target.path().to_str().unwrap();
+    repo.compose("mq", &compose().replace(TARGET_DIR, target_dir));
     repo.git(&["add", "-A"]);
     assert_eq!(repo.commit(&["-m", "mq"]).code, Some(0));
     let rendered = repo.lst(&["render", "mq"]).ok().to_owned();
@@ -382,7 +387,10 @@ fn deploy_pipes_the_rendered_yaml() {
     run.ok();
     assert_clean_stderr(&run, &repo.seed_hex());
     assert_eq!(repo.snapshot(), before);
-    let stdin = fs::read_to_string(record.path().join("call-1.stdin")).unwrap();
+    // Call 1 is the `docker ps` for mongo's on-change step, 2 the pre
+    // step, 3 `up`.
+    let stdin = fs::read_to_string(record.path().join("call-3.stdin")).unwrap();
     assert_eq!(stdin, rendered);
     assert!(stdin.contains("lst.render-hash"));
+    assert!(target.path().join("mosquitto.conf").is_file());
 }

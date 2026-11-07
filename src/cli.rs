@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 
 use crate::check::{self, Problem};
 use crate::crypto::{self, CryptoError, Seed};
-use crate::deploy::{self, DeployError};
+use crate::deploy::{self, DeployError, Phase, StepCommand, WriteOutcome};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
 use crate::hook::{self, HookError, Role};
@@ -39,7 +39,7 @@ use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, Stack, StackError};
 use crate::store::{
     self, EntryKind, META, ResolveError, SHARED, StackFile, Store, StoreError, SyncReport,
 };
-use crate::xdeploy::{self, Detected, Failure, Rendered, XDeployError};
+use crate::xdeploy::{self, Detected, Failure, Rendered, When, XDeployError};
 
 /// The store directory, relative to the repository root.
 pub const SEC_DIR: &str = ".sec";
@@ -108,15 +108,24 @@ pub enum Command {
     /// the seed of .sec/ and every marker resolves. Without one the check
     /// is structural only. Read-only; exits 1 if anything is wrong.
     Check,
-    /// Deploy stacks: check, render, `docker compose up`.
+    /// Deploy stacks: check, render, x-deploy steps, `docker compose up`.
     ///
     /// Needs the seed (LST_SEED or .env). Runs the full `lst check` first
     /// and deploys nothing if it finds a problem. Then, per stack in sorted
     /// order, renders compose.yaml (as `lst render` does) and pipes it into
     /// `docker compose -p <stack> --project-directory stacks/<stack> -f -
     /// up -d --wait --remove-orphans`, run in the repository root. Stops at
-    /// the first failure and says which stacks were deployed. Writes no
-    /// file; the rendered text only goes through the pipe.
+    /// the first failure and says which stacks were deployed.
+    ///
+    /// For a stack with x-deploy, before `up`: reads the lst.render-hash of
+    /// the existing containers of services with `when: on-change` steps,
+    /// writes the changed render: files to their `to:` paths, and runs the
+    /// pre steps (`docker compose run --rm --no-deps`); after `up`, runs
+    /// the post steps (`docker compose exec`). An on-change step is skipped
+    /// when its service's hash is unchanged. A failing pre step stops
+    /// before `up` (files already written stay). Apart from render:
+    /// targets, nothing is written; the compose file only goes through the
+    /// pipe.
     #[command(group(
         clap::ArgGroup::new("target")
             .required(true)
@@ -259,6 +268,13 @@ pub enum CliError {
     Hook(#[from] HookError),
     #[error(transparent)]
     Deploy(#[from] DeployError),
+    #[error("{source}, so `docker compose up` did not run for this stack")]
+    PreFailed { source: DeployError },
+    #[error(
+        "{source}; the stack is up (`docker compose up` succeeded), but its remaining post steps \
+         did not run"
+    )]
+    PostFailed { source: DeployError },
     #[error(
         "{source} (deployed: {}; failed: {failed}; not attempted: {})",
         list_or_none(deployed),
@@ -883,9 +899,10 @@ fn list_or_none(names: &[String]) -> String {
 /// Everything that can be decided before running compose is decided first:
 /// the full check, the set of stacks (deduplicated and sorted), each stack
 /// exists, each name is a valid compose project name. Then each stack is
-/// rendered and deployed in turn; the first failure stops it, and the error
-/// says which stacks were deployed and which were not attempted. Nothing is
-/// written to disk: the rendered text only goes into compose's stdin.
+/// rendered and deployed in turn ([`deploy_stack`]); the first failure
+/// stops it, and the error says which stacks were deployed and which were
+/// not attempted. Only `x-deploy` `render:` targets are written to disk:
+/// the rendered compose text only goes into compose's stdin.
 fn deploy(
     root: &Path,
     env_seed: EnvSeed<'_>,
@@ -914,7 +931,7 @@ fn deploy(
     let names_of = |ts: &[Stack]| ts.iter().map(|t| t.name.clone()).collect();
     for (i, s) in targets.iter().enumerate() {
         let result = render_full(root, &seed, store, s)
-            .and_then(|rendered| Ok(deploy::run_compose(root, &s.name, &rendered.compose)?));
+            .and_then(|rendered| deploy_stack(root, &s.name, rendered, stderr));
         if let Err(e) = result {
             return Err(CliError::DeployFailed {
                 failed: s.name.clone(),
@@ -924,6 +941,103 @@ fn deploy(
             });
         }
         note(stderr, &format!("deployed {}", s.name));
+    }
+    Ok(())
+}
+
+/// Deploys one rendered stack, in the order of `docs/design.md` ("Deploy
+/// order"):
+/// 1. every service a step targets is checked as a compose service name,
+///    before anything runs;
+/// 2. for each service with a `when: on-change` step, the `lst.render-hash`
+///    of its existing container is read (`docker ps`), before anything is
+///    changed;
+/// 3. every `render:` file is written ([`deploy::write_rendered`]: only if
+///    its content or mode differs), with a `wrote <to>` / `mode fixed <to>`
+///    line;
+/// 4. the `pre` steps, in order;
+/// 5. `docker compose up` ([`deploy::run_compose`]);
+/// 6. the `post` steps, in order.
+///
+/// An `on-change` step is skipped, with a note, when the hash read in 2
+/// equals the stack's new hash for its service; no container (or no label)
+/// counts as changed. A failing `pre` step stops before `up` (the files
+/// written in 3 stay written); a failing `post` step fails the deploy with
+/// the stack already up.
+///
+/// A stack without `x-deploy` has no files and no steps, so this is just
+/// step 5, exactly as in M3.
+fn deploy_stack(
+    root: &Path,
+    stack: &str,
+    rendered: Rendered,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let Rendered {
+        compose,
+        files,
+        pre,
+        post,
+        hashes,
+    } = rendered;
+    for step in pre.iter().chain(&post) {
+        deploy::validate_service_name(stack, &step.service)?;
+    }
+    let on_change: BTreeSet<&str> = pre
+        .iter()
+        .chain(&post)
+        .filter(|step| step.when == When::OnChange)
+        .map(|step| step.service.as_str())
+        .collect();
+    let mut unchanged = BTreeSet::new();
+    for service in on_change {
+        let before = deploy::existing_hash(root, stack, service)?;
+        if before.is_some() && before.as_ref() == hashes.get(service) {
+            unchanged.insert(service.to_owned());
+        }
+    }
+    for f in &files {
+        let to = f.to.display();
+        match deploy::write_rendered(&f.to, &f.contents, f.mode)? {
+            WriteOutcome::Written => note(stderr, &format!("wrote {to}")),
+            WriteOutcome::ModeFixed => note(stderr, &format!("mode fixed {to}")),
+            WriteOutcome::Unchanged => {}
+        }
+    }
+    let steps = |phase, steps, stderr: &mut dyn Write| {
+        run_steps(root, stack, &compose, phase, steps, &unchanged, stderr)
+    };
+    steps(Phase::Pre, pre, stderr).map_err(|source| CliError::PreFailed { source })?;
+    deploy::run_compose(root, stack, &compose)?;
+    steps(Phase::Post, post, stderr).map_err(|source| CliError::PostFailed { source })
+}
+
+/// Runs the `phase` steps of `stack` in order (see [`deploy_stack`]);
+/// `unchanged` are the services whose `on-change` steps are skipped. The
+/// rendered commands are moved into the runner, not copied.
+fn run_steps(
+    root: &Path,
+    stack: &str,
+    compose: &crypto::SecretString,
+    phase: Phase,
+    steps: Vec<xdeploy::Step>,
+    unchanged: &BTreeSet<String>,
+    stderr: &mut dyn Write,
+) -> Result<(), DeployError> {
+    for (index, step) in steps.into_iter().enumerate() {
+        let service = step.service;
+        if step.when == When::OnChange && unchanged.contains(&service) {
+            note(
+                stderr,
+                &format!("skipped x-deploy.{phase}[{index}] ({service}): inputs unchanged"),
+            );
+            continue;
+        }
+        let command = StepCommand::from(step.run);
+        match phase {
+            Phase::Pre => deploy::run_pre(root, stack, compose, index, &service, &command)?,
+            Phase::Post => deploy::run_post(root, stack, compose, index, &service, &command)?,
+        }
     }
     Ok(())
 }
