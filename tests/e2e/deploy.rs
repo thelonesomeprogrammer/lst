@@ -1428,3 +1428,78 @@ fn x_deploy_without_on_change_steps_queries_nothing() {
     run.ok();
     x.assert_calls(&fake.calls(), &ALL[2..]);
 }
+
+// ---------------------------------------------------------------------------
+// `$` in values (compose interpolation)
+// ---------------------------------------------------------------------------
+
+/// A manual secret with `$` in it, as stored and as compose must see it.
+const DOLLAR: &str = "pa$wo$$rd";
+const DOLLAR_COMPOSE: &str = "pa$$wo$$$$rd";
+
+/// Every `$` of a substituted value is doubled in the compose text lst
+/// produces (both render paths), so compose's interpolation turns it back
+/// into the stored value; `$` the user wrote is left alone; values that
+/// don't go through compose (`render:` files, `run:` commands) are raw.
+#[test]
+fn dollar_in_values_is_escaped_only_where_compose_reads_it() {
+    let repo = Repo::initialised();
+    let out = tempfile::tempdir().unwrap();
+    let d = out.path().display();
+    repo.compose(
+        "raw",
+        &format!(
+            "services:\n  app:\n    image: busybox\n    environment:\n      \
+             PW: '<<set:shared/pw:{DOLLAR}>>'\n      LIT: $$HOME\n"
+        ),
+    );
+    repo.write("stacks/x/conf.txt", "pw=<<secret:shared/pw>>\n");
+    repo.compose(
+        "x",
+        &format!(
+            "services:\n  app:\n    image: busybox\n    environment:\n      \
+             PW: '<<secret:shared/pw>>'\n      LIT: $$HOME\n    volumes:\n      \
+             - {d}:/cfg\nx-deploy:\n  render:\n    - from: conf.txt\n      \
+             to: {d}/conf.txt\n  pre:\n    - with: app\n      \
+             run: echo <<secret:shared/pw>>\n"
+        ),
+    );
+    commit_all(&repo, "dollar");
+
+    // Raw path: the value doubled, the user's `$$HOME` untouched.
+    let raw = render(&repo, "raw");
+    assert!(raw.contains(&format!("PW: '{DOLLAR_COMPOSE}'\n")), "{raw}");
+    assert!(raw.contains("LIT: $$HOME\n"), "{raw}");
+
+    // YAML path: same in the compose document.
+    let x = render(&repo, "x");
+    assert!(x.contains(DOLLAR_COMPOSE), "{x}");
+    assert!(!x.contains("$$$$HOME"), "{x}");
+    assert!(x.contains("$$HOME"), "{x}");
+    // `render:` files are not read by compose: raw value.
+    assert_eq!(
+        repo.lst(&["render", "x", "--file", "conf.txt"]).ok(),
+        format!("pw={DOLLAR}\n")
+    );
+
+    let fake = Fake::new();
+    let run = deploy_ok(&repo, &fake, &["raw", "x"]);
+    for v in [DOLLAR, DOLLAR_COMPOSE] {
+        assert!(!run.stderr.contains(v), "{v} leaked: {run:#?}");
+    }
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 3, "{calls:#?}");
+    // raw: up, with the escaped compose text.
+    assert_eq!(calls[0].stdin, raw.as_bytes());
+    // x: the pre step gets the raw value as argv (no interpolation there),
+    assert_eq!(
+        calls[1].args.last().map(String::as_str),
+        Some(format!("echo {DOLLAR}").as_str())
+    );
+    // then up with the escaped compose text; the written file is raw.
+    assert_eq!(calls[2].stdin, x.as_bytes());
+    assert_eq!(
+        fs::read_to_string(out.path().join("conf.txt")).unwrap(),
+        format!("pw={DOLLAR}\n")
+    );
+}

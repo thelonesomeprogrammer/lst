@@ -96,10 +96,78 @@ pub fn render<E>(
     Ok(out)
 }
 
+/// `value` as it must appear in a compose file: every `$` doubled.
+///
+/// Compose interpolates `$` (`$VAR`, `${VAR}`) in every value of the file it
+/// reads and turns `$$` back into a literal `$`. Rendered secrets are data,
+/// not templates, so every value substituted into compose text goes through
+/// this (decided 2026-11-07); text the user wrote around a marker is left
+/// alone. Values that don't pass through compose (`render:` files, `run:`
+/// commands, `lst render --file`) stay as they are.
+pub fn escape_compose(value: &SecretString) -> SecretString {
+    let v = value.expose();
+    let extra = v.bytes().filter(|&b| b == b'$').count();
+    if extra == 0 {
+        return value.clone();
+    }
+    // Exact capacity: the buffer never reallocates (no unzeroized copies).
+    let mut out = SecretString::new(String::with_capacity(v.len() + extra));
+    let s = out.as_mut_string();
+    for c in v.chars() {
+        if c == '$' {
+            s.push('$');
+        }
+        s.push(c);
+    }
+    out
+}
+
+/// [`render`] for text that compose reads: each substituted value goes
+/// through [`escape_compose`].
+pub fn render_compose<E>(
+    text: &str,
+    mut resolve: impl FnMut(&MarkerKind) -> Result<SecretString, E>,
+) -> Result<SecretString, RenderError<E>> {
+    render(text, |m| resolve(m).map(|v| escape_compose(&v)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn escape_compose_doubles_every_dollar() {
+        let esc = |v: &str| {
+            escape_compose(&SecretString::new(v.into()))
+                .expose()
+                .to_owned()
+        };
+        assert_eq!(esc(""), "");
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc("pa$wo$$rd"), "pa$$wo$$$$rd");
+        assert_eq!(esc("$"), "$$");
+        assert_eq!(esc("${HOME}é$"), "$${HOME}é$$");
+    }
+
+    #[test]
+    fn render_compose_escapes_values_only() {
+        let resolve = |_: &MarkerKind| Ok::<_, String>(SecretString::new("a$b".into()));
+        let out = render_compose("$$USER=<<gen:x>> $HOME", resolve).unwrap();
+        assert_eq!(out.expose(), "$$USER=a$$b $HOME");
+        // Errors pass through unchanged.
+        let err = render_compose("<<gen:bad>>", fixed).unwrap_err();
+        assert!(matches!(err, RenderError::Unresolved(ref l) if l[0].name == "bad"));
+    }
+
+    proptest! {
+        #[test]
+        fn escape_compose_round_trips(v in "\\PC*") {
+            let e = escape_compose(&SecretString::new(v.clone()));
+            prop_assert_eq!(e.expose().replace("$$", "$"), v.clone());
+            prop_assert_eq!(e.expose().len(), v.len() + v.matches('$').count());
+        }
+    }
 
     /// gen → `G(name)`, secret → `S(name)`; names starting with `bad` fail,
     /// and so does every `set`.

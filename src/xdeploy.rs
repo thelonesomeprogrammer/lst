@@ -754,8 +754,16 @@ impl<E, F: FnMut(&MarkerKind) -> Result<SecretString, E>> Resolver<E, F> {
     /// `s` with its markers substituted. Unresolved names are recorded and
     /// rendering goes on (with an empty placeholder) so that all of them
     /// are reported; a malformed marker is returned as an error.
-    fn text(&mut self, s: &str) -> Result<SecretString, ParseError> {
-        match render::render(s, &mut self.resolve) {
+    /// With `compose`, each substituted value is escaped for compose's `$`
+    /// interpolation ([`render::escape_compose`]); `render:` files and `run:`
+    /// commands don't pass through compose and are rendered as they are.
+    fn text(&mut self, s: &str, compose: bool) -> Result<SecretString, ParseError> {
+        let rendered = if compose {
+            render::render_compose(s, &mut self.resolve)
+        } else {
+            render::render(s, &mut self.resolve)
+        };
+        match rendered {
             Ok(v) => Ok(v),
             Err(RenderError::Parse(e)) => Err(e),
             Err(RenderError::Unresolved(list)) => {
@@ -768,11 +776,14 @@ impl<E, F: FnMut(&MarkerKind) -> Result<SecretString, E>> Resolver<E, F> {
     }
 
     /// A YAML scalar's text (decoded by YAML, so no raw-text location).
-    fn scalar(&mut self, path: &str, s: &str) -> Result<SecretString, XDeployError> {
-        self.text(s).map_err(|e| XDeployError::ScalarMarker {
-            path: path.to_owned(),
-            kind: e.kind,
-        })
+    /// `compose`: the scalar is part of the compose document (escape `$`),
+    /// not a `run:` command.
+    fn scalar(&mut self, path: &str, s: &str, compose: bool) -> Result<SecretString, XDeployError> {
+        self.text(s, compose)
+            .map_err(|e| XDeployError::ScalarMarker {
+                path: path.to_owned(),
+                kind: e.kind,
+            })
     }
 }
 
@@ -786,7 +797,7 @@ fn render_value<E, F: FnMut(&MarkerKind) -> Result<SecretString, E>>(
 ) -> Result<(), XDeployError> {
     match v {
         Value::String(s) if s.contains("<<") => {
-            let rendered = r.scalar(path, s)?;
+            let rendered = r.scalar(path, s, true)?;
             let mut old = std::mem::replace(s, rendered.expose().to_owned());
             old.zeroize();
             Ok(())
@@ -823,10 +834,10 @@ fn render_steps<E, F: FnMut(&MarkerKind) -> Result<SecretString, E>>(
     let mut out = Vec::with_capacity(steps.len());
     for s in steps {
         let run = match &s.run {
-            Run::Shell(c) => Run::Shell(r.scalar(path, c.expose())?),
+            Run::Shell(c) => Run::Shell(r.scalar(path, c.expose(), false)?),
             Run::Exec(args) => Run::Exec(
                 args.iter()
-                    .map(|a| r.scalar(path, a.expose()))
+                    .map(|a| r.scalar(path, a.expose(), false))
                     .collect::<Result<_, _>>()?,
             ),
         };
@@ -871,7 +882,7 @@ where
     let post = render_steps(&path, &model.post, &mut r)?;
     let mut rendered_files = Vec::with_capacity(model.render.len());
     for (f, source) in model.render.into_iter().zip(sources) {
-        let contents = r.text(source).map_err(|e| {
+        let contents = r.text(source, false).map_err(|e| {
             scan::parse_error(&format!("{STACKS_DIR}/{stack}/{}", f.from), source, e)
         })?;
         rendered_files.push(RenderedFile {

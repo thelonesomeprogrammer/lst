@@ -767,7 +767,7 @@ pub(crate) fn render_full(
     let resolve = |m: &MarkerKind| store.resolve(seed, &s.name, m);
     match xdeploy::detect(&text) {
         Detected::Raw => {
-            let compose = render::render(&text, resolve).map_err(|e| match e {
+            let compose = render::render_compose(&text, resolve).map_err(|e| match e {
                 RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
                 source => CliError::Render {
                     path: path.clone(),

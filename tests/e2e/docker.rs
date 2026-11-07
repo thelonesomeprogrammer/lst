@@ -273,7 +273,13 @@ fn docker_lst_deploy() {
     let main = unique("lst-e2e-deploy");
     let other = unique("lst-e2e-other");
     let repo = Repo::initialised();
-    repo.compose(&main, &stack(&image));
+    // The client also gets a manual secret with `$` (raw render path).
+    let main_stack = stack(&image).replace(
+        "    command: [\"sleep\"",
+        &format!("      NOTE: '<<set:note:{RAW_NOTE}>>'\n    command: [\"sleep\""),
+    );
+    assert!(main_stack.contains("NOTE:"));
+    repo.compose(&main, &main_stack);
     repo.git(&["add", "-A"]);
     assert_eq!(repo.commit(&["-m", "main"]).code, Some(0));
 
@@ -291,6 +297,22 @@ fn docker_lst_deploy() {
         "{run:#?}"
     );
     assert_client_logs_in(&main, &dir, &rendered);
+    // Compose's `$` interpolation didn't touch the value.
+    let note = compose_with(
+        &main,
+        &dir,
+        &rendered,
+        &["exec", "-T", "client", "printenv", "NOTE"],
+    );
+    assert!(
+        note.status.success(),
+        "{}",
+        String::from_utf8_lossy(&note.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(note.stdout).unwrap(),
+        format!("{RAW_NOTE}\n")
+    );
     let first = containers(&main);
     assert_eq!(first.len(), 2, "{first:?}");
     assert!(first.iter().all(|c| c.ends_with(" running")), "{first:?}");
@@ -459,9 +481,13 @@ fn mosquitto_image() -> String {
     std::env::var("LST_TEST_MOSQUITTO_IMAGE").unwrap_or_else(|_| "eclipse-mosquitto:2".into())
 }
 
-/// A manual secret with what YAML quoting cares about: `"`, `#`, `: `.
-/// (Not `$`: compose interpolates `$` in any value, rendered or not.)
-const MQ_NOTE: &str = "q\"uote #hash: colon [x] {y} & *z";
+/// A manual secret with what YAML quoting cares about (`"`, `#`, `: `) and
+/// what compose interpolation cares about (`$`, which lst escapes as `$$`).
+const MQ_NOTE: &str = "q\"uote #hash: colon [x] {y} & *z $HOME $$x ${Y}";
+
+/// A manual secret with `$` for the raw render path (no `'` in it: it sits
+/// in a single-quoted YAML scalar there).
+const RAW_NOTE: &str = "raw $HOME $$x ${Y} end";
 
 const MOSQUITTO_CONF: &str = "\
 # lst e2e: rendered by lst deploy
