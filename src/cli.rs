@@ -11,8 +11,13 @@
 //! `.env` is only read or written after the gitignore guard has passed
 //! (`git::ensure_env_ignored` for `init`, `git::require_env_ignored` for
 //! everything else).
+//!
+//! The seed comes from `.env` or the `LST_SEED` environment variable (CI),
+//! see [`find_seed`]; lst never writes the variable's value anywhere, and
+//! `lst init` refuses to run while it is set.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -127,14 +132,36 @@ pub enum CliError {
     EnvNotUtf8,
     #[error(
         "no .env file. In a new repository run `lst init`; on another machine put the seed \
-         from your password manager into .env as LST_SEED=…"
+         from your password manager into .env as LST_SEED=… (in CI, set the LST_SEED \
+         environment variable instead)"
     )]
     NoEnv,
     #[error(
         ".env has no LST_SEED line. In a new repository run `lst init`; on another machine \
-         put the seed from your password manager into .env as LST_SEED=…"
+         put the seed from your password manager into .env as LST_SEED=… (in CI, set the \
+         LST_SEED environment variable instead)"
     )]
     NoSeed,
+    #[error(
+        "the LST_SEED environment variable is set but empty; set it to the seed (64 lowercase \
+         hex characters) or unset it"
+    )]
+    EnvVarEmpty,
+    #[error(
+        "the LST_SEED environment variable is not 64 lowercase hex characters (no spaces, \
+         quotes or trailing newline)"
+    )]
+    EnvVarInvalid,
+    #[error(
+        "LST_SEED and .env disagree: the LST_SEED environment variable and the LST_SEED line in \
+         .env hold different seeds. Unset the variable or fix .env"
+    )]
+    SeedMismatch,
+    #[error(
+        "the LST_SEED environment variable is set: unset LST_SEED; init manages .env (it \
+         creates the seed there, or checks the one you put there)"
+    )]
+    InitWithEnvVar,
     #[error(
         "this repo is already initialised; put the seed from your password manager into .env \
          as LST_SEED=… (lst will not create a new seed for an existing .sec/)"
@@ -179,26 +206,41 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + '_ {
     }
 }
 
+/// The value of the `LST_SEED` environment variable, if it is set
+/// (zeroized on drop). `main` reads the variable and passes it to [`run`],
+/// so nothing below `run` looks at the process environment for it.
+type EnvSeed<'a> = Option<&'a [u8]>;
+
 /// Runs `cli` in the repository containing `cwd`. Only `render` writes to
 /// `stdout`; diagnostics go to `stderr`.
+///
+/// `env_seed` is the value of the `LST_SEED` environment variable, if set
+/// (`std::env::var_os("LST_SEED")`): commands that need the seed use it,
+/// alongside `.env` (see [`find_seed`]). It is never written anywhere.
 pub fn run(
     cli: Cli,
     cwd: &Path,
+    env_seed: Option<OsString>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
+    let env_seed = env_seed.map(|v| Zeroizing::new(v.into_encoded_bytes()));
+    let env_seed: EnvSeed<'_> = env_seed.as_deref().map(Vec::as_slice);
     let root = git::repo_root(cwd)?;
     match cli.command {
+        Command::Init if env_seed.is_some() => Err(CliError::InitWithEnvVar),
         Command::Init => init(&root, stderr),
-        Command::Sync => sync(&root, stderr),
-        Command::Rename { from, to, replace } => rename(&root, &from, &to, replace, stderr),
-        Command::Render { stack } => render_stack(&root, &stack, stdout),
+        Command::Sync => sync(&root, env_seed, stderr),
+        Command::Rename { from, to, replace } => {
+            rename(&root, env_seed, &from, &to, replace, stderr)
+        }
+        Command::Render { stack } => render_stack(&root, env_seed, &stack, stdout),
         Command::Hook {
             action: HookAction::Install { force },
         } => hook_install(&root, force, stderr),
         Command::Hook {
             action: HookAction::Run,
-        } => hook_run(&root, stderr),
+        } => hook_run(&root, env_seed, stderr),
     }
 }
 
@@ -252,19 +294,64 @@ fn write_env(path: &Path, exists: bool, suffix: &str) -> Result<(), CliError> {
         .map_err(io_err(path))
 }
 
-/// The seed from `.env`. The caller must have run the ignore guard.
-fn read_seed(path: &Path) -> Result<Seed, CliError> {
-    let Some(bytes) = read_env(path)? else {
-        return Err(CliError::NoEnv);
+/// The seed in the `LST_SEED` environment variable: exactly 64 lowercase
+/// hex characters, like the `.env` line. Errors never contain the value.
+fn parse_env_seed(value: &[u8]) -> Result<Seed, CliError> {
+    if value.is_empty() {
+        return Err(CliError::EnvVarEmpty);
+    }
+    let text = std::str::from_utf8(value).map_err(|_| CliError::EnvVarInvalid)?;
+    Seed::from_hex(text).map_err(|_| CliError::EnvVarInvalid)
+}
+
+/// What [`find_seed`] found.
+pub(crate) struct SeedLookup {
+    /// The seed, from `LST_SEED` or `.env`.
+    pub seed: Option<Seed>,
+    /// Whether `.env` exists (for the "no seed" message).
+    pub env_file: bool,
+}
+
+/// The seed, from the `LST_SEED` environment variable (`env_seed`) and/or
+/// `.env`. The ignore guard always runs first, so `.env` is only read once
+/// it has passed (also when the variable is set and `.env` doesn't exist:
+/// a fresh clone still has the committed `/.env` rule). If both hold a
+/// seed they must be the same seed. `.env` is never written.
+pub(crate) fn find_seed(root: &Path, env_seed: EnvSeed<'_>) -> Result<SeedLookup, CliError> {
+    git::require_env_ignored(root)?;
+    let from_var = env_seed.map(parse_env_seed).transpose()?;
+    let bytes = read_env(&root.join(ENV_FILE))?;
+    let from_file = match &bytes {
+        Some(b) => envfile::parse_seed(env_text(Some(b))?)?,
+        None => None,
     };
-    envfile::parse_seed(env_text(Some(&bytes))?)?.ok_or(CliError::NoSeed)
+    let seed = match (from_var, from_file) {
+        (Some(v), Some(f)) if v.as_bytes() != f.as_bytes() => return Err(CliError::SeedMismatch),
+        (Some(v), _) => Some(v),
+        (None, f) => f,
+    };
+    Ok(SeedLookup {
+        seed,
+        env_file: bytes.is_some(),
+    })
+}
+
+/// The seed for commands that need one ([`find_seed`]); none is an error.
+pub(crate) fn require_seed(root: &Path, env_seed: EnvSeed<'_>) -> Result<Seed, CliError> {
+    match find_seed(root, env_seed)? {
+        SeedLookup { seed: Some(s), .. } => Ok(s),
+        SeedLookup { env_file: true, .. } => Err(CliError::NoSeed),
+        SeedLookup {
+            env_file: false, ..
+        } => Err(CliError::NoEnv),
+    }
 }
 
 /// The guards and checks every command but `init` starts with: `.env` is
-/// ignored, holds a seed, `.sec/` exists and was made with that seed.
-fn open_store(root: &Path) -> Result<(Seed, Store), CliError> {
-    git::require_env_ignored(root)?;
-    let seed = read_seed(&root.join(ENV_FILE))?;
+/// ignored, there is a seed (`LST_SEED` or `.env`), `.sec/` exists and was
+/// made with that seed.
+fn open_store(root: &Path, env_seed: EnvSeed<'_>) -> Result<(Seed, Store), CliError> {
+    let seed = require_seed(root, env_seed)?;
     let store = Store::load(&root.join(SEC_DIR))?;
     store.verify_seed(&seed)?;
     Ok((seed, store))
@@ -405,8 +492,8 @@ fn read_stack_files(root: &Path) -> Result<scan::StackFiles<Contents>, CliError>
     Ok(out)
 }
 
-fn sync(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
-    let (_seed, mut store) = open_store(root)?;
+fn sync(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(), CliError> {
+    let (_seed, mut store) = open_store(root, env_seed)?;
     let scan = scan::collect(&read_stack_files(root)?)?;
     if let Some(site) = scan.sets.into_iter().next() {
         return Err(CliError::SetInWorkingTree {
@@ -465,12 +552,13 @@ fn print_report(stderr: &mut dyn Write, r: &SyncReport) {
 /// after renaming the stack directory).
 fn rename(
     root: &Path,
+    env_seed: EnvSeed<'_>,
     from: &str,
     to: &str,
     replace: bool,
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let (seed, mut store) = open_store(root)?;
+    let (seed, mut store) = open_store(root, env_seed)?;
     let source = store::parse_full_name(from)?;
     let to = if to.contains('/') {
         to.to_owned()
@@ -505,8 +593,13 @@ fn rename(
     Ok(())
 }
 
-fn render_stack(root: &Path, name: &str, stdout: &mut dyn Write) -> Result<(), CliError> {
-    let (seed, store) = open_store(root)?;
+fn render_stack(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    name: &str,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (seed, store) = open_store(root, env_seed)?;
     let s = stack::find(root, name)?;
     let (path, text) = read_compose(&s)?;
     let rendered =
@@ -650,8 +743,8 @@ impl AsRef<[u8]> for Staged {
 /// when it blocks. Nothing is written until every check has passed; then
 /// `.sec/` is saved and staged, rewritten files are staged, and last the
 /// working tree is rewritten.
-fn hook_run(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
-    let (seed, mut store) = open_store(root)?;
+fn hook_run(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(), CliError> {
+    let (seed, mut store) = open_store(root, env_seed)?;
     let temporary = hook::is_temporary_index(std::env::var_os("GIT_INDEX_FILE").as_deref());
     let entries = git::staged_entries(root, "")?;
     let roles = hook::classify(&entries)?;
