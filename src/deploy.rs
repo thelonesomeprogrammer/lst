@@ -74,6 +74,7 @@ use crate::crypto::SecretString;
 use crate::scan::Uses;
 use crate::stack::STACKS_DIR;
 use crate::store::{self, META, SHARED, StackFile};
+use crate::xdeploy::{self, HASH_LABEL};
 
 const DOCKER: &str = "docker";
 /// The environment variable that may carry the seed (CI); never passed on
@@ -320,6 +321,20 @@ impl StepCommand {
     }
 }
 
+impl From<xdeploy::Run> for StepCommand {
+    /// The rendered `run:` of an `x-deploy` step, moved (not copied).
+    fn from(run: xdeploy::Run) -> StepCommand {
+        match run {
+            xdeploy::Run::Shell(script) => StepCommand::Shell(script),
+            // Invariant: the x-deploy model refuses `run: []`, so an exec
+            // form always has a program.
+            xdeploy::Run::Exec(argv) => {
+                StepCommand::from_argv(argv).expect("x-deploy refuses an empty run: list")
+            }
+        }
+    }
+}
+
 /// Checks that `service` is a compose service name: non-empty, only
 /// `[a-zA-Z0-9._-]` (the compose specification's pattern). The model checks
 /// that it names a service of the stack; this is the runners' own guard, so
@@ -470,9 +485,6 @@ fn run_step_with(
 
 // ---- lst.render-hash of the existing container -------------------------------
 
-/// The label lst puts the render hash in.
-pub const RENDER_HASH_LABEL: &str = "lst.render-hash";
-
 /// The arguments after `docker` that list the existing containers of
 /// `service` in project `stack`, one line `<id> <lst.render-hash>` each:
 ///
@@ -501,9 +513,7 @@ pub fn hash_query_args(stack: &str, service: &str) -> Vec<String> {
         args.push(filter);
     }
     args.push("--format".to_owned());
-    args.push(format!(
-        "{{{{.ID}}}} {{{{.Label \"{RENDER_HASH_LABEL}\"}}}}"
-    ));
+    args.push(format!("{{{{.ID}}}} {{{{.Label \"{HASH_LABEL}\"}}}}"));
     args
 }
 
@@ -1450,6 +1460,30 @@ mod tests {
             matches!(&cmd, StepCommand::Exec { program, args }
                 if program.expose() == "a"
                     && args.iter().map(SecretString::expose).eq(["b", "c"])),
+            "{cmd:?}"
+        );
+    }
+
+    #[test]
+    fn x_deploy_runs_convert_to_step_commands() {
+        let cmd = StepCommand::from(xdeploy::Run::Shell(secret("echo pw")));
+        assert!(
+            matches!(&cmd, StepCommand::Shell(s) if s.expose() == "echo pw"),
+            "{cmd:?}"
+        );
+        let run = xdeploy::Run::Exec(vec![secret("psql"), secret("-c"), secret("x")]);
+        let cmd = StepCommand::from(run);
+        assert!(
+            matches!(&cmd, StepCommand::Exec { program, args }
+                if program.expose() == "psql"
+                    && args.iter().map(SecretString::expose).eq(["-c", "x"])),
+            "{cmd:?}"
+        );
+        // A single-element list is just the program.
+        let cmd = StepCommand::from(xdeploy::Run::Exec(vec![secret("true")]));
+        assert!(
+            matches!(&cmd, StepCommand::Exec { program, args }
+                if program.expose() == "true" && args.is_empty()),
             "{cmd:?}"
         );
     }
