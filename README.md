@@ -69,20 +69,36 @@ master seed (.env, gitignored)
 Per-stack deploy logic lives inside the compose file (Compose ignores `x-` keys; `lst` strips this one before deploying):
 
 ```yaml
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - /mnt/appdata/mosquitto/config:/mosquitto/config
 x-deploy:
-  render:
+  render:                           # template in the repo → rendered file on the host
     - from: config/mosquitto.conf
       to: /mnt/appdata/mosquitto/config/mosquitto.conf
-  pre:                              # one-off container from the service's image
+      mode: "0644"                  # default "0600"
+  pre:                              # one-off container from the service's image, before `up`
     - with: mosquitto
-      run: mosquitto_passwd -b -c /mosquitto/config/passwd z2m <<gen:shared/mqtt-z2m>>
-  post:                             # inside the running, healthy service
+      run: rm -f /mosquitto/config/passwd && mosquitto_passwd -b -c /mosquitto/config/passwd z2m <<gen:shared/mqtt-z2m>>
+    - with: mosquitto
+      run: [chown, "mosquitto:mosquitto", /mosquitto/config/passwd]   # exec form, no shell
+  post:                             # inside the running, healthy service, after `up --wait`
     - exec: mongo
       run: mongosh --eval '…createUser("app1", "<<gen:mongo-app1>>")…'
       when: on-change               # default: always
 ```
 
 When a service's rendered inputs change, `lst` changes a `lst.render-hash` label on it, so Compose recreates the container. No state file is needed.
+
+- **`render:`** `from` is a file in `stacks/<stack>/` (with markers, rendered as raw text); `to` is an absolute host path. `lst deploy` writes it atomically, only when its content changed, with exactly `mode` (whatever the umask); missing parent directories are created (`0755`). A wrong mode on an unchanged file is fixed. Ownership is never changed: a new file belongs to the user running lst, and a rewritten file keeps its owner and group, so a `chown` from a `pre` step survives. A symlink or a directory at `to` is refused. `lst render <stack> --file <from>` prints what would be written. lst writes `to` where it runs, so in CI the deploy step must mount the target directories at the same paths ([`docs/ci.md`](docs/ci.md#x-deploy-render-targets)); bind-mount them into the service with the same absolute host path (a relative `./config` doesn't count for the hash and points elsewhere in CI).
+- **`pre: [{with, run, when}]`** runs `docker compose run --rm --no-deps -T <with> …` before `up`: a throwaway container of the service, with its volumes, so the app's own tools (here `mosquitto_passwd`) work without installing anything on the host. It goes through the image's entrypoint (lst never overrides it), so it works with images whose entrypoint script runs the given command (mosquitto, postgres, …) but not with images whose entrypoint is the app binary itself; use a `post` step there.
+- **`post: [{exec, run, when}]`** runs `docker compose exec -T <exec> …` in the running container after `up --wait` (the entrypoint doesn't matter here).
+- **`run:`** a string runs as `sh -c <string>`; a list runs as it is (exec form, no shell: for images without one, or to keep `$` and quotes away from a shell). Markers are rendered in `run` (the values are briefly visible in `ps` on the host).
+- **`when:`** `always` (default) runs the step on every deploy; `on-change` only when the service's `lst.render-hash` differs from the label of its existing container (no container counts as changed). Steps run on every deploy otherwise, so write them idempotently (note `rm -f` above: `mosquitto_passwd -c` refuses an existing file since Mosquitto 2.1).
+- **Order per stack:** read the existing hashes of services with `on-change` steps → write the changed `render:` files (`lst: wrote <to>` / `lst: mode fixed <to>`) → `pre` steps in order → `docker compose up -d --wait --remove-orphans` → `post` steps in order. A skipped step prints `lst: skipped x-deploy.pre[0] (mosquitto): inputs unchanged`. A failing `pre` step stops before `up` (files already written stay written); a failing `post` step fails the deploy with the stack already up. Either way the stacks after it are not attempted.
+- A step's command is part of its service's hash, so changing a command recreates that container once.
 
 ## Commands
 
@@ -92,7 +108,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 | `lst sync` | Update `.sec/` from your compose files (the hook does this for you) |
 | `lst render <stack>` | Print the resolved compose file to stdout (`--file FROM`: one rendered `x-deploy` file) |
 | `lst rename <stack>/<old> <new>` | Rename a secret keeping its value (`--replace` if the new name exists) |
-| `lst deploy <stack>…` / `--changed-since REV` | Check, then render and `compose up --wait` each stack (`x-deploy` steps: M4; `--all`: M5) |
+| `lst deploy <stack>…` / `--changed-since REV` | Check, then per stack: render, `x-deploy` files and `pre` steps, `compose up --wait`, `post` steps (`--all`: M5) |
 | `lst check` | Verify `.sec/` is current, no `<<set:` committed, all secrets resolvable |
 | `lst hook install` / `run` | Install / run the pre-commit logic |
 | `lst rotate <stack>/<name>` | Give a generated secret a new value |
@@ -106,9 +122,9 @@ lst init                     # on the first machine (also installs the pre-commi
 # on each other machine: clone, put the seed in .env, run `lst hook install` (or `lst init`)
 ```
 
-## Usage today (M3)
+## Usage today (M4)
 
-`rotate`, `gc` and `--all` don't exist yet, and `lst deploy` doesn't run `x-deploy` steps or write `render:` files yet (M4 in progress; `lst render` and `lst check` already handle `x-deploy`). What works now:
+`rotate`, `gc` and `--all` don't exist yet (M5). What works now:
 
 ```sh
 lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml, pre-commit hook
@@ -153,7 +169,7 @@ lst deploy web               # check, render, docker compose up (or: lst render 
   - no file committed in `HEAD` contains `<<set:` (it is in the history: rotate the secret), and no `<<set:` waits in the working tree;
   - every `<<secret:…>>` has a value;
   - with the seed (`.env` or `LST_SEED`) also: it is the seed of `.sec/`, and every marker resolves (every stored value decrypts). Without a seed it stops after the structural checks and says so, which is what a pull-request pipeline wants.
-- **`lst deploy <stack>…`** deploys stacks through `docker compose`. It needs the seed, runs the full `lst check` first and deploys nothing if that finds a problem, and checks every stack name up front (it must exist and be a valid compose project name, `[a-z0-9][a-z0-9_-]*`: `MyApp` is an error, never lowercased). Then, per stack in sorted order, it renders `compose.yaml` (the same bytes `lst render` prints) and pipes it into `docker compose -p <stack> --project-directory stacks/<stack> -f - up -d --wait --remove-orphans`, run in the repository root. The first failure stops it, and the message names the stacks already deployed and the ones not attempted. It prints `lst: deployed <stack>` per stack on stderr (compose's output goes to stderr too) and nothing on stdout. It writes no file: the rendered text only goes through the pipe, and `LST_SEED` is not passed on to compose.
+- **`lst deploy <stack>…`** deploys stacks through `docker compose`. It needs the seed, runs the full `lst check` first and deploys nothing if that finds a problem, and checks every stack name up front (it must exist and be a valid compose project name, `[a-z0-9][a-z0-9_-]*`: `MyApp` is an error, never lowercased). Then, per stack in sorted order, it renders `compose.yaml` (the same bytes `lst render` prints) and pipes it into `docker compose -p <stack> --project-directory stacks/<stack> -f - up -d --wait --remove-orphans`, run in the repository root. The first failure stops it, and the message names the stacks already deployed and the ones not attempted. It prints `lst: deployed <stack>` per stack on stderr (compose's output goes to stderr too) and nothing on stdout. The rendered compose file only goes through the pipe, and `LST_SEED` is not passed on to compose. A stack with `x-deploy` also gets its `render:` files written and its `pre`/`post` steps run around `up` (see [Deploy steps](#deploy-steps-x-deploy)); the only files lst writes are those `to:` targets. A stack without `x-deploy` gets exactly the one `docker compose up`.
 - **`lst deploy --changed-since REV`** deploys the stacks affected by the commits `REV..HEAD` instead of a list (one or the other, not both):
   - a change under `stacks/<s>/` or in `.sec/<s>.toml` deploys `<s>`;
   - a changed entry in `.sec/shared.toml` deploys the stacks that use that shared name (an entry that only became orphaned deploys nothing);
@@ -167,7 +183,7 @@ lst deploy web               # check, render, docker compose up (or: lst render 
 
 **Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run `lst hook install` (a clone doesn't bring hooks along). `lst init` works too: there it confirms the seed matches `.sec/meta.toml` and installs the hook. A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
 
-**Quoting manual secrets in YAML** (stacks without `x-deploy`; with it, the serializer quotes values for you): `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. A block scalar takes any single-line value as-is:
+**Quoting manual secrets in YAML** (stacks without `x-deploy`; with it, the serializer quotes values for you): `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. (On either path, Compose itself interpolates `$VAR` and `${VAR}` in the file it reads, so a manual secret containing `$` reaches the container changed; avoid `$` in manual secrets for compose files.) A block scalar takes any single-line value as-is:
 
 ```yaml
 environment:

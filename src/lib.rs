@@ -4,9 +4,10 @@
 //! `marker`, `crypto`, `format`, `envfile`, `render`, `scan`, `hook`,
 //! `check`, `xdeploy` and `deploy::affected_stacks` are pure (no filesystem,
 //! subprocesses or environment variables; `crypto` only uses the OS random
-//! generator). `git`, `stack`, `store::{load, read_files, save}`,
-//! `deploy::run_compose` and `cli` (the commands behind the binary) do the
-//! I/O.
+//! generator). `git`, `stack`, `store::{load, read_files, save}`, the
+//! runners in `deploy` (`run_compose`, `run_pre`, `run_post`,
+//! `existing_hash`, `write_rendered`) and `cli` (the commands behind the
+//! binary) do the I/O.
 #![forbid(unsafe_code)]
 
 pub mod check;
