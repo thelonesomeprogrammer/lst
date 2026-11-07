@@ -1,0 +1,51 @@
+#!/bin/sh
+# Test double for `docker` (src/deploy.rs, and the e2e tests of `lst deploy`).
+#
+# Every call records, under the directory named by LST_FAKE_DOCKER_DIR
+# (required), as call-<n>.* with n = 1, 2, … (the first unused number, so
+# successive calls in one directory stay visible; calls must not run
+# concurrently in the same directory):
+#   call-<n>.args   its arguments, each followed by a NUL byte
+#   call-<n>.stdin  everything it read from stdin, byte for byte
+#   call-<n>.cwd    its working directory, followed by a newline
+#   call-<n>.seed   the value of LST_SEED, or `<unset>` (lst must not pass
+#                   the seed on to docker)
+#
+# It prints one line to stdout and one to stderr *before* reading stdin
+# (like compose may), so tests can see where each stream ends up, then
+# exits with LST_FAKE_DOCKER_EXIT (default 0). If LST_FAKE_DOCKER_FAIL_PROJECT
+# is set, only a call whose `-p <project>` equals it fails, with
+# LST_FAKE_DOCKER_EXIT (default 1 in that case); every other call exits 0.
+dir=${LST_FAKE_DOCKER_DIR:?LST_FAKE_DOCKER_DIR must name a directory}
+
+n=1
+while [ -e "$dir/call-$n.args" ]; do
+    n=$((n + 1))
+done
+base="$dir/call-$n"
+
+: >"$base.args"
+project=
+prev=
+for arg in "$@"; do
+    printf '%s\0' "$arg" >>"$base.args"
+    if [ "$prev" = "-p" ] && [ -z "$project" ]; then
+        project=$arg
+    fi
+    prev=$arg
+done
+pwd >"$base.cwd"
+printf '%s' "${LST_SEED-<unset>}" >"$base.seed"
+
+echo "fake-docker: stdout of call $n ($project)"
+echo "fake-docker: stderr of call $n ($project)" >&2
+
+cat >"$base.stdin"
+
+if [ -n "${LST_FAKE_DOCKER_FAIL_PROJECT-}" ]; then
+    if [ "$project" = "$LST_FAKE_DOCKER_FAIL_PROJECT" ]; then
+        exit "${LST_FAKE_DOCKER_EXIT:-1}"
+    fi
+    exit 0
+fi
+exit "${LST_FAKE_DOCKER_EXIT:-0}"
