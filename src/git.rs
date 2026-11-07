@@ -98,6 +98,10 @@ pub enum GitError {
         #[source]
         source: io::Error,
     },
+    #[error("unknown revision {rev:?} (not a commit in this repository)")]
+    UnknownRev { rev: String },
+    #[error("changed path {lossy:?} is not valid UTF-8, which lst does not support")]
+    NonUtf8DiffPath { lossy: String },
 }
 
 /// What `ensure_env_ignored` did.
@@ -621,6 +625,113 @@ fn hooks_dir_with(program: &OsStr, root: &Path) -> Result<PathBuf, GitError> {
     }
     // `join` keeps an absolute path as is.
     Ok(root.join(path))
+}
+
+/// `git rev-parse --verify --quiet --end-of-options <spec>`: the object id
+/// `spec` names, or `None` if it names nothing (exit 1). Any other failure
+/// (e.g. not a repository, exit 128) is an error. `--end-of-options` keeps
+/// a `spec` starting with `-` from being read as an option.
+fn verify_with(program: &OsStr, root: &Path, spec: &str) -> Result<Option<String>, GitError> {
+    let args = [
+        OsStr::new("rev-parse"),
+        OsStr::new("--verify"),
+        OsStr::new("--quiet"),
+        OsStr::new("--end-of-options"),
+        OsStr::new(spec),
+    ];
+    let out = run(program, root, &args)?;
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(None),
+        _ => return Err(failed(&args, out.status, &out.stderr)),
+    }
+    match std::str::from_utf8(&out.stdout).map(|s| s.trim_end_matches('\n')) {
+        Ok(oid) if is_oid(oid) => Ok(Some(oid.to_owned())),
+        _ => Err(GitError::BadOutput {
+            command: command_line(&args),
+        }),
+    }
+}
+
+/// The commit `rev` names, as an object id; `UnknownRev` if it names no
+/// commit (unknown, or e.g. a tree or blob).
+fn resolve_commit_with(program: &OsStr, root: &Path, rev: &str) -> Result<String, GitError> {
+    verify_with(program, root, &format!("{rev}^{{commit}}"))?.ok_or_else(|| GitError::UnknownRev {
+        rev: rev.to_owned(),
+    })
+}
+
+/// The paths that differ between commit `rev` and `HEAD`
+/// (`git diff --name-only -z --no-renames <rev> HEAD`), sorted, repo-relative
+/// and `/`-separated. Added, modified, deleted and type-changed paths are
+/// all listed; with `--no-renames` a rename is a deletion plus an addition,
+/// so both the old and the new path are listed (rename detection is on by
+/// default for `git diff`, and would hide the old path). A `rev` that names
+/// no commit is `UnknownRev`; a path that isn't UTF-8 is `NonUtf8DiffPath`.
+pub fn diff_names(root: &Path, rev: &str) -> Result<Vec<String>, GitError> {
+    diff_names_with(OsStr::new(GIT), root, rev)
+}
+
+fn diff_names_with(program: &OsStr, root: &Path, rev: &str) -> Result<Vec<String>, GitError> {
+    // Resolving first gives a clear error for an unknown rev, and the oid
+    // can't be mistaken for an option or a path.
+    let commit = resolve_commit_with(program, root, rev)?;
+    let args = [
+        OsStr::new("diff"),
+        OsStr::new("--name-only"),
+        OsStr::new("-z"),
+        OsStr::new("--no-renames"),
+        OsStr::new(&commit),
+        OsStr::new("HEAD"),
+        OsStr::new("--"),
+    ];
+    let out = run(program, root, &args)?;
+    if !out.status.success() {
+        return Err(failed(&args, out.status, &out.stderr));
+    }
+    let mut paths = Vec::new();
+    for rec in out.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let path = String::from_utf8(rec.to_vec()).map_err(|e| GitError::NonUtf8DiffPath {
+            lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })?;
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The content of `path` (repo-relative, `/`-separated, taken literally) in
+/// commit `rev`, or `None` if `rev` has nothing at `path`. A `rev` that
+/// names no commit is `UnknownRev`. A path that is a directory (tree) or a
+/// submodule at `rev` has no blob and is an error (`Failed`); a symlink's
+/// blob is its target.
+///
+/// The content may be a committed file holding a plaintext value, so it
+/// comes back as `Zeroizing` and never appears in an error (see
+/// [`read_blob`]).
+pub fn show_file(
+    root: &Path,
+    rev: &str,
+    path: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, GitError> {
+    show_file_with(OsStr::new(GIT), root, rev, path)
+}
+
+fn show_file_with(
+    program: &OsStr,
+    root: &Path,
+    rev: &str,
+    path: &str,
+) -> Result<Option<Zeroizing<Vec<u8>>>, GitError> {
+    let commit = resolve_commit_with(program, root, rev)?;
+    // `<oid>:<path>`: with a full oid in front, the first `:` is the
+    // separator, so `path` may contain `:` (and anything else but NUL).
+    // git runs in `root`, so even a `./`-relative path means the same.
+    match verify_with(program, root, &format!("{commit}:{path}"))? {
+        Some(oid) => read_blob_with(program, root, &oid).map(Some),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1749,5 +1860,247 @@ mod tests {
             path_line(b"\xff\n".to_vec()).unwrap_err(),
             GitError::NonUtf8Path
         ));
+    }
+
+    // ---- history: diff_names / show_file ----------------------------------
+
+    fn commit_all(root: &Path, msg: &str) -> String {
+        sh_git(root, &["add", "-A", "."]);
+        sh_git(root, &["commit", "-q", "--allow-empty", "-m", msg]);
+        git_str(root, &["rev-parse", "HEAD"]).trim_end().to_owned()
+    }
+
+    #[test]
+    fn diff_names_add_modify_delete_rename() {
+        let r = committed_repo();
+        let root = r.path();
+        write(root, "stacks/web/compose.yaml", "web\n");
+        write(root, "stacks/db/compose.yaml", "db\n");
+        write(
+            root,
+            "stacks/old/compose.yaml",
+            "a file long enough to be a rename\n",
+        );
+        write(root, "README", "r\n");
+        let base = commit_all(root, "base");
+        assert_eq!(diff_names(root, &base).unwrap(), Vec::<String>::new());
+        assert_eq!(diff_names(root, "HEAD").unwrap(), Vec::<String>::new());
+
+        write(root, "stacks/web/compose.yaml", "web 2\n");
+        fs::remove_file(root.join("stacks/db/compose.yaml")).unwrap();
+        write(root, ".sec/web.toml", "new\n");
+        sh_git(root, &["add", "-A", "."]);
+        sh_git(root, &["mv", "stacks/old", "stacks/new"]);
+        let tip = commit_all(root, "change");
+        // The rename really is detected as one without --no-renames.
+        let renamed = git_str(root, &["diff", "--name-status", "HEAD~1", "HEAD"]);
+        assert!(
+            renamed.contains("R100\tstacks/old/compose.yaml"),
+            "{renamed}"
+        );
+
+        let want = [
+            ".sec/web.toml",
+            "stacks/db/compose.yaml",
+            "stacks/new/compose.yaml",
+            "stacks/old/compose.yaml",
+            "stacks/web/compose.yaml",
+        ];
+        assert_eq!(diff_names(root, &base).unwrap(), want);
+        // Any rev syntax that names a commit, including a short oid.
+        assert_eq!(diff_names(root, "HEAD~1").unwrap(), want);
+        assert_eq!(diff_names(root, &base[..10]).unwrap(), want);
+        // Symmetric: HEAD against a later commit lists the same paths.
+        sh_git(root, &["checkout", "-q", "--detach", &base]);
+        assert_eq!(diff_names(root, &tip).unwrap(), want);
+    }
+
+    #[test]
+    fn diff_names_awkward_paths() {
+        let r = committed_repo();
+        let root = r.path();
+        let base = commit_all(root, "base");
+        let names = [
+            "stacks/a b/compose.yaml",
+            "stacks/new\nline/compose.yaml",
+            "stacks/tab\there",
+            "stacks/ünï/x",
+            "-leading-dash",
+            "stacks/\"q\" \\b",
+        ];
+        for n in names {
+            write(root, n, "x");
+        }
+        commit_all(root, "awkward");
+        let mut want: Vec<_> = names.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(diff_names(root, &base).unwrap(), want);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_names_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let r = committed_repo();
+        let root = r.path();
+        let base = commit_all(root, "base");
+        fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), "x").unwrap();
+        commit_all(root, "bad");
+        let err = diff_names(root, &base).unwrap_err();
+        assert!(
+            matches!(&err, GitError::NonUtf8DiffPath { lossy } if lossy == "bad-\u{fffd}"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("changed path"));
+    }
+
+    #[test]
+    fn unknown_revs() {
+        let r = committed_repo();
+        let root = r.path();
+        write(root, "f", "x");
+        commit_all(root, "f");
+        let tree = git_str(root, &["rev-parse", "HEAD^{tree}"]);
+        let blob = git_str(root, &["rev-parse", "HEAD:f"]);
+        for rev in [
+            "nope",
+            "HEAD~5",
+            "--all",
+            "-p",
+            "",
+            OID_A,
+            tree.trim_end(),
+            blob.trim_end(),
+        ] {
+            let err = diff_names(root, rev).unwrap_err();
+            assert!(
+                matches!(&err, GitError::UnknownRev { rev: got } if got == rev),
+                "{rev:?}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("unknown revision {rev:?} (not a commit in this repository)")
+            );
+            let err = show_file(root, rev, "f").unwrap_err();
+            assert!(
+                matches!(&err, GitError::UnknownRev { .. }),
+                "{rev:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_names_unborn_head() {
+        // The rev is a commit, but HEAD (an orphan branch) has none yet.
+        let r = committed_repo();
+        let root = r.path();
+        let base = commit_all(root, "base");
+        sh_git(root, &["checkout", "-q", "--orphan", "fresh"]);
+        let err = diff_names(root, &base).unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, .. }
+                if *command == format!("diff --name-only -z --no-renames {base} HEAD --")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn show_file_at_rev() {
+        let r = committed_repo();
+        let root = r.path();
+        write(root, ".sec/shared.toml", "v1\n");
+        write(root, "stacks/a:b/c d", "colon\n");
+        write(root, "stacks/new\nline", "nl\n");
+        let first = commit_all(root, "one");
+        write(root, ".sec/shared.toml", "v2\n");
+        write(root, "later", "l\n");
+        commit_all(root, "two");
+
+        let show = |rev: &str, path: &str| show_file(root, rev, path).unwrap().map(|b| b.to_vec());
+        assert_eq!(show(&first, ".sec/shared.toml").unwrap(), b"v1\n");
+        assert_eq!(show("HEAD", ".sec/shared.toml").unwrap(), b"v2\n");
+        assert_eq!(show(&first, "stacks/a:b/c d").unwrap(), b"colon\n");
+        assert_eq!(show(&first, "stacks/new\nline").unwrap(), b"nl\n");
+        // Relative to the repository root.
+        assert_eq!(show(&first, "./.sec/shared.toml").unwrap(), b"v1\n");
+        // Missing at that rev (but present later), or never there at all.
+        assert_eq!(show(&first, "later"), None);
+        assert_eq!(show("HEAD", "missing"), None);
+        assert_eq!(show("HEAD", ".sec/shared.toml/below"), None);
+        // A directory has no blob; nothing of its contents leaks.
+        let err = show_file(root, "HEAD", ".sec").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, .. } if command.starts_with("cat-file blob ")),
+            "{err:?}"
+        );
+        assert!(!format!("{err} {err:?}").contains("v2"));
+        // A path outside the repository is a failure, not "missing".
+        let err = show_file(root, "HEAD", "../outside").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, stderr, .. }
+                if command.starts_with("rev-parse --verify --quiet --end-of-options ")
+                    && command.ends_with(":../outside")
+                    && stderr.contains("outside repository")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_file_symlink_is_its_target() {
+        let r = committed_repo();
+        let root = r.path();
+        std::os::unix::fs::symlink("target/file", root.join("link")).unwrap();
+        commit_all(root, "link");
+        assert_eq!(
+            show_file(root, "HEAD", "link").unwrap().unwrap().as_slice(),
+            b"target/file"
+        );
+    }
+
+    #[test]
+    fn history_fails_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for err in [
+            diff_names(root, "HEAD").unwrap_err(),
+            show_file(root, "HEAD", "f").unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, GitError::Failed { command, stderr, .. }
+                    if command == "rev-parse --verify --quiet --end-of-options HEAD^{commit}"
+                        && stderr.contains("not a git repository")),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_spawn_and_output_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let missing = dir.path().join("no-such-git");
+        let m = missing.as_os_str();
+        for err in [
+            diff_names_with(m, root, "HEAD").unwrap_err(),
+            show_file_with(m, root, "HEAD", "f").unwrap_err(),
+        ] {
+            assert!(matches!(err, GitError::Spawn(_)), "{err:?}");
+        }
+        let garbage = fixture("fake-git-garbage");
+        let t = OsStr::new("true");
+        for program in [garbage.as_os_str(), t] {
+            for err in [
+                diff_names_with(program, root, "HEAD").unwrap_err(),
+                show_file_with(program, root, "HEAD", "f").unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&err, GitError::BadOutput { command }
+                        if command == "rev-parse --verify --quiet --end-of-options HEAD^{commit}"),
+                    "{err:?}"
+                );
+            }
+        }
     }
 }
