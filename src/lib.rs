@@ -3,12 +3,14 @@
 //!
 //! `marker`, `crypto`, `format`, `envfile`, `render`, `scan` and `hook`
 //! are pure (no filesystem, subprocesses or environment variables; `crypto`
-//! only uses the OS random generator). `git`, `stack`, `store::{load, save}`
-//! and `cli` (the commands behind the binary) do the I/O.
+//! only uses the OS random generator). `git`, `stack`, `store::{load, save}`,
+//! `deploy::run_compose` and `cli` (the commands behind the binary) do the
+//! I/O.
 #![forbid(unsafe_code)]
 
 pub mod cli;
 pub mod crypto;
+pub mod deploy;
 pub mod envfile;
 pub mod format;
 pub mod git;
