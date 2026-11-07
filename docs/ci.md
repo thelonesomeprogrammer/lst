@@ -7,7 +7,7 @@ It has three steps:
 | Step | Runs on | Does |
 |---|---|---|
 | `build` | push, manual | Builds lst with `cargo install --locked --git … --tag …` into a cache directory on the agent host. Skipped when the cached binary already is the wanted version, so it only compiles after you bump `LST_TAG`. The binary is static (musl), so any Alpine image can run it. |
-| `deploy` | push, manual | `lst check`, then `lst deploy --changed-since <previous pipeline's commit>`, or `lst deploy <every stack>` when that commit can't be trusted (see below). Has the seed and the Docker socket. |
+| `deploy` | push, manual | `lst check`, then `lst deploy --changed-since <previous pipeline's commit>`, or `lst deploy <every stack>` when that commit can't be trusted (see below). Has the seed and the Docker socket, and must mount the directories of `x-deploy` `render:` targets (see [below](#x-deploy-render-targets)). |
 | `check` | pull request | `lst check` without the seed (structural only: `.sec/` is current, no committed `<<set:…>>`, every `<<secret:…>>` has a value). No seed, no Docker socket. Uses the binary the `build` step cached. |
 
 The pipeline is written for Woodpecker 3 (list syntax for `steps` and `clone`); compare it with the workflow syntax docs of your version.
@@ -24,13 +24,26 @@ The pipeline is written for Woodpecker 3 (list syntax for `steps` and `clone`); 
 
 `docker compose` runs *inside* the `deploy` step's container, and the daemon it talks to is the host's. Compose resolves a relative bind mount such as `./data:/data` against the project directory, which here is the CI workspace (`/woodpecker/src/…/stacks/<stack>`), and the host daemon then looks for that path **on the host**, where it doesn't exist (it creates an empty directory instead). Use absolute host paths for bind mounts (`/mnt/appdata/<stack>/data:/data`) or named volumes. Things compose reads itself (`env_file:`, build contexts) work as usual, because the client sends them.
 
+This matters twice for `x-deploy`: a service only gets the `lst.render-hash` label for a rendered file (and so is only recreated when it changes) if it bind-mounts the file's `to:` path, or a directory above it, by its **absolute** host path; a relative `./config:/config` is ignored for the hash, and in CI it would point into the workspace anyway, not at the file lst wrote.
+
+### x-deploy render targets
+
+lst writes each `x-deploy` `render:` file itself, to its `to:` path, in the filesystem it runs in: inside the `deploy` step's container. The host daemon only sees those files if that path is the same host directory. So the `deploy` step must mount every directory that holds a `to:` target **at the same path** it has on the host, read-write, for example for `to: /mnt/appdata/mosquitto/config/mosquitto.conf`:
+
+```yaml
+    volumes:
+      - /mnt/appdata:/mnt/appdata
+```
+
+(One mount of the common parent covers every stack under it; the example pipeline has this line, commented out: adjust it to your appdata path.) Without the mount, lst writes into the container's own filesystem, the deploy succeeds, and the service sees an empty directory or an old file. Files are written as the step's user (root in `docker:cli`), with the `mode` from `x-deploy` and the owner of an existing file kept, so a `chown` from a `pre` step survives later deploys. `pre` and `post` steps need nothing extra: they run through compose on the host daemon, like `up`.
+
 ### What the Docker socket means
 
 Mounting `/var/run/docker.sock` gives the step full control of the host's Docker daemon, which is root on the host: it can start a privileged container with `/` mounted. So everything that can run in a pipeline with the trusted settings can take over the host. In particular:
 
 - **Pull requests run the pipeline file from the pull request.** A pull request can change `.woodpecker.yml` to mount the socket in its own step (trusted applies to the repository, not to the file), or mount the cache directory read-write and replace the lst binary that the next push runs with the seed. Keep the repository private and don't accept pull requests from people you don't trust; set Woodpecker to require approval for pull request pipelines, or drop the `pull_request` event from the pipeline.
 - **Anyone who can push to the default branch can deploy anything**, and read every secret (the seed is in the step's environment). That is the same trust as a shell on the host, which is the threat model lst already has: whoever can read `.env` on the server can `docker inspect` every secret anyway.
-- Rendered secrets show up in `docker inspect`, as with any lst deploy. They don't show up in the pipeline log: lst prints stack names and compose's own progress output, never values.
+- Rendered secrets show up in `docker inspect`, as with any lst deploy. They don't show up in the pipeline log: lst prints stack names, paths and compose's own progress output, never values. The output of `x-deploy` `pre`/`post` steps goes to the log too, so don't write steps that print a secret.
 
 ### Retiring Dockge
 
@@ -79,5 +92,8 @@ The default Woodpecker clone fetches a single commit, so the pipeline's `clone` 
 | `lst is not in the cache yet` (pull request check) | The cache is filled by the default branch's pipeline: run it once. |
 | `build` fails in `cargo install` | No network to GitHub or crates.io from the agent, or the tag doesn't exist. |
 | A bind-mounted directory is empty in the container | A relative bind mount; see [Bind mounts must be absolute host paths](#bind-mounts-must-be-absolute-host-paths). |
+| `lst: wrote /mnt/…` but the service doesn't see the file (or sees an old one) | The `deploy` step doesn't mount that directory at the same path; see [x-deploy render targets](#x-deploy-render-targets). |
+| `` x-deploy.pre[0] (service "x") of stack "s" failed (…), so `docker compose up` did not run `` | The step's own output above says why. Nothing of that stack was started; `render:` files written before it stay. Steps run on every deploy unless `when: on-change`, so they must be idempotent. |
+| `` x-deploy.post[0] … failed (…); the stack is up `` | The stack is running, but the post step (and the ones after it) didn't finish. Fix the step and push; with `when: on-change` it runs again only if its service's inputs changed (a changed command counts). |
 
 **Upgrading lst:** bump `LST_TAG` in the `build` step and push; `build` sees the version change and compiles the new one. To force a rebuild, delete `/var/lib/woodpecker/lst-cache/lst` on the agent host.

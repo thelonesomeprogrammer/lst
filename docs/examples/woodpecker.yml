@@ -72,6 +72,10 @@ steps:
       - /var/lib/woodpecker/lst-cache:/cache:ro
       # Full control of the host's Docker daemon: see docs/ci.md.
       - /var/run/docker.sock:/var/run/docker.sock
+      # x-deploy render: targets. lst writes each `to:` file in this
+      # container, so mount the host directories that hold them at the
+      # same path (read-write). See docs/ci.md, "x-deploy render targets".
+      # - /mnt/appdata:/mnt/appdata
     commands:
       - |
         set -eu
