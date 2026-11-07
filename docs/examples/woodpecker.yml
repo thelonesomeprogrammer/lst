@@ -1,0 +1,117 @@
+# Woodpecker pipeline for the homelab repository (the repo with stacks/,
+# .sec/ and a committed `/.env` rule; not lst's own repository).
+# Save it as .woodpecker.yml (or .woodpecker/deploy.yml) there.
+# Setup, first run and troubleshooting: docs/ci.md in the lst repository.
+#
+# Shell variables are written `$${NAME}`: Woodpecker substitutes `${NAME}`
+# in the file itself before the step runs, and `$$` is its escape for a
+# literal `$`, so the shell sees `${NAME}` and reads the variable at run
+# time.
+
+when:
+  # Pushes to the default branch deploy what changed.
+  - event: push
+    branch: ${CI_REPO_DEFAULT_BRANCH}
+  # A manual run ("Run pipeline" in the UI) deploys every stack.
+  - event: manual
+  # Pull requests only get the structural check (no seed, no deploy).
+  - event: pull_request
+
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      # --changed-since needs the previous pipeline's commit in the clone.
+      # Pushes of more commits than this fall back to deploying every stack.
+      depth: 50
+
+steps:
+  # Builds lst once per version into the cache volume. The binary is
+  # static (musl), so the deploy step's Alpine image can run it.
+  - name: build
+    image: rust:1-alpine
+    when:
+      - event: [push, manual]
+    environment:
+      LST_GIT: https://github.com/thelonesomeprogrammer/lst
+      # The release tag to build. Bump it to upgrade lst.
+      LST_TAG: v0.1.0
+      CARGO_HOME: /cache/cargo
+    volumes:
+      # A host directory (needs the repository to be trusted for volumes).
+      - /var/lib/woodpecker/lst-cache:/cache
+    commands:
+      - |
+        set -eu
+        want="lst $${LST_TAG#v}"
+        have=$(/cache/lst/bin/lst --version 2>/dev/null || true)
+        if [ "$${have}" = "$${want}" ]; then
+          echo "cached: $${have}"
+        else
+          apk add --no-cache musl-dev git
+          cargo install --locked --force --git "$${LST_GIT}" --tag "$${LST_TAG}" --root /cache/lst
+        fi
+        /cache/lst/bin/lst --version
+
+  # Checks the repository, then deploys the changed stacks through the
+  # host's Docker daemon.
+  - name: deploy
+    image: docker:cli
+    depends_on: [build]
+    when:
+      - event: [push, manual]
+    environment:
+      LST_SEED:
+        from_secret: lst_seed
+    volumes:
+      - /var/lib/woodpecker/lst-cache:/cache
+      # Full control of the host's Docker daemon: see docs/ci.md.
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        set -eu
+        export PATH="/cache/lst/bin:$${PATH}"
+        lst check
+        prev="$${CI_PREV_COMMIT_SHA:-}"
+        if [ "$${CI_PIPELINE_EVENT}" = push ] \
+          && [ "$${CI_PREV_PIPELINE_STATUS:-}" = success ] \
+          && [ -n "$${prev}" ] \
+          && git cat-file -e "$${prev}^{commit}" 2>/dev/null; then
+          lst deploy --changed-since "$${prev}"
+        else
+          echo "deploying every stack (event $${CI_PIPELINE_EVENT}, previous pipeline" \
+            "$${CI_PREV_PIPELINE_STATUS:-none}, previous commit $${prev:-none}" \
+            "$${prev:+(not in this clone?)})"
+          set --
+          for dir in stacks/*/; do
+            [ -f "$${dir}compose.yaml" ] || continue
+            name="$${dir#stacks/}"
+            set -- "$@" "$${name%/}"
+          done
+          if [ "$#" -gt 0 ]; then
+            lst deploy "$@"
+          else
+            echo "no stacks"
+          fi
+        fi
+
+  # Pull requests: the structural check, without the seed (secrets are
+  # not given to pull request pipelines) and without the Docker socket.
+  - name: check
+    image: docker:cli
+    depends_on: []
+    when:
+      - event: pull_request
+    environment:
+      LST_GIT: https://github.com/thelonesomeprogrammer/lst
+      LST_TAG: v0.1.0
+    volumes:
+      - /var/lib/woodpecker/lst-cache:/cache:ro
+    commands:
+      - |
+        set -eu
+        if ! /cache/lst/bin/lst --version; then
+          echo "lst is not in the cache yet: run the pipeline on the default branch once" >&2
+          exit 1
+        fi
+        /cache/lst/bin/lst check
