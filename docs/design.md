@@ -90,6 +90,7 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
 - **Deploy order:** check → render compose + files → write changed files → `pre` → `up -d --wait --remove-orphans` → `post`.
 - **`lst render <stack>`** prints the final compose (stripped, labelled) and never writes files; `lst render <stack> --file <from>` prints one rendered extra file.
 - **CI:** lst writes `to:` files itself, so the deploy step must mount the target directories at the same paths (documented in `docs/ci.md`).
+- **`$` in values (decided 2026-11-07 by tlp, found during M4):** compose interpolates `$` (`$VAR`, `${VAR}`) in every value of the file it reads and turns `$$` into a literal `$`. So every value lst substitutes into compose text (both render paths) has each `$` written as `$$`; text the user wrote around a marker is left alone (a hand-written `$$HOME` stays as it is). Values that don't pass through compose stay raw: `render:` files, `run:` commands (passed as arguments) and `lst render --file`. `lst render <stack>` shows the escaped form, exactly what compose reads. The render hash is computed from the raw files and commands, so it is unaffected.
 - **Implementation choices (raised by Claude Code during M4, pending review by tlp):**
   - *Which path:* a line starting with `x-deploy:` (or a quoted key) selects the YAML path; other stacks are never YAML-parsed. If such a line exists but there is no top-level key, or the text parses with a top-level `x-deploy` that no line starts with (flow style), that is an error, so steps never silently don't run.
   - *Merge keys* (`<<: *a`) are applied before anything else, so merged `volumes:`/`labels:` count and an injected `labels:` never hides merged ones.
@@ -99,7 +100,7 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
   - *Hash inputs:* exactly the design's (mounted files' rendered contents by `to`, then the targeted steps' phase, `when` and rendered command); `mode` is not hashed. The byte layout is documented on `xdeploy::service_hash` and pinned in `tests/vectors.rs`.
   - *Errors:* every unresolved name of a stack (compose, commands, `render:` files) is reported in one list under the stack's `compose.yaml`; a user-set `lst.render-hash` label is an error on any service.
   - *Deploy wiring (part Z):* stacks are still rendered one at a time inside the deploy loop (as in M3), so "up front" checks of a stack (its steps' service names against compose's `[a-zA-Z0-9._-]+`) happen before anything runs *for that stack*, not before earlier stacks deploy. The `docker ps` hash reads go in sorted service order, once per service with an `on-change` step, before any file is written. An `on-change` step is skipped only if the existing label is present and equal to the new hash. Messages: `wrote <to>`, `mode fixed <to>`, `skipped x-deploy.<phase>[i] (<service>): inputs unchanged`; a failing `pre` adds "so `docker compose up` did not run for this stack", a failing `post` "the stack is up …", both inside the usual deployed/failed/not-attempted summary.
-  - *Found with real Docker (part Z):* Mosquitto 2.1's `mosquitto_passwd -c` refuses an existing file, so the `pre` example above fails from the second deploy on; it needs `rm -f <file> &&` first (README shows that). The 2.1 image's entrypoint also no longer chowns `/mosquitto`, so the root-created `0600` password file needs a `chown mosquitto:mosquitto` step. Compose interpolates `$` in every value of the file it reads, rendered secrets included, on both render paths: a manual secret with `$` arrives changed (documented; escaping `$` → `$$` on the YAML path would be a design change).
+  - *Found with real Docker (part Z):* Mosquitto 2.1's `mosquitto_passwd -c` refuses an existing file, so the `pre` example above fails from the second deploy on; it needs `rm -f <file> &&` first (README shows that). The 2.1 image's entrypoint also no longer chowns `/mosquitto`, so the root-created `0600` password file needs a `chown mosquitto:mosquitto` step. Compose interpolates `$` in every value of the file it reads, so a manual secret with `$` arrived changed; tlp decided to escape it (see "`$` in values" below).
 
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
@@ -144,12 +145,15 @@ x-deploy:
       to: /mnt/<appdata>/mosquitto/config/mosquitto.conf
   pre:                         # before compose up
     - with: mosquitto          # one-off container from that service's image
-      run: mosquitto_passwd -b -c /mosquitto/config/passwd z2m <<gen:shared/mqtt-z2m>>
+      run: rm -f /mosquitto/config/passwd && mosquitto_passwd -b -c /mosquitto/config/passwd z2m <<gen:shared/mqtt-z2m>>
+    - with: mosquitto          # Mosquitto 2.1: the broker runs as `mosquitto` and must read the file
+      run: [chown, "mosquitto:mosquitto", /mosquitto/config/passwd]
   post:                        # after compose up, inside the running service
     - exec: mongo
       run: mongosh … createUser("app1", "<<gen:mongo-app1>>") …
       when: on-change
 ```
+_(Example updated 2026-11-07: since Mosquitto 2.1, `mosquitto_passwd -c` refuses an existing file, hence the `rm -f`, and the image no longer chowns `/mosquitto`, hence the `chown` step. Found with real Docker during M4; the decision itself is unchanged.)_
 - **`render`:** template files in the repo (with markers) and where their rendered copies go.
 - **`pre` with `with: <service>`:** runs in a throwaway container of that service's image, with the service's volumes. The app's own hasher is used without installing anything on Unraid, and the file exists before the real container starts.
 - **`post` with `exec: <service>`:** runs inside the already-running container.

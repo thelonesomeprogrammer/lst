@@ -183,7 +183,7 @@ lst deploy web               # check, render, docker compose up (or: lst render 
 
 **Second machine:** clone the repo, create `.env` with the line `LST_SEED=<the 64 hex characters from your password manager>`, and run `lst hook install` (a clone doesn't bring hooks along). `lst init` works too: there it confirms the seed matches `.sec/meta.toml` and installs the hook. A wrong seed fails loudly, because `.sec/meta.toml` holds its fingerprint.
 
-**Quoting manual secrets in YAML** (stacks without `x-deploy`; with it, the serializer quotes values for you): `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. (On either path, Compose itself interpolates `$VAR` and `${VAR}` in the file it reads, so a manual secret containing `$` reaches the container changed; avoid `$` in manual secrets for compose files.) A block scalar takes any single-line value as-is:
+**Quoting manual secrets in YAML** (stacks without `x-deploy`; with it, the serializer quotes values for you): `render` substitutes raw text, with no YAML quoting or escaping (it renders non-YAML files too). Generated formats are always safe as plain YAML scalars. A manual secret (`<<secret:name>>`) that might contain `"`, `#`, `: ` or a newline must sit in a suitably quoted scalar. This is up to you; `lst` doesn't check it. (`$` is handled for you on both paths: Compose interpolates `$VAR` and `${VAR}` in the file it reads, so `lst` writes every `$` of a substituted value as `$$`, which Compose turns back into `$`. `$` you write yourself around a marker is left alone, and `render:` files and `run:` commands get the value unescaped, since Compose doesn't read them.) A block scalar takes any single-line value as-is:
 
 ```yaml
 environment:
@@ -217,7 +217,7 @@ stacks/<stack>/config/…      # optional template files with markers
 - [x] M1: `init` + `render` (+ `sync`)
 - [x] M2: pre-commit hook
 - [x] M3: `deploy` + `check` + CI (example pipeline in `docs/examples/woodpecker.yml`; first real Gitea/Woodpecker run still to be confirmed)
-- [ ] M4: `x-deploy`
+- [x] M4: `x-deploy`
 - [ ] M5: `rotate`, `gc`, `--all`, `--dry-run`
 
 ## License
