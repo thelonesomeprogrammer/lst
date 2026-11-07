@@ -27,6 +27,9 @@
 //!
 //! `worktree_files` is the working-tree counterpart for `lst sync`: the
 //! files git would stage, so sync and the hook see the same files.
+//!
+//! `rev_exists` and `tree_entries` read committed trees (`lst check` scans
+//! every blob of `HEAD` for `<<set:`).
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -92,6 +95,8 @@ pub enum GitError {
     NonUtf8IndexPath { lossy: String },
     #[error("path {lossy:?} in the working tree is not valid UTF-8, which lst does not support")]
     NonUtf8WorktreePath { lossy: String },
+    #[error("committed path {lossy:?} is not valid UTF-8, which lst does not support")]
+    NonUtf8TreePath { lossy: String },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -593,6 +598,100 @@ fn worktree_files_with(
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Whether `rev` names a commit (`git rev-parse --verify --quiet
+/// <rev>^{commit}`). `false` for `HEAD` on an unborn branch (no commit
+/// yet) and for anything that doesn't resolve to a commit.
+pub fn rev_exists(root: &Path, rev: &str) -> Result<bool, GitError> {
+    rev_exists_with(OsStr::new(GIT), root, rev)
+}
+
+fn rev_exists_with(program: &OsStr, root: &Path, rev: &str) -> Result<bool, GitError> {
+    let spec = format!("{rev}^{{commit}}");
+    let args = [
+        OsStr::new("rev-parse"),
+        OsStr::new("--verify"),
+        OsStr::new("--quiet"),
+        OsStr::new(&spec),
+    ];
+    let out = run(program, root, &args)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(failed(&args, out.status, &out.stderr)),
+    }
+}
+
+/// The fields of one `ls-tree -z` record,
+/// `<mode> SP <type> SP <oid> TAB <path>`; `None` if it isn't one.
+fn parse_tree_record(rec: &[u8]) -> Option<(&str, &str, &[u8])> {
+    let tab = rec.iter().position(|&b| b == b'\t')?;
+    let (meta, path) = (&rec[..tab], &rec[tab + 1..]);
+    let mut fields = std::str::from_utf8(meta).ok()?.split(' ');
+    let (Some(mode), Some(kind), Some(oid), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    let valid = !mode.is_empty()
+        && mode.bytes().all(|b| b.is_ascii_digit())
+        && matches!(kind, "blob" | "commit" | "tree")
+        && is_oid(oid)
+        && !path.is_empty();
+    valid.then_some((mode, oid, path))
+}
+
+/// Parses `ls-tree -r -z` output (see [`parse_stage_entries`] for why the
+/// path is everything after the tab).
+fn parse_tree_entries(args: &[&OsStr], stdout: &[u8]) -> Result<Vec<IndexEntry>, GitError> {
+    let bad = || GitError::BadOutput {
+        command: command_line(args),
+    };
+    let body = match stdout.strip_suffix(b"\0") {
+        Some(body) => body,
+        None if stdout.is_empty() => return Ok(Vec::new()),
+        None => return Err(bad()),
+    };
+    let mut entries = Vec::new();
+    for rec in body.split(|&b| b == 0) {
+        let (mode, oid, path) = parse_tree_record(rec).ok_or_else(bad)?;
+        let path = String::from_utf8(path.to_vec()).map_err(|e| GitError::NonUtf8TreePath {
+            lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })?;
+        entries.push(IndexEntry {
+            mode: mode.to_owned(),
+            oid: oid.to_owned(),
+            path,
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+/// Every file of the tree of commit `rev`, recursively and wherever it is
+/// (`git ls-tree -r -z --full-tree <rev>`), sorted by path. The entries
+/// have the same shape as the index's: regular files, symlinks (`120000`)
+/// and submodules (`160000`, whose oid is a commit) are listed with their
+/// modes; see [`IndexEntry::is_file`]. A path that isn't UTF-8 is
+/// `NonUtf8TreePath`.
+pub fn tree_entries(root: &Path, rev: &str) -> Result<Vec<IndexEntry>, GitError> {
+    tree_entries_with(OsStr::new(GIT), root, rev)
+}
+
+fn tree_entries_with(program: &OsStr, root: &Path, rev: &str) -> Result<Vec<IndexEntry>, GitError> {
+    let args = [
+        OsStr::new("ls-tree"),
+        OsStr::new("-r"),
+        OsStr::new("-z"),
+        OsStr::new("--full-tree"),
+        OsStr::new(rev),
+    ];
+    let out = run(program, root, &args)?;
+    if !out.status.success() {
+        return Err(failed(&args, out.status, &out.stderr));
+    }
+    parse_tree_entries(&args, &out.stdout)
 }
 
 /// The directory git runs hooks from (`git rev-parse --git-path hooks`):
@@ -1580,6 +1679,183 @@ mod tests {
         assert!(matches!(
             worktree_files_with(missing.as_os_str(), dir.path(), "x").unwrap_err(),
             GitError::Spawn(_)
+        ));
+    }
+
+    // ---- committed trees -------------------------------------------------
+
+    #[test]
+    fn rev_exists_for_commits_only() {
+        let r = repo();
+        let root = r.path();
+        // Unborn branch: no HEAD commit yet.
+        assert!(!rev_exists(root, "HEAD").unwrap());
+        let r = committed_repo();
+        let root = r.path();
+        assert!(rev_exists(root, "HEAD").unwrap());
+        let head = git_str(root, &["rev-parse", "HEAD"]);
+        assert!(rev_exists(root, head.trim_end()).unwrap());
+        assert!(!rev_exists(root, "no-such-branch").unwrap());
+        // A tree is not a commit.
+        let tree = git_str(root, &["rev-parse", "HEAD^{tree}"]);
+        assert!(!rev_exists(root, tree.trim_end()).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = rev_exists(dir.path(), "HEAD").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, .. }
+                if command == "rev-parse --verify --quiet HEAD^{commit}"),
+            "{err:?}"
+        );
+        let missing = dir.path().join("no-such-git");
+        assert!(matches!(
+            rev_exists_with(missing.as_os_str(), dir.path(), "HEAD").unwrap_err(),
+            GitError::Spawn(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_entries_list_the_committed_tree() {
+        let r = committed_repo();
+        let root = r.path();
+        // The initial commit is empty.
+        assert_eq!(tree_entries(root, "HEAD").unwrap(), vec![]);
+        let head = git_str(root, &["rev-parse", "HEAD"]);
+        let head = head.trim_end();
+        write(root, "z/deep/file", "deep");
+        write(root, "a b\tc", "awkward");
+        write(root, "run.sh", "#!/bin/sh\n");
+        fs::set_permissions(
+            root.join("run.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("run.sh", root.join("link")).unwrap();
+        sh_git(root, &["add", "."]);
+        sh_git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                head,
+                "sub",
+            ],
+        );
+        sh_git(root, &["commit", "-q", "-m", "files"]);
+        // Not committed: neither staged nor working-tree changes.
+        write(root, "staged", "s");
+        sh_git(root, &["add", "staged"]);
+        write(root, "z/deep/file", "changed");
+
+        // From a subdirectory, still the full tree.
+        let got = tree_entries(&root.join("z"), "HEAD").unwrap();
+        let summary: Vec<_> = got
+            .iter()
+            .map(|e| (e.mode.as_str(), e.path.as_str(), e.is_file()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("100644", "a b\tc", true),
+                ("120000", "link", false),
+                ("100755", "run.sh", true),
+                ("160000", "sub", false),
+                ("100644", "z/deep/file", true),
+            ]
+        );
+        assert_eq!(&*read_blob(root, &got[4].oid).unwrap(), b"deep");
+        assert_eq!(got[3].oid, head);
+        // Any commit-ish works; a missing one fails.
+        assert_eq!(tree_entries(root, "HEAD~1").unwrap(), vec![]);
+        let err = tree_entries(root, "no-such-rev").unwrap_err();
+        assert!(
+            matches!(&err, GitError::Failed { command, .. }
+                if command == "ls-tree -r -z --full-tree no-such-rev"),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_entries_errors() {
+        use std::os::unix::ffi::OsStrExt;
+        let r = committed_repo();
+        let root = r.path();
+        fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), "x").unwrap();
+        sh_git(root, &["add", "."]);
+        sh_git(root, &["commit", "-q", "-m", "bad"]);
+        let err = tree_entries(root, "HEAD").unwrap_err();
+        assert!(
+            matches!(&err, GitError::NonUtf8TreePath { lossy } if lossy == "bad-\u{fffd}"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "committed path \"bad-\u{fffd}\" is not valid UTF-8, which lst does not support"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-git");
+        assert!(matches!(
+            tree_entries_with(missing.as_os_str(), dir.path(), "HEAD").unwrap_err(),
+            GitError::Spawn(_)
+        ));
+        let garbage = fixture("fake-git-garbage");
+        let err = tree_entries_with(garbage.as_os_str(), dir.path(), "HEAD").unwrap_err();
+        assert!(
+            matches!(&err, GitError::BadOutput { command }
+                if command == "ls-tree -r -z --full-tree HEAD"),
+            "{err:?}"
+        );
+        // A git that exits 0 with no output: an empty tree. (And
+        // rev-parse's exit 0 means "exists".)
+        let t = OsStr::new("true");
+        assert_eq!(tree_entries_with(t, dir.path(), "HEAD").unwrap(), vec![]);
+        assert!(rev_exists_with(t, dir.path(), "HEAD").unwrap());
+    }
+
+    #[test]
+    fn parse_tree_output() {
+        let args = [OsStr::new("ls-tree")];
+        assert_eq!(parse_tree_entries(&args, b"").unwrap(), vec![]);
+        let out = format!(
+            "100644 blob {OID_A}\tz\0040000 tree {OID_A}\td\0160000 commit {OID_A}\ta\tb\nc\0"
+        );
+        assert_eq!(
+            parse_tree_entries(&args, out.as_bytes()).unwrap(),
+            vec![
+                entry("160000", OID_A, "a\tb\nc"),
+                entry("040000", OID_A, "d"),
+                entry("100644", OID_A, "z"),
+            ]
+        );
+        for bad in [
+            "garbage".to_owned(),
+            format!("100644 blob {OID_A}\ta"),
+            format!("100644 blob {OID_A} a\0"),
+            format!("100644 {OID_A}\ta\0"),
+            format!("100644 blob {OID_A} x\ta\0"),
+            format!(" blob {OID_A}\ta\0"),
+            format!("10064x blob {OID_A}\ta\0"),
+            format!("100644 tag {OID_A}\ta\0"),
+            "100644 blob abc\ta\0".to_owned(),
+            format!("100644 blob {OID_A}\t\0"),
+            format!("100644 blob {OID_A}\ta\0\0"),
+        ] {
+            let err = parse_tree_entries(&args, bad.as_bytes()).unwrap_err();
+            assert!(
+                matches!(&err, GitError::BadOutput { command } if command == "ls-tree"),
+                "{bad:?}: {err:?}"
+            );
+        }
+        let mut meta_not_utf8 = b"10064\xff blob ".to_vec();
+        meta_not_utf8.extend_from_slice(format!("{OID_A}\ta\0").as_bytes());
+        assert!(matches!(
+            parse_tree_entries(&args, &meta_not_utf8).unwrap_err(),
+            GitError::BadOutput { .. }
         ));
     }
 
