@@ -62,7 +62,9 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{self, Write};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -124,6 +126,27 @@ pub enum DeployError {
         "`docker ps` for service {service:?} of stack {stack:?} printed something that isn't UTF-8"
     )]
     HashQueryOutput { stack: String, service: String },
+    #[error(
+        "invalid mode {mode:#o} for the rendered file {} (only the permission bits 0o777 \
+         may be set)",
+        .path.display()
+    )]
+    RenderMode { path: PathBuf, mode: u32 },
+    #[error("refusing to write the rendered file {}: it is a symbolic link", .path.display())]
+    RenderSymlink { path: PathBuf },
+    /// The target is a directory or another non-regular file (FIFO, socket,
+    /// device), or the path has no file name (`/`, `x/..`).
+    #[error(
+        "refusing to write the rendered file {}: it is not a regular file",
+        .path.display()
+    )]
+    RenderNotFile { path: PathBuf },
+    #[error("could not write the rendered file {}", .path.display())]
+    RenderWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Checks that `stack` is usable as a compose project name as it is:
@@ -541,6 +564,200 @@ fn existing_hash_with(
         service: service.to_owned(),
     })?;
     Ok(parse_hash_query(&text))
+}
+
+// ---- rendered files ----------------------------------------------------------
+
+/// What [`write_rendered`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The file already had this content and mode; nothing touched.
+    Unchanged,
+    /// The file already had this content, but another mode: only the mode
+    /// was set (content, mtime and inode untouched).
+    ModeFixed,
+    /// The file was created or replaced.
+    Written,
+}
+
+/// The mode bits a rendered file may get: permissions only (no setuid,
+/// setgid or sticky bit).
+const MODE_BITS: u32 = 0o777;
+/// The mode for directories [`write_rendered`] creates, before the umask:
+/// what `mkdir -p` and Docker (for a missing bind-mount source) use, so a
+/// container user can still reach a file a `pre` step `chown`s to it.
+const NEW_DIR_MODE: u32 = 0o755;
+
+/// Writes `contents` (a rendered extra file) to `path` with mode `mode`,
+/// unless it already holds exactly that:
+/// - `mode` may only have permission bits (`0o777`); it is set exactly, not
+///   masked by the umask.
+/// - `path` must not be a symbolic link (refused even if it points at the
+///   right file: lst would silently write somewhere else, or replace the
+///   link), nor a directory or other non-regular file. Symbolic links in
+///   the *parent* directories are followed (an appdata share may well be
+///   one).
+/// - Existing file with the same bytes: nothing is written (mtime and inode
+///   stay); if only its mode differs, the mode is fixed
+///   ([`WriteOutcome::ModeFixed`]), since a wrong mode on a file of secrets
+///   matters even when the content is right.
+/// - Otherwise the new content goes into a temporary file `.lst-<random>.tmp`
+///   in the same directory, created `0600` and set to `mode` (and, when
+///   replacing a file, to its owner and group, so a `chown` from an earlier
+///   `pre` step survives) *before* any data is written; it is fsynced,
+///   renamed over `path` (so readers see the old or the new file, never a
+///   partial one) and the directory is fsynced. On any error the temporary
+///   file is removed.
+/// - Missing parent directories are created with mode `0755` (minus the
+///   umask); existing ones are left alone.
+///
+/// Errors name the path only, never the content.
+pub fn write_rendered(
+    path: &Path,
+    contents: &SecretString,
+    mode: u32,
+) -> Result<WriteOutcome, DeployError> {
+    write_rendered_with(path, contents, mode, |from, to| fs::rename(from, to))
+}
+
+/// [`write_rendered`] with the final rename injectable, so tests can make
+/// it fail after the temporary file exists.
+fn write_rendered_with(
+    path: &Path,
+    contents: &SecretString,
+    mode: u32,
+    rename: fn(&Path, &Path) -> io::Result<()>,
+) -> Result<WriteOutcome, DeployError> {
+    let io_err = |source| DeployError::RenderWrite {
+        path: path.to_owned(),
+        source,
+    };
+    if mode & !MODE_BITS != 0 {
+        return Err(DeployError::RenderMode {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    if path.file_name().is_none() {
+        return Err(DeployError::RenderNotFile {
+            path: path.to_owned(),
+        });
+    }
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let existing = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(DeployError::RenderSymlink {
+                path: path.to_owned(),
+            });
+        }
+        Ok(m) if !m.is_file() => {
+            return Err(DeployError::RenderNotFile {
+                path: path.to_owned(),
+            });
+        }
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_err(e)),
+    };
+    match &existing {
+        Some(meta) => {
+            if let Some(outcome) = same_content(path, meta, contents, mode).map_err(io_err)? {
+                return Ok(outcome);
+            }
+        }
+        None => DirBuilder::new()
+            .recursive(true)
+            .mode(NEW_DIR_MODE)
+            .create(dir)
+            .map_err(io_err)?,
+    }
+    replace(path, dir, existing.as_ref(), contents, mode, rename).map_err(io_err)?;
+    Ok(WriteOutcome::Written)
+}
+
+/// If the existing regular file at `path` (whose `symlink_metadata` is
+/// `meta`) already holds `contents`: fixes its mode if needed and says
+/// what it did. `None`: it must be (re)written. A file swapped for another
+/// one since `meta` was read counts as different, and is then replaced by
+/// a rename, which never follows a link.
+fn same_content(
+    path: &Path,
+    meta: &fs::Metadata,
+    contents: &SecretString,
+    mode: u32,
+) -> io::Result<Option<WriteOutcome>> {
+    let mut file = File::open(path)?;
+    let now = file.metadata()?;
+    let same_file = now.dev() == meta.dev() && now.ino() == meta.ino() && now.is_file();
+    // Room for the whole file plus the probe for EOF, so the buffer of
+    // secrets doesn't reallocate (leaving an unwiped copy) while reading.
+    let capacity = usize::try_from(now.len()).unwrap_or(0).saturating_add(1);
+    let mut old = Zeroizing::new(Vec::with_capacity(capacity));
+    file.read_to_end(&mut old)?;
+    if !same_file || old.as_slice() != contents.expose().as_bytes() {
+        return Ok(None);
+    }
+    if now.mode() & 0o7777 == mode {
+        return Ok(Some(WriteOutcome::Unchanged));
+    }
+    file.set_permissions(Permissions::from_mode(mode))?;
+    Ok(Some(WriteOutcome::ModeFixed))
+}
+
+/// Removes the temporary file on drop unless it was renamed into place.
+struct TempFile<'a> {
+    path: &'a Path,
+    renamed: bool,
+}
+
+impl Drop for TempFile<'_> {
+    fn drop(&mut self) {
+        if !self.renamed {
+            // Best effort: the original error is what gets reported.
+            let _ = fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Writes `contents` to a new temporary file in `dir` and renames it over
+/// `path`; see [`write_rendered`].
+fn replace(
+    path: &Path,
+    dir: &Path,
+    existing: Option<&fs::Metadata>,
+    contents: &SecretString,
+    mode: u32,
+    rename: fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let tmp_path = dir.join(format!(".lst-{:016x}.tmp", u64::from_le_bytes(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    let mut tmp = TempFile {
+        path: &tmp_path,
+        renamed: false,
+    };
+    if let Some(old) = existing {
+        let new = file.metadata()?;
+        if (new.uid(), new.gid()) != (old.uid(), old.gid()) {
+            std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()))?;
+        }
+    }
+    // After the chown, which may clear mode bits; before any data.
+    file.set_permissions(Permissions::from_mode(mode))?;
+    file.write_all(contents.expose().as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    rename(tmp.path, path)?;
+    tmp.renamed = true;
+    File::open(dir)?.sync_all()
 }
 
 /// The stacks a change set affects; see [`affected_stacks`].
@@ -1228,15 +1445,12 @@ mod tests {
     #[test]
     fn empty_exec_form_is_unrepresentable() {
         assert!(StepCommand::from_argv(Vec::new()).is_none());
-        let StepCommand::Exec { program, args } =
-            StepCommand::from_argv(vec![secret("a"), secret("b"), secret("c")]).unwrap()
-        else {
-            panic!("not exec form");
-        };
-        assert_eq!(program.expose(), "a");
-        assert_eq!(
-            args.iter().map(SecretString::expose).collect::<Vec<_>>(),
-            ["b", "c"]
+        let cmd = StepCommand::from_argv(vec![secret("a"), secret("b"), secret("c")]).unwrap();
+        assert!(
+            matches!(&cmd, StepCommand::Exec { program, args }
+                if program.expose() == "a"
+                    && args.iter().map(SecretString::expose).eq(["b", "c"])),
+            "{cmd:?}"
         );
     }
 
@@ -1770,6 +1984,460 @@ mod tests {
             "some:11",
             &fail_run,
         );
+    }
+
+    // ---- rendered files -----------------------------------------------------
+
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    /// Every entry of `dir`, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// An mtime long ago, so a rewrite can't go unnoticed within the
+    /// timestamp resolution.
+    fn age(path: &Path) -> SystemTime {
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        old
+    }
+
+    fn mtime(path: &Path) -> SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn ino(path: &Path) -> u64 {
+        fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn writes_new_file_with_exact_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mosquitto.conf");
+        // 0666 isn't reachable through the default umask: set explicitly.
+        for mode in [0o666, 0o600, 0o400, 0o000, 0o777] {
+            fs::remove_file(&path).ok();
+            let c = secret("password_file /x\nü€😀\n");
+            assert_eq!(
+                write_rendered(&path, &c, mode).unwrap(),
+                WriteOutcome::Written
+            );
+            assert_eq!(fs::read(&path).unwrap(), c.expose().as_bytes());
+            assert_eq!(mode_of(&path), mode, "{mode:o}");
+        }
+        // No temporary file left behind.
+        assert_eq!(entries(dir.path()), ["mosquitto.conf"]);
+        // Empty content is a file too.
+        let empty = dir.path().join("empty");
+        let c = SecretString::default();
+        assert_eq!(
+            write_rendered(&empty, &c, 0o600).unwrap(),
+            WriteOutcome::Written
+        );
+        assert_eq!(fs::read(&empty).unwrap(), b"");
+        assert_eq!(
+            write_rendered(&empty, &c, 0o600).unwrap(),
+            WriteOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn unchanged_content_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let c = secret("same\n");
+        assert_eq!(
+            write_rendered(&path, &c, 0o640).unwrap(),
+            WriteOutcome::Written
+        );
+        let old = age(&path);
+        let inode = ino(&path);
+        assert_eq!(
+            write_rendered(&path, &c, 0o640).unwrap(),
+            WriteOutcome::Unchanged
+        );
+        assert_eq!(mtime(&path), old);
+        assert_eq!(ino(&path), inode);
+        assert_eq!(mode_of(&path), 0o640);
+        assert_eq!(entries(dir.path()), ["f"]);
+    }
+
+    #[test]
+    fn unchanged_content_with_other_mode_only_fixes_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let c = secret("same\n");
+        write_rendered(&path, &c, 0o644).unwrap();
+        let old = age(&path);
+        let inode = ino(&path);
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::ModeFixed
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mtime(&path), old);
+        assert_eq!(ino(&path), inode);
+        // A setuid bit someone else set is a different mode too.
+        fs::set_permissions(&path, Permissions::from_mode(0o4600)).unwrap();
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::ModeFixed
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn changed_content_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        write_rendered(&path, &secret("old value\n"), 0o644).unwrap();
+        let old = age(&path);
+        let inode = ino(&path);
+        // A prefix of the old content, a longer one, and a mode change.
+        for (content, mode) in [("old", 0o644), ("old value\nmore\n", 0o600), ("", 0o600)] {
+            let c = secret(content);
+            assert_eq!(
+                write_rendered(&path, &c, mode).unwrap(),
+                WriteOutcome::Written
+            );
+            assert_eq!(fs::read(&path).unwrap(), content.as_bytes());
+            assert_eq!(mode_of(&path), mode);
+        }
+        assert_ne!(mtime(&path), old);
+        // Replaced by a rename: a new inode, never a partial write in place.
+        assert_ne!(ino(&path), inode);
+        assert_eq!(entries(dir.path()), ["f"]);
+    }
+
+    #[test]
+    fn creates_missing_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appdata/mosquitto/config/mosquitto.conf");
+        let c = secret("x");
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::Written
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"x");
+        // An existing directory keeps its mode.
+        let existing = dir.path().join("kept");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, Permissions::from_mode(0o711)).unwrap();
+        write_rendered(&existing.join("new/f"), &c, 0o600).unwrap();
+        assert_eq!(mode_of(&existing), 0o711);
+        // Through a symlinked parent directory (followed).
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, dir.path().join("link")).unwrap();
+        write_rendered(&dir.path().join("link/f"), &c, 0o600).unwrap();
+        assert_eq!(fs::read(real.join("f")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn large_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let c = SecretString::new(payload(LARGE));
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::Written
+        );
+        assert!(fs::read(&path).unwrap() == c.expose().as_bytes());
+        assert_eq!(
+            write_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::Unchanged
+        );
+        // One byte different at the very end.
+        let mut other = payload(LARGE);
+        other.push('!');
+        let other = SecretString::new(other);
+        assert_eq!(
+            write_rendered(&path, &other, 0o600).unwrap(),
+            WriteOutcome::Written
+        );
+        assert!(fs::read(&path).unwrap() == other.expose().as_bytes());
+    }
+
+    #[test]
+    fn symlink_target_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::write(&real, "real content").unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        // Even with the content the link's target already has.
+        for content in ["new", "real content"] {
+            for path in [&link, &dangling] {
+                let err = write_rendered(path, &secret(content), 0o600).unwrap_err();
+                assert!(
+                    matches!(&err, DeployError::RenderSymlink { path: p } if p == path),
+                    "{err:?}"
+                );
+            }
+        }
+        assert_eq!(fs::read(&real).unwrap(), b"real content");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dir.path().join("nowhere").exists());
+        let err = write_rendered(&link, &secret("new"), 0o600).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write the rendered file {}: it is a symbolic link",
+                link.display()
+            )
+        );
+    }
+
+    #[test]
+    fn non_file_targets_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let fifo = dir.path().join("fifo");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        for path in [
+            sub.clone(),
+            fifo.clone(),
+            PathBuf::from("/"),
+            dir.path().join("sub/.."),
+            PathBuf::from(""),
+        ] {
+            let err = write_rendered(&path, &secret("x"), 0o600).unwrap_err();
+            assert!(
+                matches!(&err, DeployError::RenderNotFile { path: p } if *p == path),
+                "{path:?}: {err:?}"
+            );
+        }
+        assert!(sub.is_dir() && entries(&sub).is_empty());
+        let err = write_rendered(&sub, &secret("x"), 0o600).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write the rendered file {}: it is not a regular file",
+                sub.display()
+            )
+        );
+        assert_eq!(entries(dir.path()), ["fifo", "sub"]);
+    }
+
+    #[test]
+    fn invalid_modes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        for mode in [0o4600, 0o2600, 0o1600, 0o10600, u32::MAX] {
+            let err = write_rendered(&path, &secret("x"), mode).unwrap_err();
+            assert!(
+                matches!(&err, DeployError::RenderMode { path: p, mode: m }
+                    if *p == path && *m == mode),
+                "{err:?}"
+            );
+        }
+        assert!(!path.exists());
+        let err = write_rendered(&path, &secret("x"), 0o4600).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid mode 0o4600 for the rendered file {} (only the permission bits 0o777 \
+                 may be set)",
+                path.display()
+            )
+        );
+    }
+
+    /// Asserts `err` is a `RenderWrite` for `path` that shows neither
+    /// `content` nor anything but the path.
+    fn assert_write_error(err: &DeployError, path: &Path, content: &str) {
+        assert!(
+            matches!(err, DeployError::RenderWrite { path: p, .. } if p == path),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("could not write the rendered file {}", path.display())
+        );
+        let source = std::error::Error::source(err).unwrap().to_string();
+        let shown = format!("{err:?} {source}");
+        assert!(!shown.contains(content), "{shown}");
+    }
+
+    #[test]
+    fn io_failures_name_the_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "PW-secret-value";
+        // A parent that is a file.
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+        let path = file.join("x.conf");
+        let err = write_rendered(&path, &secret(content), 0o600).unwrap_err();
+        assert_write_error(&err, &path, content);
+        // A parent directory that can't be created (procfs refuses even
+        // root).
+        let path = Path::new("/proc/lst-test-no-such-dir/x.conf");
+        let err = write_rendered(path, &secret(content), 0o600).unwrap_err();
+        assert_write_error(&err, path, content);
+        // An existing directory where no file can be created.
+        let path = Path::new("/proc/self/lst-test-x.conf");
+        let err = write_rendered(path, &secret(content), 0o600).unwrap_err();
+        assert_write_error(&err, path, content);
+        // An existing regular file that can't be read for the comparison
+        // (reading this process's memory at address 0 is EIO).
+        let path = Path::new("/proc/self/mem");
+        let err = write_rendered(path, &secret(content), 0o600).unwrap_err();
+        assert_write_error(&err, path, content);
+    }
+
+    fn failing_rename(_: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::other("injected rename failure"))
+    }
+
+    #[test]
+    fn failed_rename_leaves_no_temp_file_and_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "PW-new-value";
+        // New file.
+        let path = dir.path().join("new.conf");
+        let err = write_rendered_with(&path, &secret(content), 0o600, failing_rename).unwrap_err();
+        assert_write_error(&err, &path, content);
+        assert!(entries(dir.path()).is_empty());
+        // Replacing an existing file: it stays as it was.
+        let path = dir.path().join("old.conf");
+        write_rendered(&path, &secret("old"), 0o644).unwrap();
+        let err = write_rendered_with(&path, &secret(content), 0o600, failing_rename).unwrap_err();
+        assert_write_error(&err, &path, content);
+        assert_eq!(entries(dir.path()), ["old.conf"]);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(mode_of(&path), 0o644);
+    }
+
+    /// Whether this test process runs as root (judged by the owner of a
+    /// file it creates).
+    fn is_root(dir: &Path) -> bool {
+        let probe = dir.join("probe");
+        fs::write(&probe, "").unwrap();
+        let root = fs::metadata(&probe).unwrap().uid() == 0;
+        fs::remove_file(probe).unwrap();
+        root
+    }
+
+    #[test]
+    fn replacing_keeps_owner_and_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        write_rendered(&path, &secret("old"), 0o600).unwrap();
+        // As a normal user the file is ours already: nothing to change.
+        let me = fs::metadata(&path).unwrap();
+        write_rendered(&path, &secret("new"), 0o600).unwrap();
+        let now = fs::metadata(&path).unwrap();
+        assert_eq!((now.uid(), now.gid()), (me.uid(), me.gid()));
+        // A file a `pre` step chowned to the container user keeps that
+        // owner when its content changes. Only root can chown to another
+        // user; a normal user's test chowns to itself (a no-op).
+        let owner = (me.uid(), me.gid());
+        // (Indexed rather than an `if`, so the branch not taken on this
+        // machine isn't a line coverage misses.)
+        let other = [owner, (1883, 1884)][usize::from(is_root(dir.path()))];
+        std::os::unix::fs::chown(&path, Some(other.0), Some(other.1)).unwrap();
+        let c = secret("newer");
+        assert_eq!(
+            write_rendered(&path, &c, 0o640).unwrap(),
+            WriteOutcome::Written
+        );
+        let now = fs::metadata(&path).unwrap();
+        assert_eq!((now.uid(), now.gid()), other);
+        assert_eq!(mode_of(&path), 0o640);
+        assert_eq!(fs::read(&path).unwrap(), b"newer");
+        // A new file is lst's own.
+        let fresh = dir.path().join("fresh");
+        write_rendered(&fresh, &secret("x"), 0o600).unwrap();
+        let new = fs::metadata(&fresh).unwrap();
+        assert_eq!((new.uid(), new.gid()), owner);
+    }
+
+    // ---- rendered files under a umask, in a child process -------------------
+
+    const CHILD_WRITE_DIR: &str = "LST_TEST_DEPLOY_WRITE_DIR";
+
+    /// The child's side of `write_ignores_umask`: does nothing in a normal
+    /// test run. Writes `rel.conf` relative to its working directory and
+    /// `a/b/c.conf` under CHILD_WRITE_DIR.
+    #[test]
+    fn child_write_rendered() {
+        let Some(dir) = env::var_os(CHILD_WRITE_DIR) else {
+            return;
+        };
+        let rel = Path::new("rel.conf");
+        let c = secret("x\n");
+        assert_eq!(
+            write_rendered(rel, &c, 0o644).unwrap(),
+            WriteOutcome::Written
+        );
+        assert_eq!(
+            write_rendered(rel, &c, 0o644).unwrap(),
+            WriteOutcome::Unchanged
+        );
+        assert_eq!(mode_of(rel), 0o644);
+        let nested = Path::new(&dir).join("a/b/c.conf");
+        assert_eq!(
+            write_rendered(&nested, &c, 0o666).unwrap(),
+            WriteOutcome::Written
+        );
+        assert_eq!(mode_of(&nested), 0o666);
+    }
+
+    #[test]
+    fn write_ignores_umask_for_files_not_dirs() {
+        for (umask, dir_mode) in [("077", 0o700), ("000", 0o755), ("027", 0o750)] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = tempfile::tempdir().unwrap();
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
+                .arg(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "deploy::tests::child_write_rendered",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .current_dir(dir.path());
+            let dir_str = dir.path().to_str().unwrap();
+            child_output(cmd, record.path(), &[(CHILD_WRITE_DIR, dir_str)]);
+            assert_eq!(fs::read(dir.path().join("rel.conf")).unwrap(), b"x\n");
+            assert_eq!(mode_of(&dir.path().join("a/b/c.conf")), 0o666);
+            // New directories: 0755 minus the umask.
+            assert_eq!(mode_of(&dir.path().join("a")), dir_mode, "umask {umask}");
+            assert_eq!(mode_of(&dir.path().join("a/b")), dir_mode, "umask {umask}");
+            assert_eq!(entries(dir.path()), ["a", "rel.conf"]);
+        }
     }
 
     // ---- affected stacks ---------------------------------------------------
