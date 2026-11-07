@@ -6,7 +6,9 @@
 //! update a vector to make a test pass: every deployed secret depends on
 //! these exact outputs.
 
-use lst::crypto::{GenId, Sealed, Seed, derive_gen, encryption_key, fingerprint, open};
+use lst::crypto::{
+    GenId, Sealed, Seed, derive_gen, encryption_key, fingerprint, open, render_hash_key,
+};
 use lst::format::{Format, generate};
 
 const SEED: [u8; 32] = [0x42; 32];
@@ -204,4 +206,25 @@ fn seed_hex_vectors() {
         "0008101820283038404850586068707880889098a0a8b0b8c0c8d0d8e0e8f0f8"
     );
     assert_eq!(Seed::from_hex(hex.expose()).unwrap().as_bytes(), &seq);
+}
+
+/// Added in M4 (2026-11-07): the `lst.render-hash` key,
+/// `derive_key("lst v1 render-hash", seed)`, used as a keyed BLAKE3 hash.
+/// Cross-checked with the Python `blake3` bindings
+/// (`blake3(seed, derive_key_context=…)`, then `blake3(msg, key=…)`).
+#[test]
+fn render_hash_key_vector() {
+    let hash = |msg: &[u8]| {
+        let mut h = render_hash_key(&seed()).hasher();
+        h.update(msg);
+        h.finalize_hex()
+    };
+    assert_eq!(
+        hash(b"lst v1 render-hash test vector"),
+        "a82702b47354a43c502e721a9c1c7b60dbaa875504f868dad643584ac387c8a5"
+    );
+    assert_eq!(
+        hash(b""),
+        "f2dba65f855f80fcd14b5567a5e26014cf6573430df1ffbe1d62bfeffa57dc90"
+    );
 }
