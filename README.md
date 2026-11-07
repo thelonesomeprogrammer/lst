@@ -194,7 +194,7 @@ stacks/<stack>/config/…      # optional template files with markers
 - [x] M0: core library (marker parser, derivation, formats, encryption, frozen test vectors)
 - [x] M1: `init` + `render` (+ `sync`)
 - [x] M2: pre-commit hook
-- [ ] M3: `deploy` + `check` + CI
+- [x] M3: `deploy` + `check` + CI (example pipeline in `docs/examples/woodpecker.yml`; first real Gitea/Woodpecker run still to be confirmed)
 - [ ] M4: `x-deploy`
 - [ ] M5: `rotate`, `gc`, `--all`, `--dry-run`
 
