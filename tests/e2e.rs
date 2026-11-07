@@ -21,6 +21,9 @@ mod check;
 #[path = "e2e/deploy.rs"]
 mod deploy;
 
+#[path = "e2e/xdeploy.rs"]
+mod xdeploy;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;

@@ -22,6 +22,10 @@ const CTX_GEN: &str = "lst v1 gen";
 const CTX_SEC_ENCRYPTION: &str = "lst v1 sec-encryption";
 /// FROZEN: BLAKE3 derive_key context for the seed fingerprint.
 const CTX_FINGERPRINT: &str = "lst v1 fingerprint";
+/// FROZEN (M4): BLAKE3 derive_key context for the `lst.render-hash` key.
+/// Changing it changes every render hash, so every labelled container is
+/// recreated once.
+const CTX_RENDER_HASH: &str = "lst v1 render-hash";
 /// FROZEN: prefix of the AEAD associated data; the full secret name follows.
 const AD_PREFIX: &[u8] = b"lst v1 secret\0";
 
@@ -267,6 +271,64 @@ pub fn fingerprint(seed: &Seed) -> String {
     s
 }
 
+/// Key for the `lst.render-hash` labels (`docs/design.md`, "x-deploy
+/// details"). Zeroized on drop; `Debug` is redacted; no accessor.
+pub struct RenderHashKey(Zeroizing<[u8; 32]>);
+
+impl fmt::Debug for RenderHashKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RenderHashKey(<redacted>)")
+    }
+}
+
+/// FROZEN: `derive_key("lst v1 render-hash", seed)`.
+pub fn render_hash_key(seed: &Seed) -> RenderHashKey {
+    RenderHashKey(Zeroizing::new(blake3::derive_key(
+        CTX_RENDER_HASH,
+        &seed.0[..],
+    )))
+}
+
+impl RenderHashKey {
+    /// A keyed BLAKE3 hasher (`blake3::Hasher::new_keyed`) under this key.
+    /// Feeding it a message and calling [`KeyedHasher::finalize_hex`] gives
+    /// the same result as `blake3::keyed_hash(key, message)`.
+    pub fn hasher(&self) -> KeyedHasher {
+        KeyedHasher(blake3::Hasher::new_keyed(&self.0))
+    }
+}
+
+/// An incremental keyed BLAKE3 hash. Its state depends on the key and on
+/// the (secret) input, so it is zeroized on drop; `Debug` is redacted.
+pub struct KeyedHasher(blake3::Hasher);
+
+impl KeyedHasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The 32-byte keyed hash of everything fed in, as 64 lowercase hex
+    /// characters. Without the key it reveals nothing about the input.
+    pub fn finalize_hex(self) -> String {
+        let hash = self.0.finalize();
+        let mut s = String::with_capacity(64);
+        push_hex(&mut s, hash.as_bytes());
+        s
+    }
+}
+
+impl Drop for KeyedHasher {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for KeyedHasher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyedHasher(<redacted>)")
+    }
+}
+
 /// FROZEN: AD = `"lst v1 secret\0"` + full name (UTF-8).
 fn associated_data(full_name: &str) -> Result<Vec<u8>, CryptoError> {
     if full_name.as_bytes().contains(&0) {
@@ -444,12 +506,16 @@ mod tests {
     #[test]
     fn debug_is_redacted() {
         let s = seed(0xab);
+        let mut hasher = render_hash_key(&s).hasher();
+        hasher.update(b"topsecret");
         let out = format!(
-            "{:?} {:?} {:?} {:?}",
+            "{:?} {:?} {:?} {:?} {:?} {:?}",
             s,
             encryption_key(&s),
             SecretString::new("topsecret".into()),
-            derive_gen(&s, &GenId([0; ID_LEN]))
+            derive_gen(&s, &GenId([0; ID_LEN])),
+            render_hash_key(&s),
+            hasher,
         );
         assert!(!out.contains("ab") && !out.contains("171") && !out.contains("topsecret"));
         assert!(out.contains("<redacted>"));
@@ -535,5 +601,31 @@ mod tests {
         km[..32].copy_from_slice(seed(1).as_bytes());
         km[32..].copy_from_slice(&id1.0);
         assert_eq!(read(&seed(1), &id1), blake3::derive_key(CTX_GEN, &km));
+    }
+
+    #[test]
+    fn render_hash_is_keyed_blake3_under_the_derived_key() {
+        let hash = |s: &Seed, parts: &[&[u8]]| {
+            let mut h = render_hash_key(s).hasher();
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize_hex()
+        };
+        let key = blake3::derive_key(CTX_RENDER_HASH, seed(1).as_bytes());
+        let expected = blake3::keyed_hash(&key, b"abcdef").to_hex().to_string();
+        assert_eq!(hash(&seed(1), &[b"abcdef"]), expected);
+        // Incremental: how the message is split doesn't matter.
+        assert_eq!(hash(&seed(1), &[b"ab", b"", b"cdef"]), expected);
+        assert_eq!(expected.len(), 64);
+        assert_ne!(hash(&seed(2), &[b"abcdef"]), expected);
+        assert_ne!(hash(&seed(1), &[b"abcdeg"]), expected);
+        // Not the plain (unkeyed) hash, and not another context's key.
+        assert_ne!(expected, blake3::hash(b"abcdef").to_hex().to_string());
+        let other = blake3::derive_key(CTX_FINGERPRINT, seed(1).as_bytes());
+        assert_ne!(
+            expected,
+            blake3::keyed_hash(&other, b"abcdef").to_hex().to_string()
+        );
     }
 }

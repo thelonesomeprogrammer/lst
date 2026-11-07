@@ -89,6 +89,14 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
 - **Deploy order:** check → render compose + files → write changed files → `pre` → `up -d --wait --remove-orphans` → `post`.
 - **`lst render <stack>`** prints the final compose (stripped, labelled) and never writes files; `lst render <stack> --file <from>` prints one rendered extra file.
 - **CI:** lst writes `to:` files itself, so the deploy step must mount the target directories at the same paths (documented in `docs/ci.md`).
+- **Implementation choices (raised by Claude Code during M4, pending review by tlp):**
+  - *Which path:* a line starting with `x-deploy:` (or a quoted key) selects the YAML path; other stacks are never YAML-parsed. If such a line exists but there is no top-level key, or the text parses with a top-level `x-deploy` that no line starts with (flow style), that is an error, so steps never silently don't run.
+  - *Merge keys* (`<<: *a`) are applied before anything else, so merged `volumes:`/`labels:` count and an injected `labels:` never hides merged ones.
+  - *Markers are substituted after YAML decoding*; sync and the hook read raw text, so a marker that only exists through a YAML escape isn't synced (documented: write markers literally). A marker in a service name is an error; `from`, `to`, `mode`, `with`, `exec`, `when` must not contain markers (they're used as written).
+  - *Paths:* `.` and empty components are dropped from `from`/`to`; `..` is refused; `from` must be a file `lst sync` reads (not gitignored, not a symlink) and UTF-8. `mode` is 3–4 octal digits, `"0640"` or `640` quoted; an unquoted number is refused (ambiguous).
+  - *Mounts:* bind sources that are relative, named, contain `$` or `..`, and top-level `volumes:` driver options are ignored.
+  - *Hash inputs:* exactly the design's (mounted files' rendered contents by `to`, then the targeted steps' phase, `when` and rendered command); `mode` is not hashed. The byte layout is documented on `xdeploy::service_hash` and pinned in `tests/vectors.rs`.
+  - *Errors:* every unresolved name of a stack (compose, commands, `render:` files) is reported in one list under the stack's `compose.yaml`; a user-set `lst.render-hash` label is an error on any service.
 
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.

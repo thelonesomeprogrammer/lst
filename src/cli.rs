@@ -27,17 +27,19 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use crate::check::{self, Problem};
-use crate::crypto::{CryptoError, SecretString, Seed};
+use crate::crypto::{self, CryptoError, Seed};
 use crate::deploy::{self, DeployError};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
 use crate::hook::{self, HookError, Role};
+use crate::marker::MarkerKind;
 use crate::render::{self, RenderError};
 use crate::scan::{self, ScanError};
 use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, Stack, StackError};
 use crate::store::{
     self, EntryKind, META, ResolveError, SHARED, StackFile, Store, StoreError, SyncReport,
 };
+use crate::xdeploy::{self, Detected, Failure, Rendered, XDeployError};
 
 /// The store directory, relative to the repository root.
 pub const SEC_DIR: &str = ".sec";
@@ -85,10 +87,17 @@ pub enum Command {
     },
     /// Print the resolved compose file of a stack to stdout.
     ///
-    /// Read-only: never writes .sec/ or .env.
+    /// Read-only: never writes .sec/, .env or any x-deploy render: target.
+    /// A stack with a top-level x-deploy key is rendered through YAML:
+    /// x-deploy is removed and services with rendered inputs get an
+    /// lst.render-hash label.
     Render {
         /// The stack: stacks/<STACK>/compose.yaml.
         stack: String,
+        /// Print the rendered x-deploy render: file whose `from` is FROM
+        /// (relative to stacks/<STACK>/) instead of the compose file.
+        #[arg(long, value_name = "FROM")]
+        file: Option<String>,
     },
     /// Check that the repository is ready to deploy, listing every problem.
     ///
@@ -233,6 +242,17 @@ pub enum CliError {
         path: String,
         source: RenderError<ResolveError>,
     },
+    #[error(transparent)]
+    XDeploy(#[from] XDeployError),
+    #[error(
+        "stack {stack:?} has no x-deploy render: entry with from: {file:?} (its entries: {})",
+        list_or_none(known)
+    )]
+    UnknownRenderFile {
+        stack: String,
+        file: String,
+        known: Vec<String>,
+    },
     #[error("could not write to stdout: {0}")]
     Stdout(io::Error),
     #[error(transparent)]
@@ -303,7 +323,9 @@ pub fn run(
         Command::Rename { from, to, replace } => {
             rename(&root, env_seed, &from, &to, replace, stderr)
         }
-        Command::Render { stack } => render_stack(&root, env_seed, &stack, stdout),
+        Command::Render { stack, file } => {
+            render_stack(&root, env_seed, &stack, file.as_deref(), stdout)
+        }
         Command::Check => check(&root, env_seed, stderr),
         Command::Deploy {
             stacks,
@@ -552,18 +574,24 @@ type Contents = Zeroizing<Vec<u8>>;
 fn read_stack_files(root: &Path) -> Result<scan::StackFiles<Contents>, CliError> {
     let mut out = BTreeMap::new();
     for s in stack::discover(root)? {
-        let mut files = Vec::new();
-        for path in git::worktree_files(root, &format!("{STACKS_DIR}/{}/", s.name))? {
-            let full = root.join(&path);
-            let meta = fs::symlink_metadata(&full).map_err(io_err(Path::new(&path)))?;
-            if meta.is_file() {
-                let bytes = fs::read(&full).map_err(io_err(Path::new(&path)))?;
-                files.push((path, Zeroizing::new(bytes)));
-            }
-        }
+        let files = read_one_stack(root, &s)?;
         out.insert(s.name, files);
     }
     Ok(out)
+}
+
+/// The files of one stack, as [`read_stack_files`] reads them.
+fn read_one_stack(root: &Path, s: &Stack) -> Result<Vec<(String, Contents)>, CliError> {
+    let mut files = Vec::new();
+    for path in git::worktree_files(root, &format!("{STACKS_DIR}/{}/", s.name))? {
+        let full = root.join(&path);
+        let meta = fs::symlink_metadata(&full).map_err(io_err(Path::new(&path)))?;
+        if meta.is_file() {
+            let bytes = fs::read(&full).map_err(io_err(Path::new(&path)))?;
+            files.push((path, Zeroizing::new(bytes)));
+        }
+    }
+    Ok(files)
 }
 
 fn sync(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(), CliError> {
@@ -667,32 +695,87 @@ fn rename(
     Ok(())
 }
 
+/// `lst render STACK [--file FROM]`: the rendered compose file, or one
+/// rendered `render:` file, on stdout. Writes no file.
 fn render_stack(
     root: &Path,
     env_seed: EnvSeed<'_>,
     name: &str,
+    file: Option<&str>,
     stdout: &mut dyn Write,
 ) -> Result<(), CliError> {
     let (seed, store) = open_store(root, env_seed)?;
     let s = stack::find(root, name)?;
-    let rendered = render_compose(&seed, &store, &s)?;
+    let rendered = render_full(root, &seed, &store, &s)?;
+    let out = match file {
+        None => &rendered.compose,
+        Some(file) => {
+            let from = xdeploy::normalize_from(file);
+            let found = rendered
+                .files
+                .iter()
+                .find(|f| Some(&f.from) == from.as_ref());
+            match found {
+                Some(f) => &f.contents,
+                None => {
+                    return Err(CliError::UnknownRenderFile {
+                        stack: s.name,
+                        file: file.to_owned(),
+                        known: rendered.files.iter().map(|f| f.from.clone()).collect(),
+                    });
+                }
+            }
+        }
+    };
     stdout
-        .write_all(rendered.expose().as_bytes())
+        .write_all(out.expose().as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(CliError::Stdout)
 }
 
-/// The rendered `compose.yaml` of `s`: what `lst render` prints and what
-/// `lst deploy` pipes into compose (the same bytes).
-fn render_compose(seed: &Seed, store: &Store, s: &Stack) -> Result<SecretString, CliError> {
+/// Everything rendered for stack `s`: its compose file (what `lst render`
+/// prints and `lst deploy` pipes into compose, the same bytes) and, for a
+/// stack with `x-deploy`, its `render:` files, steps and render hashes.
+///
+/// A stack without `x-deploy` takes the raw-text path of M1–M3
+/// ([`render::render`], byte for byte; only `compose` is set). One with it
+/// takes the YAML path ([`xdeploy::render`]), with the stack's files as
+/// `lst sync` reads them. Writes nothing. For `lst deploy`'s x-deploy steps.
+pub(crate) fn render_full(
+    root: &Path,
+    seed: &Seed,
+    store: &Store,
+    s: &Stack,
+) -> Result<Rendered, CliError> {
     let (path, text) = read_compose(s)?;
-    render::render(&text, |m| store.resolve(seed, &s.name, m)).map_err(|e| match e {
-        RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
-        source => CliError::Render {
-            path: path.clone(),
-            source,
-        },
-    })
+    let resolve = |m: &MarkerKind| store.resolve(seed, &s.name, m);
+    match xdeploy::detect(&text) {
+        Detected::Raw => {
+            let compose = render::render(&text, resolve).map_err(|e| match e {
+                RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
+                source => CliError::Render {
+                    path: path.clone(),
+                    source,
+                },
+            })?;
+            Ok(Rendered {
+                compose,
+                ..Rendered::default()
+            })
+        }
+        Detected::Hidden => Err(XDeployError::Hidden { path }.into()),
+        Detected::XDeploy => {
+            let files = read_one_stack(root, s)?;
+            let key = crypto::render_hash_key(seed);
+            xdeploy::render(&s.name, &text, &files, &key, resolve).map_err(|e| match e {
+                Failure::XDeploy(e) => e.into(),
+                Failure::Unresolved(list) => CliError::Render {
+                    path,
+                    source: RenderError::Unresolved(list),
+                },
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +824,7 @@ fn check_repo(
     let files = read_stack_files(root)?;
 
     let mut problems = check::working_tree(&store, &loaded, &files)?;
+    problems.extend(check::xdeploy(&files));
     problems.extend(committed_sets(root, stderr)?);
     if let Some(seed) = seed {
         problems.extend(check::resolution(&store, seed, &files)?);
@@ -829,8 +913,8 @@ fn deploy(
     }
     let names_of = |ts: &[Stack]| ts.iter().map(|t| t.name.clone()).collect();
     for (i, s) in targets.iter().enumerate() {
-        let result = render_compose(&seed, store, s)
-            .and_then(|rendered| Ok(deploy::run_compose(root, &s.name, &rendered)?));
+        let result = render_full(root, &seed, store, s)
+            .and_then(|rendered| Ok(deploy::run_compose(root, &s.name, &rendered.compose)?));
         if let Err(e) = result {
             return Err(CliError::DeployFailed {
                 failed: s.name.clone(),
