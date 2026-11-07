@@ -1,8 +1,12 @@
-//! `lst deploy`: running `docker compose up` on a rendered stack, and
-//! working out which stacks `--changed-since REV` affects.
+//! `lst deploy`: running `docker compose up` on a rendered stack, the
+//! `x-deploy` steps around it, writing rendered extra files, and working
+//! out which stacks `--changed-since REV` affects.
 //!
-//! [`validate_project_name`], [`compose_args`] and [`affected_stacks`] are
-//! pure. [`run_compose`] is the thin runner around them.
+//! [`validate_project_name`], [`validate_service_name`], [`compose_args`],
+//! [`step_args`], [`hash_query_args`], [`parse_hash_query`] and
+//! [`affected_stacks`] are pure. [`run_compose`], [`run_pre`], [`run_post`],
+//! [`existing_hash`] and [`write_rendered`] are the thin runners around
+//! them.
 //!
 //! # Running compose
 //! Per stack, lst runs (an argument vector, never a shell string)
@@ -29,14 +33,40 @@
 //! - The project name is validated again before anything runs, so a name
 //!   that could be read as an option or a path never reaches compose.
 //!
+//! # `x-deploy` steps
+//! A `pre` step runs before `up`, in a throwaway container of the service's
+//! image; a `post` step after `up --wait`, in the running container
+//! ([`step_args`] has the exact arguments). Both get the rendered compose
+//! file on stdin exactly like `up` (same project name, project directory,
+//! working directory, output handling and `LST_SEED` removal), so the
+//! step's container sees the same configuration, volumes included.
+//!
+//! The commands hold rendered secrets. They are passed as arguments (never
+//! through a shell on the host), are wiped from lst's own buffers when
+//! dropped, and never appear in errors: a failing step is reported by stack,
+//! phase, step index and service only. (`std::process::Command` keeps its
+//! own copy until it is dropped, and the arguments are visible in `ps` while
+//! docker runs; both accepted in `docs/design.md`.)
+//!
+//! # Reading `lst.render-hash`
+//! See [`hash_query_args`] and [`parse_hash_query`]: one `docker ps` that
+//! filters by compose's own labels, so it needs neither the compose file
+//! nor a project directory.
+//!
+//! # Rendered files
+//! See [`write_rendered`].
+//!
 //! # Affected stacks (`--changed-since REV`)
 //! See [`affected_stacks`].
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+
+use zeroize::Zeroizing;
 
 use crate::crypto::SecretString;
 use crate::scan::Uses;
@@ -69,6 +99,31 @@ pub enum DeployError {
     Wait(#[source] io::Error),
     #[error("`docker compose up` for stack {stack:?} failed ({status})")]
     Compose { stack: String, status: ExitStatus },
+    #[error(
+        "service name {service:?} of stack {stack:?} is not a valid docker compose service name \
+         (only a-z, A-Z, 0-9, `.`, `_` and `-`)"
+    )]
+    InvalidServiceName { stack: String, service: String },
+    /// A `pre`/`post` step exited non-zero. `index` is the step's position
+    /// in its list (from 0), as in `x-deploy.pre[0]`. Never the command.
+    #[error("x-deploy.{phase}[{index}] (service {service:?}) of stack {stack:?} failed ({status})")]
+    Step {
+        stack: String,
+        phase: Phase,
+        index: usize,
+        service: String,
+        status: ExitStatus,
+    },
+    #[error("`docker ps` for service {service:?} of stack {stack:?} failed ({status})")]
+    HashQuery {
+        stack: String,
+        service: String,
+        status: ExitStatus,
+    },
+    #[error(
+        "`docker ps` for service {service:?} of stack {stack:?} printed something that isn't UTF-8"
+    )]
+    HashQueryOutput { stack: String, service: String },
 }
 
 /// Checks that `stack` is usable as a compose project name as it is:
@@ -130,8 +185,47 @@ fn run_compose_with(
     rendered: &SecretString,
 ) -> Result<(), DeployError> {
     validate_project_name(stack)?;
+    let (status, written) = run_piped(
+        program,
+        compose_args(stack, &stack_dir_rel(stack)),
+        root,
+        rendered,
+    )?;
+    if !status.success() {
+        return Err(DeployError::Compose {
+            stack: stack.to_owned(),
+            status,
+        });
+    }
+    stdin_taken(stack, written)
+}
+
+/// Compose exited 0 without taking all of the input (`written` failed):
+/// whatever it ran is not what lst rendered.
+fn stdin_taken(stack: &str, written: io::Result<()>) -> Result<(), DeployError> {
+    written.map_err(|source| DeployError::Stdin {
+        stack: stack.to_owned(),
+        source,
+    })
+}
+
+/// Runs `program args` in `root` with `input` on stdin, the child's stdout
+/// and stderr on lst's stderr and `LST_SEED` removed, and waits for it.
+/// Returns its exit status and the result of writing stdin; callers check
+/// the status first (a child that fails without reading its input reports
+/// its own error, not lst's broken pipe).
+fn run_piped<I, S>(
+    program: &OsStr,
+    args: I,
+    root: &Path,
+    input: &SecretString,
+) -> Result<(ExitStatus, io::Result<()>), DeployError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut child = Command::new(program)
-        .args(compose_args(stack, &stack_dir_rel(stack)))
+        .args(args)
         .current_dir(root)
         .env_remove(SEED_ENV)
         .stdin(Stdio::piped())
@@ -150,24 +244,303 @@ fn run_compose_with(
         // Invariant: stdin was configured as `Stdio::piped()` above, so
         // `spawn` populated the handle and nothing has taken it yet.
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        stdin.write_all(rendered.expose().as_bytes())
+        stdin.write_all(input.expose().as_bytes())
     };
     let status = child.wait().map_err(DeployError::Wait)?;
-    if !status.success() {
-        return Err(DeployError::Compose {
+    Ok((status, written))
+}
+
+// ---- x-deploy steps --------------------------------------------------------
+
+/// When an `x-deploy` step runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Before `up`: `docker compose run --rm --no-deps -T`.
+    Pre,
+    /// After `up --wait`: `docker compose exec -T`.
+    Post,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Phase::Pre => "pre",
+            Phase::Post => "post",
+        })
+    }
+}
+
+/// A step's rendered `run:`. It holds secrets, hence [`SecretString`]
+/// (whose `Debug` is redacted).
+#[derive(Debug)]
+pub enum StepCommand {
+    /// `run: <string>`: runs as `sh -c <string>` in the container.
+    Shell(SecretString),
+    /// `run: [program, args…]`: exec form, no shell. An empty list can't be
+    /// represented; see [`StepCommand::from_argv`].
+    Exec {
+        program: SecretString,
+        args: Vec<SecretString>,
+    },
+}
+
+impl StepCommand {
+    /// Exec form from a list; `None` for an empty list (the model must
+    /// reject `run: []`).
+    pub fn from_argv(argv: Vec<SecretString>) -> Option<StepCommand> {
+        let mut argv = argv.into_iter();
+        let program = argv.next()?;
+        Some(StepCommand::Exec {
+            program,
+            args: argv.collect(),
+        })
+    }
+}
+
+/// Checks that `service` is a compose service name: non-empty, only
+/// `[a-zA-Z0-9._-]` (the compose specification's pattern). The model checks
+/// that it names a service of the stack; this is the runners' own guard, so
+/// nothing else ever reaches docker's argument list or a `--filter`.
+pub fn validate_service_name(stack: &str, service: &str) -> Result<(), DeployError> {
+    let ok = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+    if !service.is_empty() && service.bytes().all(ok) {
+        Ok(())
+    } else {
+        Err(DeployError::InvalidServiceName {
             stack: stack.to_owned(),
+            service: service.to_owned(),
+        })
+    }
+}
+
+/// The arguments after `docker` for a step of `service` in `stack`:
+///
+/// ```text
+/// pre:  compose -p <stack> --project-directory stacks/<stack> -f - run --rm --no-deps -T -- <service> <command>
+/// post: compose -p <stack> --project-directory stacks/<stack> -f - exec -T -- <service> <command>
+/// ```
+///
+/// with `<command>` = `sh -c <string>` (shell form) or `<program> <args…>`
+/// (exec form).
+/// - `run` and `exec` stop parsing their own options at the service name
+///   (compose sets `SetInterspersed(false)` on both), so a command or
+///   argument starting with `-` reaches the container as it is. The `--`
+///   before the service also keeps a service name starting with `-` from
+///   being read as an option. (Checked against Docker Compose v5.6.1.)
+/// - `sh` itself would read a command string starting with `-` or `+` as
+///   options, so for such a string the shell form is `sh -c -- <string>`
+///   (POSIX; dash, bash and busybox ash all accept it). Every other string
+///   gets the plain `sh -c <string>`.
+/// - `run` uses the image's entrypoint, like the service would.
+///
+/// The result holds the rendered command and is wiped on drop. Doesn't
+/// validate `stack` or `service`; the runners do.
+pub fn step_args(
+    phase: Phase,
+    stack: &str,
+    service: &str,
+    command: &StepCommand,
+) -> Zeroizing<Vec<String>> {
+    let mut args = Zeroizing::new(Vec::new());
+    let mut push = |a: &str| args.push(a.to_owned());
+    for a in ["compose", "-p", stack, "--project-directory"] {
+        push(a);
+    }
+    push(&format!("{STACKS_DIR}/{stack}"));
+    push("-f");
+    push("-");
+    let sub: &[&str] = match phase {
+        Phase::Pre => &["run", "--rm", "--no-deps", "-T"],
+        Phase::Post => &["exec", "-T"],
+    };
+    for a in sub.iter().chain(&["--", service]) {
+        push(a);
+    }
+    match command {
+        StepCommand::Shell(script) => {
+            let script = script.expose();
+            push("sh");
+            push("-c");
+            if script.starts_with(['-', '+']) {
+                push("--");
+            }
+            push(script);
+        }
+        StepCommand::Exec { program, args } => {
+            for a in std::iter::once(program).chain(args) {
+                push(a.expose());
+            }
+        }
+    }
+    args
+}
+
+/// Runs step `index` of the `pre` list: `command` in a throwaway container
+/// of `service` (see [`step_args`]), with `compose` (the stack's rendered
+/// compose file) on stdin, in `root`, and waits for it. A non-zero exit is
+/// [`DeployError::Step`]; the step's output goes to lst's stderr.
+pub fn run_pre(
+    root: &Path,
+    stack: &str,
+    compose: &SecretString,
+    index: usize,
+    service: &str,
+    command: &StepCommand,
+) -> Result<(), DeployError> {
+    let step = StepRef {
+        phase: Phase::Pre,
+        index,
+        service,
+    };
+    run_step_with(OsStr::new(DOCKER), root, stack, compose, step, command)
+}
+
+/// Runs step `index` of the `post` list in the running container of
+/// `service`; otherwise like [`run_pre`].
+pub fn run_post(
+    root: &Path,
+    stack: &str,
+    compose: &SecretString,
+    index: usize,
+    service: &str,
+    command: &StepCommand,
+) -> Result<(), DeployError> {
+    let step = StepRef {
+        phase: Phase::Post,
+        index,
+        service,
+    };
+    run_step_with(OsStr::new(DOCKER), root, stack, compose, step, command)
+}
+
+/// Which step is running, for its arguments and errors.
+#[derive(Debug, Clone, Copy)]
+struct StepRef<'a> {
+    phase: Phase,
+    index: usize,
+    service: &'a str,
+}
+
+fn run_step_with(
+    program: &OsStr,
+    root: &Path,
+    stack: &str,
+    compose: &SecretString,
+    step: StepRef<'_>,
+    command: &StepCommand,
+) -> Result<(), DeployError> {
+    validate_project_name(stack)?;
+    validate_service_name(stack, step.service)?;
+    let args = step_args(step.phase, stack, step.service, command);
+    let (status, written) = run_piped(program, args.iter(), root, compose)?;
+    if !status.success() {
+        return Err(DeployError::Step {
+            stack: stack.to_owned(),
+            phase: step.phase,
+            index: step.index,
+            service: step.service.to_owned(),
             status,
         });
     }
-    // Compose exited 0 without taking all of the input: whatever it
-    // deployed is not what lst rendered.
-    if let Err(source) = written {
-        return Err(DeployError::Stdin {
+    stdin_taken(stack, written)
+}
+
+// ---- lst.render-hash of the existing container -------------------------------
+
+/// The label lst puts the render hash in.
+pub const RENDER_HASH_LABEL: &str = "lst.render-hash";
+
+/// The arguments after `docker` that list the existing containers of
+/// `service` in project `stack`, one line `<id> <lst.render-hash>` each:
+///
+/// ```text
+/// ps --all --no-trunc --filter label=com.docker.compose.project=<stack>
+///    --filter label=com.docker.compose.service=<service>
+///    --filter label=com.docker.compose.oneoff=False
+///    --format {{.ID}} {{.Label "lst.render-hash"}}
+/// ```
+///
+/// Why plain `docker ps` and not `docker compose ps`: it filters by the
+/// labels compose itself puts on every container, so it needs no compose
+/// file on stdin and no project directory, and its `--format` with `.Label`
+/// has been stable for far longer than compose's `ps --format json` (whose
+/// shape changed across v2 releases). `--all` includes stopped containers
+/// (compose reuses those too); `oneoff=False` leaves out `compose run`
+/// containers, such as one a failed `pre` step left behind.
+pub fn hash_query_args(stack: &str, service: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["ps", "--all", "--no-trunc"].map(String::from).into();
+    for filter in [
+        format!("label=com.docker.compose.project={stack}"),
+        format!("label=com.docker.compose.service={service}"),
+        "label=com.docker.compose.oneoff=False".to_owned(),
+    ] {
+        args.push("--filter".to_owned());
+        args.push(filter);
+    }
+    args.push("--format".to_owned());
+    args.push(format!(
+        "{{{{.ID}}}} {{{{.Label \"{RENDER_HASH_LABEL}\"}}}}"
+    ));
+    args
+}
+
+/// The render hash of the existing container(s), from the output of
+/// [`hash_query_args`]:
+/// - no container → `None` (counts as changed);
+/// - one container → its label, or `None` if it has none (empty);
+/// - several (`scale`/`replicas`) → their label if all carry the same
+///   non-empty one, otherwise `None`: a half-updated set of replicas counts
+///   as changed, so an `on-change` step runs rather than being skipped.
+pub fn parse_hash_query(output: &str) -> Option<String> {
+    let mut labels = output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split_once(' ').map_or("", |(_id, label)| label));
+    let first = labels.next()?;
+    let same = labels.all(|label| label == first);
+    (same && !first.is_empty()).then(|| first.to_owned())
+}
+
+/// The `lst.render-hash` label of the existing container of `service` in
+/// project `stack` (see [`hash_query_args`] and [`parse_hash_query`]), read
+/// before `up`. `None` means "treat as changed". Runs `docker ps` in `root`
+/// with `LST_SEED` removed; its stderr goes to lst's stderr.
+pub fn existing_hash(
+    root: &Path,
+    stack: &str,
+    service: &str,
+) -> Result<Option<String>, DeployError> {
+    existing_hash_with(OsStr::new(DOCKER), root, stack, service)
+}
+
+fn existing_hash_with(
+    program: &OsStr,
+    root: &Path,
+    stack: &str,
+    service: &str,
+) -> Result<Option<String>, DeployError> {
+    validate_project_name(stack)?;
+    validate_service_name(stack, service)?;
+    let out = Command::new(program)
+        .args(hash_query_args(stack, service))
+        .current_dir(root)
+        .env_remove(SEED_ENV)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(DeployError::Spawn)?;
+    if !out.status.success() {
+        return Err(DeployError::HashQuery {
             stack: stack.to_owned(),
-            source,
+            service: service.to_owned(),
+            status: out.status,
         });
     }
-    Ok(())
+    let text = String::from_utf8(out.stdout).map_err(|_| DeployError::HashQueryOutput {
+        stack: stack.to_owned(),
+        service: service.to_owned(),
+    })?;
+    Ok(parse_hash_query(&text))
 }
 
 /// The stacks a change set affects; see [`affected_stacks`].
@@ -563,23 +936,34 @@ mod tests {
         expect: &str,
         extra: &[(&str, &str)],
     ) -> Output {
-        let out = Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "deploy::tests::child_run_compose",
-                "--nocapture",
-                "--test-threads=1",
-                "-q",
-            ])
-            .env(CHILD_ROOT, root)
-            .env(CHILD_STACK, stack)
-            .env(CHILD_REPEAT, repeat.to_string())
-            .env(CHILD_EXPECT, expect)
+        let repeat = repeat.to_string();
+        let mut envs = vec![
+            (CHILD_ROOT, root.to_str().unwrap()),
+            (CHILD_STACK, stack),
+            (CHILD_REPEAT, &repeat),
+            (CHILD_EXPECT, expect),
+        ];
+        envs.extend(extra.iter().copied());
+        in_child_test("deploy::tests::child_run_compose", record, &envs)
+    }
+
+    /// Runs the test `test` in a child copy of this test binary, with the
+    /// fake docker recording into `record`, `LST_SEED` set and `envs`, and
+    /// checks that it ran and passed.
+    fn in_child_test(test: &str, record: &Path, envs: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env::current_exe().unwrap());
+        cmd.args(["--exact", test, "--nocapture", "--test-threads=1", "-q"]);
+        child_output(cmd, record, envs)
+    }
+
+    fn child_output(mut cmd: Command, record: &Path, envs: &[(&str, &str)]) -> Output {
+        let out = cmd
             .env("LST_FAKE_DOCKER_DIR", record)
             .env(SEED_ENV, FAKE_SEED)
             .env_remove("LST_FAKE_DOCKER_EXIT")
             .env_remove("LST_FAKE_DOCKER_FAIL_PROJECT")
-            .envs(extra.iter().copied())
+            .env_remove("LST_FAKE_DOCKER_FAIL_SUBCOMMAND")
+            .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -693,6 +1077,699 @@ mod tests {
             .collect();
         assert_eq!(projects, ["web", "db", "db"]);
         assert_eq!(call(record.path(), 2).stdin, payload(2).as_bytes());
+    }
+
+    // ---- x-deploy step arguments -------------------------------------------
+
+    fn secret(s: &str) -> SecretString {
+        SecretString::new(s.to_owned())
+    }
+
+    fn shell(s: &str) -> StepCommand {
+        StepCommand::Shell(secret(s))
+    }
+
+    fn exec(argv: &[&str]) -> StepCommand {
+        StepCommand::from_argv(argv.iter().map(|a| secret(a)).collect()).unwrap()
+    }
+
+    /// `compose -p <stack> --project-directory stacks/<stack> -f -` + `rest`.
+    fn compose_prefix(stack: &str, rest: &[&str]) -> Vec<String> {
+        let dir = format!("stacks/{stack}");
+        [
+            "compose",
+            "-p",
+            stack,
+            "--project-directory",
+            &dir,
+            "-f",
+            "-",
+        ]
+        .iter()
+        .chain(rest)
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn args_of(phase: Phase, stack: &str, service: &str, command: &StepCommand) -> Vec<String> {
+        step_args(phase, stack, service, command).to_vec()
+    }
+
+    #[test]
+    fn exact_pre_args() {
+        let cmd = "mosquitto_passwd -b -c /mosquitto/config/passwd z2m 's3cr\"t'";
+        assert_eq!(
+            args_of(Phase::Pre, "mqtt", "mosquitto", &shell(cmd)),
+            compose_prefix(
+                "mqtt",
+                &[
+                    "run",
+                    "--rm",
+                    "--no-deps",
+                    "-T",
+                    "--",
+                    "mosquitto",
+                    "sh",
+                    "-c",
+                    cmd
+                ]
+            )
+        );
+        assert_eq!(
+            args_of(
+                Phase::Pre,
+                "mqtt",
+                "mosquitto",
+                &exec(&["chown", "1883:1883", "/x"])
+            ),
+            compose_prefix(
+                "mqtt",
+                &[
+                    "run",
+                    "--rm",
+                    "--no-deps",
+                    "-T",
+                    "--",
+                    "mosquitto",
+                    "chown",
+                    "1883:1883",
+                    "/x"
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn exact_post_args() {
+        let cmd = "mongosh --eval 'db.createUser({user: \"app\"})'";
+        assert_eq!(
+            args_of(Phase::Post, "db", "mongo", &shell(cmd)),
+            compose_prefix("db", &["exec", "-T", "--", "mongo", "sh", "-c", cmd])
+        );
+        assert_eq!(
+            args_of(Phase::Post, "db", "mongo", &exec(&["mongosh", "--quiet"])),
+            compose_prefix("db", &["exec", "-T", "--", "mongo", "mongosh", "--quiet"])
+        );
+        // A single-element exec form is just the program.
+        assert_eq!(
+            args_of(Phase::Post, "db", "mongo", &exec(&["true"])),
+            compose_prefix("db", &["exec", "-T", "--", "mongo", "true"])
+        );
+    }
+
+    #[test]
+    fn shell_strings_starting_like_options_get_double_dash() {
+        let tail = |phase, cmd: &str| {
+            let args = args_of(phase, "s", "svc", &shell(cmd));
+            let at = args.iter().position(|a| a == "sh").unwrap();
+            args[at..].to_vec()
+        };
+        for phase in [Phase::Pre, Phase::Post] {
+            for cmd in ["-x", "--help", "- echo", "+e; echo ok", "+"] {
+                assert_eq!(tail(phase, cmd), ["sh", "-c", "--", cmd], "{cmd:?}");
+            }
+            for cmd in ["echo -x", " -x", "", "x-", "\u{2212}x", "ü"] {
+                assert_eq!(tail(phase, cmd), ["sh", "-c", cmd], "{cmd:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exec_args_pass_through_verbatim() {
+        // Leading dashes, `--`, empty strings, unicode and whitespace are
+        // separate arguments, untouched.
+        let argv = [
+            "-x",
+            "--",
+            "",
+            "ü€😀",
+            "a b\nc",
+            "--rm",
+            "-T",
+            "$HOME",
+            "'q'",
+        ];
+        let args = args_of(Phase::Pre, "s", "svc", &exec(&argv));
+        let at = args.iter().position(|a| a == "svc").unwrap();
+        assert_eq!(args[at + 1..], argv.map(String::from));
+        // A service starting with `-` stays after `--`.
+        let args = args_of(Phase::Post, "s", "-svc", &exec(&["true"]));
+        assert_eq!(args[9..], ["--", "-svc", "true"].map(String::from));
+    }
+
+    #[test]
+    fn unicode_and_multiline_shell_strings_are_one_argument() {
+        let cmd = "printf '%s\\n' 'ü€😀' \\\n && echo \"$X\"";
+        let args = args_of(Phase::Pre, "s", "svc", &shell(cmd));
+        assert_eq!(args.last().unwrap(), cmd);
+        assert_eq!(args.len(), 16);
+    }
+
+    #[test]
+    fn empty_exec_form_is_unrepresentable() {
+        assert!(StepCommand::from_argv(Vec::new()).is_none());
+        let StepCommand::Exec { program, args } =
+            StepCommand::from_argv(vec![secret("a"), secret("b"), secret("c")]).unwrap()
+        else {
+            panic!("not exec form");
+        };
+        assert_eq!(program.expose(), "a");
+        assert_eq!(
+            args.iter().map(SecretString::expose).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+    }
+
+    #[test]
+    fn step_commands_debug_redacted() {
+        let shown = format!("{:?} {:?}", shell("pw-1"), exec(&["x", "pw-2"]));
+        assert!(!shown.contains("pw-"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn phase_names() {
+        assert_eq!(Phase::Pre.to_string(), "pre");
+        assert_eq!(Phase::Post.to_string(), "post");
+    }
+
+    #[test]
+    fn service_names() {
+        for s in ["web", "a", "My.Svc_2", "-x", "_x", ".x", "0"] {
+            validate_service_name("st", s).unwrap();
+        }
+        for s in ["", "a b", "a=b", "a/b", "ü", "a:b", "a\n", "a\0"] {
+            let err = validate_service_name("st", s).unwrap_err();
+            assert!(
+                matches!(&err, DeployError::InvalidServiceName { stack, service }
+                    if stack == "st" && service == s),
+                "{s:?}: {err:?}"
+            );
+        }
+        assert_eq!(
+            validate_service_name("st", "a b").unwrap_err().to_string(),
+            "service name \"a b\" of stack \"st\" is not a valid docker compose service name \
+             (only a-z, A-Z, 0-9, `.`, `_` and `-`)"
+        );
+    }
+
+    // ---- x-deploy step runners, in this process -----------------------------
+
+    fn step(phase: Phase, index: usize, service: &str) -> StepRef<'_> {
+        StepRef {
+            phase,
+            index,
+            service,
+        }
+    }
+
+    #[test]
+    fn step_runners_validate_before_running_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = secret("services: {}\n");
+        let cmd = shell("true");
+        // Through the public entry points: never reaches a real docker.
+        for run in [run_pre, run_post] {
+            let err = run(dir.path(), "Web", &c, 0, "svc", &cmd).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidProjectName { .. }),
+                "{err:?}"
+            );
+            let err = run(dir.path(), "web", &c, 0, "a b", &cmd).unwrap_err();
+            assert!(
+                matches!(err, DeployError::InvalidServiceName { .. }),
+                "{err:?}"
+            );
+        }
+        let err = existing_hash(dir.path(), "-p", "svc").unwrap_err();
+        assert!(
+            matches!(err, DeployError::InvalidProjectName { .. }),
+            "{err:?}"
+        );
+        let err = existing_hash(dir.path(), "web", "").unwrap_err();
+        assert!(
+            matches!(err, DeployError::InvalidServiceName { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn step_runner_spawn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-docker");
+        for phase in [Phase::Pre, Phase::Post] {
+            let err = run_step_with(
+                missing.as_os_str(),
+                dir.path(),
+                "web",
+                &secret(""),
+                step(phase, 0, "svc"),
+                &shell("true"),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, DeployError::Spawn(e) if e.kind() == io::ErrorKind::NotFound),
+                "{err:?}"
+            );
+        }
+        let err = existing_hash_with(missing.as_os_str(), dir.path(), "web", "svc").unwrap_err();
+        assert!(
+            matches!(&err, DeployError::Spawn(e) if e.kind() == io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn failing_step_names_stack_phase_index_and_service_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for (phase, index, rendered) in [
+            (Phase::Pre, 2, payload(1)),
+            (Phase::Post, 0, payload(LARGE)),
+        ] {
+            let err = run_step_with(
+                OsStr::new("false"),
+                dir.path(),
+                "web",
+                &SecretString::new(rendered),
+                step(phase, index, "db"),
+                &shell("echo PW-in-command"),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, DeployError::Step { stack, phase: p, index: i, service, status }
+                    if stack == "web" && *p == phase && *i == index && service == "db"
+                        && status.code() == Some(1)),
+                "{err:?}"
+            );
+            let shown = format!("{err} {err:?}");
+            assert!(!shown.contains("PW"), "{shown}");
+        }
+        let err = run_step_with(
+            OsStr::new("false"),
+            dir.path(),
+            "web",
+            &secret(""),
+            step(Phase::Pre, 3, "mosquitto"),
+            &exec(&["x"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "x-deploy.pre[3] (service \"mosquitto\") of stack \"web\" failed (exit status: 1)"
+        );
+    }
+
+    #[test]
+    fn step_success_without_reading_input_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = OsStr::new("true");
+        let s = step(Phase::Post, 0, "svc");
+        run_step_with(t, dir.path(), "web", &secret(""), s, &shell("x")).unwrap();
+        let big = SecretString::new(payload(LARGE));
+        let err = run_step_with(t, dir.path(), "web", &big, s, &shell("x")).unwrap_err();
+        assert!(
+            matches!(&err, DeployError::Stdin { stack, source }
+                if stack == "web" && source.kind() == io::ErrorKind::BrokenPipe),
+            "{err:?}"
+        );
+    }
+
+    // ---- render-hash query --------------------------------------------------
+
+    #[test]
+    fn exact_hash_query_args() {
+        assert_eq!(
+            hash_query_args("mqtt", "mosquitto"),
+            [
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                "label=com.docker.compose.project=mqtt",
+                "--filter",
+                "label=com.docker.compose.service=mosquitto",
+                "--filter",
+                "label=com.docker.compose.oneoff=False",
+                "--format",
+                "{{.ID}} {{.Label \"lst.render-hash\"}}",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hash_query_cases() {
+        let h = |s: &str| Some(s.to_owned());
+        // No container.
+        assert_eq!(parse_hash_query(""), None);
+        assert_eq!(parse_hash_query("\n\n"), None);
+        // One container, with and without the label (docker prints the
+        // separator space either way; tolerate it missing too).
+        assert_eq!(parse_hash_query("c0ffee 9a8b7c\n"), h("9a8b7c"));
+        assert_eq!(parse_hash_query("c0ffee 9a8b7c"), h("9a8b7c"));
+        assert_eq!(parse_hash_query("c0ffee \n"), None);
+        assert_eq!(parse_hash_query("c0ffee\n"), None);
+        // Several containers: the same label, or treat as changed.
+        assert_eq!(parse_hash_query("a 1f\nb 1f\nc 1f\n"), h("1f"));
+        assert_eq!(parse_hash_query("a 1f\nb 2f\n"), None);
+        assert_eq!(parse_hash_query("a 1f\nb \n"), None);
+        assert_eq!(parse_hash_query("a \nb \n"), None);
+        assert_eq!(parse_hash_query("a \nb 1f\n"), None);
+        // Line endings as `str::lines` takes them (CRLF too).
+        assert_eq!(parse_hash_query("a 1f\r\nb 1f\n"), Some("1f".to_owned()));
+    }
+
+    #[test]
+    fn hash_query_failure_and_empty_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = existing_hash_with(OsStr::new("false"), dir.path(), "web", "db").unwrap_err();
+        assert!(
+            matches!(&err, DeployError::HashQuery { stack, service, status }
+                if stack == "web" && service == "db" && status.code() == Some(1)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "`docker ps` for service \"db\" of stack \"web\" failed (exit status: 1)"
+        );
+        // Success with no output: no container.
+        assert_eq!(
+            existing_hash_with(OsStr::new("true"), dir.path(), "web", "db").unwrap(),
+            None
+        );
+    }
+
+    // ---- step runners and hash query with the fake docker, in a child ------
+
+    const CHILD_OP: &str = "LST_TEST_DEPLOY_OP";
+    const CHILD_SERVICE: &str = "LST_TEST_DEPLOY_SERVICE";
+    const CHILD_INDEX: &str = "LST_TEST_DEPLOY_INDEX";
+    /// A shell-form command; or with CHILD_EXEC, the exec form's arguments
+    /// separated by U+001F.
+    const CHILD_SHELL: &str = "LST_TEST_DEPLOY_SHELL";
+    const CHILD_EXEC: &str = "LST_TEST_DEPLOY_EXEC";
+
+    /// The child's side of the step and hash tests: does nothing in a
+    /// normal test run. CHILD_OP is `pre`, `post` or `hash`; CHILD_EXPECT
+    /// is `ok` or `step:<code>` (steps), `none`, `some:<hash>`,
+    /// `query:<code>` or `output` (hash).
+    #[test]
+    fn child_step_or_hash() {
+        let Some(op) = env::var_os(CHILD_OP) else {
+            return;
+        };
+        let root = PathBuf::from(env::var_os(CHILD_ROOT).unwrap());
+        let stack = env::var(CHILD_STACK).unwrap();
+        let service = env::var(CHILD_SERVICE).unwrap();
+        let expect = env::var(CHILD_EXPECT).unwrap();
+        let fake = fixture("fake-docker");
+        let program = fake.as_os_str();
+        if op == "hash" {
+            let result = existing_hash_with(program, &root, &stack, &service);
+            match expect.split_once(':') {
+                None if expect == "none" => assert_eq!(result.unwrap(), None),
+                None => {
+                    let err = result.unwrap_err();
+                    assert!(
+                        matches!(&err, DeployError::HashQueryOutput { stack: s, service: v }
+                            if *s == stack && *v == service),
+                        "{err:?}"
+                    );
+                }
+                Some(("some", hash)) => assert_eq!(result.unwrap().as_deref(), Some(hash)),
+                Some((_query, code)) => {
+                    let err = result.unwrap_err();
+                    assert!(
+                        matches!(&err, DeployError::HashQuery { status, .. }
+                            if status.code() == code.parse().ok()),
+                        "{err:?}"
+                    );
+                }
+            }
+            return;
+        }
+        let phase = if op == "pre" { Phase::Pre } else { Phase::Post };
+        let index: usize = env::var(CHILD_INDEX).unwrap().parse().unwrap();
+        let repeat: usize = env::var(CHILD_REPEAT).unwrap().parse().unwrap();
+        let command = match env::var(CHILD_EXEC) {
+            Ok(argv) => exec(&argv.split('\u{1f}').collect::<Vec<_>>()),
+            Err(_) => shell(&env::var(CHILD_SHELL).unwrap()),
+        };
+        let compose = SecretString::new(payload(repeat));
+        let s = step(phase, index, &service);
+        let result = run_step_with(program, &root, &stack, &compose, s, &command);
+        match expect.strip_prefix("step:") {
+            None => result.unwrap(),
+            Some(code) => {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, DeployError::Step { phase: p, index: i, service: v, status, .. }
+                        if *p == phase && *i == index && *v == service
+                            && status.code() == code.parse().ok()),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+
+    /// Runs `child_step_or_hash` with `op` for `stack`/`service`, plus
+    /// `extra`.
+    fn in_child_op(
+        op: &str,
+        root: &Path,
+        record: &Path,
+        stack: &str,
+        service: &str,
+        expect: &str,
+        extra: &[(&str, &str)],
+    ) -> Output {
+        let mut envs = vec![
+            (CHILD_OP, op),
+            (CHILD_ROOT, root.to_str().unwrap()),
+            (CHILD_STACK, stack),
+            (CHILD_SERVICE, service),
+            (CHILD_EXPECT, expect),
+        ];
+        envs.extend(extra.iter().copied());
+        in_child_test("deploy::tests::child_step_or_hash", record, &envs)
+    }
+
+    #[test]
+    fn pre_step_pipes_compose_with_exact_args() {
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let cmd = "mosquitto_passwd -b /c/passwd z2m 'pw ü€'";
+        let extra = [(CHILD_INDEX, "0"), (CHILD_REPEAT, "1"), (CHILD_SHELL, cmd)];
+        let out = in_child_op(
+            "pre",
+            root.path(),
+            record.path(),
+            "mqtt",
+            "mosquitto",
+            "ok",
+            &extra,
+        );
+        assert_eq!(calls(record.path()), 1);
+        let c = call(record.path(), 1);
+        let want = args_of(Phase::Pre, "mqtt", "mosquitto", &shell(cmd));
+        assert_eq!(c.args, want.iter().map(OsString::from).collect::<Vec<_>>());
+        assert_eq!(c.stdin, payload(1).as_bytes());
+        assert_eq!(c.cwd, root.path().canonicalize().unwrap());
+        assert_eq!(c.seed, "<unset>");
+        // The step's stdout and stderr go to lst's stderr.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stdout.contains("fake-docker"), "{stdout}");
+        assert!(
+            stderr.contains("fake-docker: stdout of call 1 (mqtt)\n"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("fake-docker: stderr of call 1 (mqtt)\n"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn post_step_exec_form_with_large_input() {
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let argv = "mongosh\u{1f}--eval\u{1f}-x\u{1f}\u{1f}ü 😀";
+        let repeat = LARGE.to_string();
+        let extra = [
+            (CHILD_INDEX, "1"),
+            (CHILD_REPEAT, &repeat),
+            (CHILD_EXEC, argv),
+        ];
+        in_child_op(
+            "post",
+            root.path(),
+            record.path(),
+            "db",
+            "mongo",
+            "ok",
+            &extra,
+        );
+        let c = call(record.path(), 1);
+        let want = args_of(
+            Phase::Post,
+            "db",
+            "mongo",
+            &exec(&["mongosh", "--eval", "-x", "", "ü 😀"]),
+        );
+        assert_eq!(c.args, want.iter().map(OsString::from).collect::<Vec<_>>());
+        assert!(c.stdin == payload(LARGE).as_bytes());
+        assert_eq!(c.seed, "<unset>");
+    }
+
+    #[test]
+    fn failing_steps_by_subcommand() {
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let (r, rec) = (root.path(), record.path());
+        let base = [(CHILD_REPEAT, "1"), (CHILD_SHELL, "x")];
+        let with = |more: &[(&'static str, &'static str)]| {
+            let mut v = base.to_vec();
+            v.extend_from_slice(more);
+            v
+        };
+        // `run` fails: the pre step fails with the exit code, `exec` doesn't.
+        let fail_run = with(&[
+            (CHILD_INDEX, "4"),
+            ("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "run"),
+            ("LST_FAKE_DOCKER_EXIT", "5"),
+        ]);
+        in_child_op("pre", r, rec, "web", "app", "step:5", &fail_run);
+        in_child_op("post", r, rec, "web", "app", "ok", &fail_run);
+        // `exec` fails (default code 1); `run` doesn't.
+        let fail_exec = with(&[
+            (CHILD_INDEX, "0"),
+            ("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "exec"),
+        ]);
+        in_child_op("post", r, rec, "web", "app", "step:1", &fail_exec);
+        in_child_op("pre", r, rec, "web", "app", "ok", &fail_exec);
+        // Both a project and a subcommand: only calls matching both fail.
+        let both = with(&[
+            (CHILD_INDEX, "0"),
+            ("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "run"),
+            ("LST_FAKE_DOCKER_FAIL_PROJECT", "db"),
+        ]);
+        in_child_op("pre", r, rec, "web", "app", "ok", &both);
+        in_child_op("post", r, rec, "db", "app", "ok", &both);
+        in_child_op("pre", r, rec, "db", "app", "step:1", &both);
+        // A plain non-zero exit fails every step.
+        let exit = with(&[(CHILD_INDEX, "0"), ("LST_FAKE_DOCKER_EXIT", "9")]);
+        in_child_op("post", r, rec, "web", "app", "step:9", &exit);
+        assert_eq!(calls(rec), 8);
+        // Every failing call still got the whole compose file.
+        for n in 1..=8 {
+            assert_eq!(call(rec, n).stdin, payload(1).as_bytes(), "call {n}");
+        }
+    }
+
+    #[test]
+    fn fake_docker_fail_subcommand_spares_up() {
+        // The subcommand matcher skips compose's global options and their
+        // values (`-f -` included).
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let fail = [("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "run")];
+        in_child(root.path(), record.path(), "web", 1, "ok", &fail);
+        let fail = [("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "up")];
+        in_child(root.path(), record.path(), "web", 1, "exit:1", &fail);
+    }
+
+    /// Writes the fake docker's `ps` answer for `stack`/`service`.
+    fn ps_answer(record: &Path, stack: &str, service: &str, answer: &[u8]) {
+        fs::write(record.join(format!("ps.{stack}.{service}")), answer).unwrap();
+    }
+
+    #[test]
+    fn existing_hash_via_fake_docker() {
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        let (r, rec) = (root.path(), record.path());
+        let id = "c".repeat(64);
+        ps_answer(
+            rec,
+            "mqtt",
+            "mosquitto",
+            format!("{id} 0123abcd\n").as_bytes(),
+        );
+        ps_answer(rec, "mqtt", "nolabel", format!("{id} \n").as_bytes());
+        ps_answer(rec, "mqtt", "scaled", b"a 77\nb 77\n");
+        ps_answer(rec, "mqtt", "mixed", b"a 77\nb 78\n");
+        ps_answer(rec, "mqtt", "half", b"a 77\nb \n");
+        ps_answer(rec, "mqtt", "bad", b"a \xff\xfe\n");
+        // The same service in another project is a different answer.
+        ps_answer(rec, "other", "mosquitto", b"a ffff\n");
+        let cases = [
+            ("mqtt", "mosquitto", "some:0123abcd"),
+            ("mqtt", "nolabel", "none"),
+            ("mqtt", "absent", "none"),
+            ("mqtt", "scaled", "some:77"),
+            ("mqtt", "mixed", "none"),
+            ("mqtt", "half", "none"),
+            ("mqtt", "bad", "output"),
+            ("other", "mosquitto", "some:ffff"),
+        ];
+        for (stack, service, expect) in cases {
+            let out = in_child_op("hash", r, rec, stack, service, expect, &[]);
+            // Docker's stderr reaches lst's stderr; the answer isn't echoed.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("fake-docker: stderr of call"), "{stderr}");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("fake-docker"));
+        }
+        assert_eq!(calls(rec), cases.len());
+        for (n, (stack, service, _)) in cases.iter().enumerate() {
+            let c = call(rec, n + 1);
+            let want: Vec<OsString> = hash_query_args(stack, service)
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            assert_eq!(c.args, want);
+            assert!(c.stdin.is_empty());
+            assert_eq!(c.cwd, r.canonicalize().unwrap());
+            assert_eq!(c.seed, "<unset>");
+        }
+        let err = DeployError::HashQueryOutput {
+            stack: "mqtt".into(),
+            service: "bad".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "`docker ps` for service \"bad\" of stack \"mqtt\" printed something that isn't UTF-8"
+        );
+    }
+
+    #[test]
+    fn existing_hash_query_failure_via_fake_docker() {
+        let root = tempfile::tempdir().unwrap();
+        let record = tempfile::tempdir().unwrap();
+        ps_answer(record.path(), "web", "app", b"a 11\n");
+        let fail_ps = [
+            ("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "ps"),
+            ("LST_FAKE_DOCKER_EXIT", "2"),
+        ];
+        in_child_op(
+            "hash",
+            root.path(),
+            record.path(),
+            "web",
+            "app",
+            "query:2",
+            &fail_ps,
+        );
+        // Failing `run` doesn't affect `ps`.
+        let fail_run = [("LST_FAKE_DOCKER_FAIL_SUBCOMMAND", "run")];
+        in_child_op(
+            "hash",
+            root.path(),
+            record.path(),
+            "web",
+            "app",
+            "some:11",
+            &fail_run,
+        );
     }
 
     // ---- affected stacks ---------------------------------------------------
