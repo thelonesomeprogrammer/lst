@@ -11,11 +11,24 @@
 #   call-<n>.seed   the value of LST_SEED, or `<unset>` (lst must not pass
 #                   the seed on to docker)
 #
-# It prints one line to stdout and one to stderr *before* reading stdin
-# (like compose may), so tests can see where each stream ends up, then
-# exits with LST_FAKE_DOCKER_EXIT (default 0). If LST_FAKE_DOCKER_FAIL_PROJECT
-# is set, only a call whose `-p <project>` equals it fails, with
-# LST_FAKE_DOCKER_EXIT (default 1 in that case); every other call exits 0.
+# The subcommand is the first argument after `compose` and its global
+# options (`-p X`, `--project-directory X`, `-f X` take a value), e.g. `up`,
+# `run` or `exec`; for a call that doesn't start with `compose` it is the
+# first argument (`ps`). The project is the value of `-p`, or for `ps` the
+# value of a `--filter label=com.docker.compose.project=<project>`.
+#
+# `ps` prints the contents of the file `ps.<project>.<service>` in
+# LST_FAKE_DOCKER_DIR to stdout (nothing if there is no such file), where
+# <service> comes from `--filter label=com.docker.compose.service=<service>`,
+# so a test can script which containers exist and their labels. Every other
+# call prints one line to stdout instead. Each call prints one line to
+# stderr, both *before* reading stdin (like compose may), so tests can see
+# where each stream ends up.
+#
+# Exit status: LST_FAKE_DOCKER_EXIT (default 0). If LST_FAKE_DOCKER_FAIL_PROJECT
+# and/or LST_FAKE_DOCKER_FAIL_SUBCOMMAND is set, only a call that matches
+# every one of them that is set fails, with LST_FAKE_DOCKER_EXIT (default 1
+# in that case); every other call exits 0.
 dir=${LST_FAKE_DOCKER_DIR:?LST_FAKE_DOCKER_DIR must name a directory}
 
 n=1
@@ -26,24 +39,58 @@ base="$dir/call-$n"
 
 : >"$base.args"
 project=
+service=
+subcommand=
+in_compose=
+expect_value=
 prev=
 for arg in "$@"; do
     printf '%s\0' "$arg" >>"$base.args"
     if [ "$prev" = "-p" ] && [ -z "$project" ]; then
         project=$arg
     fi
+    case $arg in
+    label=com.docker.compose.project=*)
+        [ -n "$project" ] || project=${arg#label=com.docker.compose.project=} ;;
+    label=com.docker.compose.service=*)
+        [ -n "$service" ] || service=${arg#label=com.docker.compose.service=} ;;
+    esac
+    if [ -z "$subcommand" ]; then
+        if [ -n "$expect_value" ]; then
+            expect_value=
+        elif [ -z "$in_compose" ] && [ "$prev" = "" ] && [ "$arg" = "compose" ]; then
+            in_compose=1
+        elif [ -n "$in_compose" ]; then
+            case $arg in
+            -p | --project-directory | -f) expect_value=1 ;;
+            -*) ;;
+            *) subcommand=$arg ;;
+            esac
+        else
+            subcommand=$arg
+        fi
+    fi
     prev=$arg
 done
 pwd >"$base.cwd"
 printf '%s' "${LST_SEED-<unset>}" >"$base.seed"
 
-echo "fake-docker: stdout of call $n ($project)"
+if [ "$subcommand" = "ps" ]; then
+    if [ -e "$dir/ps.$project.$service" ]; then
+        cat "$dir/ps.$project.$service"
+    fi
+else
+    echo "fake-docker: stdout of call $n ($project)"
+fi
 echo "fake-docker: stderr of call $n ($project)" >&2
 
 cat >"$base.stdin"
 
-if [ -n "${LST_FAKE_DOCKER_FAIL_PROJECT-}" ]; then
-    if [ "$project" = "$LST_FAKE_DOCKER_FAIL_PROJECT" ]; then
+fail_project=${LST_FAKE_DOCKER_FAIL_PROJECT-}
+fail_subcommand=${LST_FAKE_DOCKER_FAIL_SUBCOMMAND-}
+if [ -n "$fail_project" ] || [ -n "$fail_subcommand" ]; then
+    if { [ -z "$fail_project" ] || [ "$project" = "$fail_project" ]; } &&
+        { [ -z "$fail_subcommand" ] || [ "$subcommand" = "$fail_subcommand" ]; }; then
         exit "${LST_FAKE_DOCKER_EXIT:-1}"
     fi
     exit 0

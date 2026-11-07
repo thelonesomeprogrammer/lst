@@ -347,3 +347,104 @@ fn docker_lst_deploy() {
     assert_ne!(recreated, idle, "the changed stack was not recreated");
     assert_client_logs_in(&main, &dir, &rendered);
 }
+
+/// The `x-deploy` step runners and the render-hash lookup of
+/// `src/deploy.rs` against real compose: argument forms (shell, exec, a
+/// leading `-`/`+`), the compose file on stdin for `run` and `exec`, the
+/// label read with `docker ps` before and after `up`, and step failures.
+#[test]
+#[ignore = "needs Docker; run with `cargo test --test e2e -- --ignored docker`"]
+fn docker_x_deploy_steps_and_render_hash() {
+    use lst::crypto::SecretString;
+    use lst::deploy::{self, DeployError, Phase, StepCommand};
+
+    let image = docker_image();
+    let project = unique("lst-steps");
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("stacks").join(&project);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let file = format!(
+        "\
+services:
+  app:
+    image: {image}
+    command: [\"sleep\", \"infinity\"]
+    volumes:
+      - ./out:/out
+    labels:
+      lst.render-hash: 0123abcd
+  plain:
+    image: {image}
+    command: [\"sleep\", \"infinity\"]
+"
+    );
+    let _down = Down {
+        project: project.clone(),
+        dir: dir.clone(),
+        file: file.clone(),
+    };
+    let compose = SecretString::new(file.clone());
+    let s = |v: &str| SecretString::new(v.to_owned());
+    let argv = |v: &[&str]| StepCommand::from_argv(v.iter().map(|a| s(a)).collect()).unwrap();
+    let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
+    let r = root.path();
+
+    // Nothing is up yet: no container, no hash.
+    assert_eq!(deploy::existing_hash(r, &project, "app").unwrap(), None);
+
+    // pre, shell form, with the volume of the service.
+    let cmd = StepCommand::Shell(s("printf '%s' 'pw ü€' > /out/shell"));
+    deploy::run_pre(r, &project, &compose, 0, "app", &cmd).unwrap();
+    assert_eq!(read("shell"), "pw ü€");
+    // pre, exec form, arguments starting with `-` passed through.
+    let cmd = argv(&[
+        "sh",
+        "-c",
+        "printf '%s|' \"$@\" > /out/exec",
+        "x",
+        "-d",
+        "--rm",
+        "",
+    ]);
+    deploy::run_pre(r, &project, &compose, 1, "app", &cmd).unwrap();
+    assert_eq!(read("exec"), "-d|--rm||");
+    // pre, a shell string starting with `+`: `sh -c --` keeps busybox from
+    // reading it as options (`+e` is then just a command that isn't found).
+    let cmd = StepCommand::Shell(s("+e; printf ok > /out/plus"));
+    deploy::run_pre(r, &project, &compose, 2, "app", &cmd).unwrap();
+    assert_eq!(read("plus"), "ok");
+    // A failing pre step.
+    let fail = StepCommand::Shell(s("exit 3"));
+    let err = deploy::run_pre(r, &project, &compose, 3, "app", &fail).unwrap_err();
+    assert!(
+        matches!(&err, DeployError::Step { phase: Phase::Pre, index: 3, status, .. }
+            if status.code() == Some(3)),
+        "{err:?}"
+    );
+    // `run --rm` containers are gone, and never count as the service's.
+    assert_eq!(deploy::existing_hash(r, &project, "app").unwrap(), None);
+
+    deploy::run_compose(r, &project, &compose).unwrap();
+    assert_eq!(
+        deploy::existing_hash(r, &project, "app")
+            .unwrap()
+            .as_deref(),
+        Some("0123abcd")
+    );
+    assert_eq!(deploy::existing_hash(r, &project, "plain").unwrap(), None);
+    assert_eq!(deploy::existing_hash(r, &project, "nope").unwrap(), None);
+
+    // post, in the running container.
+    let cmd = argv(&["sh", "-c", "printf post > /out/post"]);
+    deploy::run_post(r, &project, &compose, 0, "app", &cmd).unwrap();
+    assert_eq!(read("post"), "post");
+    let cmd = StepCommand::Shell(s("-x"));
+    let err = deploy::run_post(r, &project, &compose, 1, "plain", &cmd).unwrap_err();
+    // `-x` ran as a command (not found: 127), not as a shell option.
+    assert!(
+        matches!(&err, DeployError::Step { phase: Phase::Post, index: 1, status, .. }
+            if status.code() == Some(127)),
+        "{err:?}"
+    );
+}
