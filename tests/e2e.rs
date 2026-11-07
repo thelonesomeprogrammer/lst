@@ -18,6 +18,9 @@ mod seed_env;
 #[path = "e2e/check.rs"]
 mod check;
 
+#[path = "e2e/deploy.rs"]
+mod deploy;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;

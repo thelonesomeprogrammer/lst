@@ -92,7 +92,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 | `lst sync` | Update `.sec/` from your compose files (the hook does this for you) |
 | `lst render <stack>` | Print the resolved compose file to stdout |
 | `lst rename <stack>/<old> <new>` | Rename a secret keeping its value (`--replace` if the new name exists) |
-| `lst deploy <stack>` / `--all` | Check → render files → `pre` → `compose up --wait` → `post` |
+| `lst deploy <stack>…` / `--changed-since REV` | Check, then render and `compose up --wait` each stack (`x-deploy` steps: M4; `--all`: M5) |
 | `lst check` | Verify `.sec/` is current, no `<<set:` committed, all secrets resolvable |
 | `lst hook install` / `run` | Install / run the pre-commit logic |
 | `lst rotate <stack>/<name>` | Give a generated secret a new value |
@@ -106,9 +106,9 @@ lst init                     # on the first machine (also installs the pre-commi
 # on each other machine: clone, put the seed in .env, run `lst hook install` (or `lst init`)
 ```
 
-## Usage today (M2)
+## Usage today (M3)
 
-`deploy` and `check` don't exist yet. What works now:
+`x-deploy`, `rotate`, `gc` and `--all` don't exist yet. What works now:
 
 ```sh
 lst init                     # in the repo: seed → .env (mode 0600), /.env → .gitignore, .sec/meta.toml, pre-commit hook
@@ -118,7 +118,8 @@ git add .gitignore .sec && git commit -m "lst init"
 # edit compose files, then just commit: the hook updates .sec/ and stores <<set:…>> values
 git add stacks && git commit
 
-lst render web | docker compose -p web --project-directory stacks/web -f - up -d
+lst check                    # is everything consistent and resolvable?
+lst deploy web               # check, render, docker compose up (or: lst render web | docker compose …)
 ```
 
 - **`lst init`** gitignores `.env` (and refuses if `.env` is tracked), creates the seed and writes `.sec/meta.toml`. Other lines in an existing `.env` are kept. It never prints the seed. Running it again only checks that the seed in `.env` matches `.sec/`. If `.sec/` already exists but `.env` has no seed, it refuses rather than create a second seed. As its last step it installs the pre-commit hook (see below), also when the repo is already initialised; an existing pre-commit hook that isn't lst's is left alone, with a warning.
@@ -137,10 +138,24 @@ lst render web | docker compose -p web --project-directory stacks/web -f - up -d
   - It is silent when there is nothing to report.
   - `git commit -a` works. `git commit <paths>` commits from a temporary index that git never copies back to your real index, so it only works when the hook has nothing to change. Otherwise it blocks and asks you to `git add` the files and run `git commit` without paths.
 - **`lst hook install [--force]`** installs the hook where git looks for it (`git rev-parse --git-path hooks`, so `core.hooksPath` is respected). Run it once in every clone (`lst init` does it too). It never replaces a pre-commit hook that isn't lst's unless you pass `--force`.
-- **`git commit --no-verify` skips the hook**, and with it the protection: a `<<set:…>>` committed that way is plaintext in your history. Don't. (From M3, deploy refuses a committed `<<set:` and tells you to rotate the secret.)
+- **`git commit --no-verify` skips the hook**, and with it the protection: a `<<set:…>>` committed that way is plaintext in your history. Don't. `lst check` and `lst deploy` refuse a committed `<<set:` and tell you to rotate the secret.
 - **`lst sync`** does by hand what the hook does on commit (you rarely need it). It reads every file under `stacks/<stack>/` in the working tree that git would stage (not only `compose.yaml`). Gitignored files, such as bind-mounted data, are skipped; symlinks are skipped rather than followed; non-UTF-8 files are skipped unless they contain `<<set:`. A symlinked `stacks/`, a symlink directly in `stacks/` and a symlinked `compose.yaml` are errors (git commits a symlink as a link, so the hook couldn't see the stack). It updates `.sec/`: new generated names get a random id, names that are no longer used are marked as orphans (never deleted), and orphans that come back are reused with the same id (and so the same value). Commit `.sec/` afterwards (any commit does: the hook stages it). `<<set:…>>` is refused: commit the file instead, and the pre-commit hook stores the value. When one name disappears and one appears in the same stack, it prints the `lst rename` command that keeps the old value.
 - **`lst rename <from> <to> [--replace]`** renames an entry in `.sec/` without changing its value: a generated secret keeps its id, a manual secret is re-encrypted under the new name. `<from>` is a full name (`web/db`, `shared/mqtt`); `<to>` is a full name too, or a name without `/` in the same stack (or `shared`). Moving between a stack and `shared/` works. If `<to>` already exists (typically because a sync or commit just gave it a fresh id) pass `--replace`. It does not edit your files: change the markers yourself.
 - **`lst render <stack>`** prints the resolved compose file to stdout and nothing else; diagnostics go to stderr. It is read-only: a name that isn't in `.sec/` yet fails with a hint to run `lst sync`. Every unresolvable secret is listed in one go.
+- **`lst check`** lists every problem at once and exits 1 if there is any (read-only):
+  - `.sec/` is current for the working tree (what `lst sync` would change: new or orphaned names, a stale format);
+  - no file committed in `HEAD` contains `<<set:` (it is in the history: rotate the secret), and no `<<set:` waits in the working tree;
+  - every `<<secret:…>>` has a value;
+  - with the seed (`.env` or `LST_SEED`) also: it is the seed of `.sec/`, and every marker resolves (every stored value decrypts). Without a seed it stops after the structural checks and says so, which is what a pull-request pipeline wants.
+- **`lst deploy <stack>…`** deploys stacks through `docker compose`. It needs the seed, runs the full `lst check` first and deploys nothing if that finds a problem, and checks every stack name up front (it must exist and be a valid compose project name, `[a-z0-9][a-z0-9_-]*`: `MyApp` is an error, never lowercased). Then, per stack in sorted order, it renders `compose.yaml` (the same bytes `lst render` prints) and pipes it into `docker compose -p <stack> --project-directory stacks/<stack> -f - up -d --wait --remove-orphans`, run in the repository root. The first failure stops it, and the message names the stacks already deployed and the ones not attempted. It prints `lst: deployed <stack>` per stack on stderr (compose's output goes to stderr too) and nothing on stdout. It writes no file: the rendered text only goes through the pipe, and `LST_SEED` is not passed on to compose.
+- **`lst deploy --changed-since REV`** deploys the stacks affected by the commits `REV..HEAD` instead of a list (one or the other, not both):
+  - a change under `stacks/<s>/` or in `.sec/<s>.toml` deploys `<s>`;
+  - a changed entry in `.sec/shared.toml` deploys the stacks that use that shared name (an entry that only became orphaned deploys nothing);
+  - a change in `.sec/meta.toml` deploys every stack;
+  - anything else (README, CI config) deploys nothing. A stack that changed but no longer exists is reported, not taken down (run `docker compose -p <s> down` yourself). Nothing affected prints `nothing to deploy` and exits 0.
+  - An unknown `REV` is an error that hints at shallow clones: fetch more history, or deploy the stacks explicitly.
+- **`LST_SEED`** (for CI): if this environment variable is set, lst takes the seed from it (the same 64 lowercase hex characters) and never writes it anywhere; `.env` doesn't have to exist. If `.env` also holds a seed, they must match. On your own machines keep the seed in `.env`; the variable is for pipelines, where the seed comes from a CI secret. `lst init` refuses to run while it is set. The `.env` gitignore check still applies.
+- **CI:** [`docs/ci.md`](docs/ci.md) sets up the example Woodpecker pipeline ([`docs/examples/woodpecker.yml`](docs/examples/woodpecker.yml)): on each push to the default branch it runs `lst check` and `lst deploy --changed-since <previous commit>` with the Docker socket mounted, and a structural `lst check` (no seed) on pull requests.
 - Marker errors point at the spot: `stacks/web/compose.yaml:3:17: …`.
 - Exit codes: `0` ok, `1` error, `2` usage error.
 

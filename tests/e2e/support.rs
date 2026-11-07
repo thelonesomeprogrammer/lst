@@ -21,7 +21,7 @@ pub struct Run {
 }
 
 impl Run {
-    fn from_output(out: Output) -> Run {
+    pub fn from_output(out: Output) -> Run {
         Run {
             code: out.status.code(),
             stdout: String::from_utf8(out.stdout).unwrap(),

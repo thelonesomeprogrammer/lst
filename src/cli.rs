@@ -3,7 +3,8 @@
 //!
 //! Every command works on the git repository containing the current
 //! directory. Output rules:
-//! - stdout carries nothing but `lst render`'s rendered text;
+//! - stdout carries nothing but `lst render`'s rendered text (`lst deploy`
+//!   sends compose's own output to stderr too, see [`crate::deploy`]);
 //! - diagnostics go to stderr, prefixed `lst: `;
 //! - no secret value and never the seed appear in any message: errors name
 //!   secrets (`stack/name`) and files (`path:line:col`), nothing else.
@@ -16,7 +17,7 @@
 //! see [`find_seed`]; lst never writes the variable's value anywhere, and
 //! `lst init` refuses to run while it is set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -26,14 +27,17 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use crate::check::{self, Problem};
-use crate::crypto::{CryptoError, Seed};
+use crate::crypto::{CryptoError, SecretString, Seed};
+use crate::deploy::{self, DeployError};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
 use crate::hook::{self, HookError, Role};
 use crate::render::{self, RenderError};
 use crate::scan::{self, ScanError};
 use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, Stack, StackError};
-use crate::store::{self, EntryKind, META, ResolveError, SHARED, Store, StoreError, SyncReport};
+use crate::store::{
+    self, EntryKind, META, ResolveError, SHARED, StackFile, Store, StoreError, SyncReport,
+};
 
 /// The store directory, relative to the repository root.
 pub const SEC_DIR: &str = ".sec";
@@ -95,6 +99,32 @@ pub enum Command {
     /// the seed of .sec/ and every marker resolves. Without one the check
     /// is structural only. Read-only; exits 1 if anything is wrong.
     Check,
+    /// Deploy stacks: check, render, `docker compose up`.
+    ///
+    /// Needs the seed (LST_SEED or .env). Runs the full `lst check` first
+    /// and deploys nothing if it finds a problem. Then, per stack in sorted
+    /// order, renders compose.yaml (as `lst render` does) and pipes it into
+    /// `docker compose -p <stack> --project-directory stacks/<stack> -f -
+    /// up -d --wait --remove-orphans`, run in the repository root. Stops at
+    /// the first failure and says which stacks were deployed. Writes no
+    /// file; the rendered text only goes through the pipe.
+    #[command(group(
+        clap::ArgGroup::new("target")
+            .required(true)
+            .args(["stacks", "changed_since"])
+    ))]
+    Deploy {
+        /// The stacks to deploy (stacks/<STACK>/compose.yaml).
+        #[arg(value_name = "STACK")]
+        stacks: Vec<String>,
+        /// Deploy the stacks affected by the commits REV..HEAD instead: a
+        /// change under stacks/<s>/ or in .sec/<s>.toml deploys <s>; a
+        /// changed entry in .sec/shared.toml deploys the stacks using that
+        /// name; a change in .sec/meta.toml deploys every stack. Deleted
+        /// stacks are reported, not torn down.
+        #[arg(long, value_name = "REV")]
+        changed_since: Option<String>,
+    },
     /// Install or run the pre-commit hook.
     Hook {
         #[command(subcommand)]
@@ -207,6 +237,29 @@ pub enum CliError {
     Stdout(io::Error),
     #[error(transparent)]
     Hook(#[from] HookError),
+    #[error(transparent)]
+    Deploy(#[from] DeployError),
+    #[error(
+        "{source} (deployed: {}; failed: {failed}; not attempted: {})",
+        list_or_none(deployed),
+        list_or_none(not_attempted)
+    )]
+    DeployFailed {
+        failed: String,
+        deployed: Vec<String>,
+        not_attempted: Vec<String>,
+        source: Box<CliError>,
+    },
+    #[error(
+        "--changed-since: unknown revision {rev:?} (not a commit in this repository). Is this a \
+         shallow clone? Fetch more history (in Woodpecker: a larger `clone: depth`), or deploy \
+         the stacks explicitly"
+    )]
+    UnknownDeployRev { rev: String },
+    #[error("--changed-since {rev}: in that revision, {source}")]
+    OldShared { rev: String, source: StoreError },
+    #[error("--changed-since {rev}: in that revision, .sec/{SHARED}.toml is not valid UTF-8")]
+    OldSharedNotUtf8 { rev: String },
     #[error(
         "{path} already exists and is not lst's hook (or was changed); lst won't overwrite it. \
          Run `lst hook install --force` to replace it (move what it does elsewhere first if you \
@@ -252,6 +305,10 @@ pub fn run(
         }
         Command::Render { stack } => render_stack(&root, env_seed, &stack, stdout),
         Command::Check => check(&root, env_seed, stderr),
+        Command::Deploy {
+            stacks,
+            changed_since,
+        } => deploy(&root, env_seed, stacks, changed_since.as_deref(), stderr),
         Command::Hook {
             action: HookAction::Install { force },
         } => hook_install(&root, force, stderr),
@@ -618,19 +675,24 @@ fn render_stack(
 ) -> Result<(), CliError> {
     let (seed, store) = open_store(root, env_seed)?;
     let s = stack::find(root, name)?;
-    let (path, text) = read_compose(&s)?;
-    let rendered =
-        render::render(&text, |m| store.resolve(&seed, &s.name, m)).map_err(|e| match e {
-            RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
-            source => CliError::Render {
-                path: path.clone(),
-                source,
-            },
-        })?;
+    let rendered = render_compose(&seed, &store, &s)?;
     stdout
         .write_all(rendered.expose().as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(CliError::Stdout)
+}
+
+/// The rendered `compose.yaml` of `s`: what `lst render` prints and what
+/// `lst deploy` pipes into compose (the same bytes).
+fn render_compose(seed: &Seed, store: &Store, s: &Stack) -> Result<SecretString, CliError> {
+    let (path, text) = read_compose(s)?;
+    render::render(&text, |m| store.resolve(seed, &s.name, m)).map_err(|e| match e {
+        RenderError::Parse(p) => scan::parse_error(&path, &text, p).into(),
+        source => CliError::Render {
+            path: path.clone(),
+            source,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +712,16 @@ fn check(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(
     Ok(())
 }
 
+/// What [`check_repo`] read and found consistent, for `lst deploy` to go
+/// on with (rather than read it all again).
+struct Checked {
+    /// `.sec/`; with a seed, one made with that seed.
+    store: Store,
+    /// Every stack file in the working tree ([`read_stack_files`]), keyed
+    /// by stack: every existing stack is a key.
+    files: scan::StackFiles<Contents>,
+}
+
 /// Every problem `lst check` looks for (see [`crate::check`]), each
 /// printed as one line on `stderr`; `Err(CheckFailed)` if there is any.
 /// Prints nothing else on success, so `lst deploy` can run it first. With
@@ -658,11 +730,11 @@ fn check(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(
 /// Problems are collected, not returned at the first; hard errors (an
 /// unreadable or invalid `.sec/`, a malformed marker, a failing git) still
 /// stop it, because nothing can be decided then.
-pub(crate) fn check_repo(
+fn check_repo(
     root: &Path,
     seed: Option<&Seed>,
     stderr: &mut dyn Write,
-) -> Result<(), CliError> {
+) -> Result<Checked, CliError> {
     let (meta, sec_files) = Store::read_files(&root.join(SEC_DIR))?;
     let store = Store::from_files(&meta, &sec_files)?;
     let loaded = check::loaded_files(&meta, &sec_files);
@@ -678,7 +750,7 @@ pub(crate) fn check_repo(
         note(stderr, &p.to_string());
     }
     if problems.is_empty() {
-        Ok(())
+        Ok(Checked { store, files })
     } else {
         Err(CliError::CheckFailed {
             count: problems.len(),
@@ -705,6 +777,128 @@ fn committed_sets(root: &Path, stderr: &mut dyn Write) -> Result<Vec<Problem>, C
         }
     }
     Ok(problems)
+}
+
+// ---------------------------------------------------------------------------
+// deploy
+// ---------------------------------------------------------------------------
+
+/// `a, b` or `none`.
+fn list_or_none(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// `lst deploy STACK…` / `lst deploy --changed-since REV` (clap makes sure
+/// exactly one of the two is given). See [`crate::deploy`] for how compose
+/// runs.
+///
+/// Everything that can be decided before running compose is decided first:
+/// the full check, the set of stacks (deduplicated and sorted), each stack
+/// exists, each name is a valid compose project name. Then each stack is
+/// rendered and deployed in turn; the first failure stops it, and the error
+/// says which stacks were deployed and which were not attempted. Nothing is
+/// written to disk: the rendered text only goes into compose's stdin.
+fn deploy(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    stacks: Vec<String>,
+    changed_since: Option<&str>,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let seed = require_seed(root, env_seed)?;
+    // With the seed, a passing check includes `store.verify_seed`.
+    let checked = check_repo(root, Some(&seed), stderr)?;
+    let store = &checked.store;
+    let names = match changed_since {
+        Some(rev) => changed_stacks(root, rev, &checked, stderr)?,
+        None => stacks.into_iter().collect(),
+    };
+    if names.is_empty() {
+        note(stderr, "nothing to deploy");
+        return Ok(());
+    }
+    let mut targets = Vec::with_capacity(names.len());
+    for name in &names {
+        let s = stack::find(root, name)?;
+        deploy::validate_project_name(&s.name)?;
+        targets.push(s);
+    }
+    let names_of = |ts: &[Stack]| ts.iter().map(|t| t.name.clone()).collect();
+    for (i, s) in targets.iter().enumerate() {
+        let result = render_compose(&seed, store, s)
+            .and_then(|rendered| Ok(deploy::run_compose(root, &s.name, &rendered)?));
+        if let Err(e) = result {
+            return Err(CliError::DeployFailed {
+                failed: s.name.clone(),
+                deployed: names_of(&targets[..i]),
+                not_attempted: names_of(&targets[i + 1..]),
+                source: Box::new(e),
+            });
+        }
+        note(stderr, &format!("deployed {}", s.name));
+    }
+    Ok(())
+}
+
+/// The stacks `--changed-since REV` deploys ([`deploy::affected_stacks`]
+/// over `REV..HEAD`), with a note for each affected stack that no longer
+/// exists and each changed path that can't belong to a stack.
+///
+/// `.sec/shared.toml` is compared between `REV` and the working tree (the
+/// store just checked, which in CI is `HEAD`), and the markers and the
+/// existing stacks are the working tree's: the same files `lst check` just
+/// found consistent.
+fn changed_stacks(
+    root: &Path,
+    rev: &str,
+    checked: &Checked,
+    stderr: &mut dyn Write,
+) -> Result<BTreeSet<String>, CliError> {
+    let changed = git::diff_names(root, rev).map_err(|e| match e {
+        GitError::UnknownRev { .. } => CliError::UnknownDeployRev {
+            rev: rev.to_owned(),
+        },
+        e => e.into(),
+    })?;
+    let rev_err = |source| CliError::OldShared {
+        rev: rev.to_owned(),
+        source,
+    };
+    let before = match git::show_file(root, rev, &format!("{SEC_DIR}/{SHARED}.toml"))? {
+        None => StackFile::default(),
+        Some(bytes) => {
+            let text = std::str::from_utf8(&bytes).map_err(|_| CliError::OldSharedNotUtf8 {
+                rev: rev.to_owned(),
+            })?;
+            StackFile::parse(SHARED, text).map_err(rev_err)?
+        }
+    };
+    let empty = StackFile::default();
+    let after = checked.store.files().get(SHARED).unwrap_or(&empty);
+    let uses = scan::collect(&checked.files)?.uses;
+    let existing = checked.files.keys().cloned().collect();
+    let affected = deploy::affected_stacks(&changed, &before, after, &uses, &existing);
+    for s in &affected.deleted {
+        note(
+            stderr,
+            &format!(
+                "not deploying {s}: it changed but has no {STACKS_DIR}/{s}/{COMPOSE_FILE} any \
+                 more (lst does not tear stacks down; run `docker compose -p {s} down` if it \
+                 should go)"
+            ),
+        );
+    }
+    for p in &affected.ignored {
+        note(
+            stderr,
+            &format!("ignoring {p}: not a valid stack name, so it belongs to no stack"),
+        );
+    }
+    Ok(affected.deploy)
 }
 
 // ---------------------------------------------------------------------------
