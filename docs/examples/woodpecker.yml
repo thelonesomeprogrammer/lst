@@ -2,11 +2,12 @@
 # .sec/ and a committed `/.env` rule; not lst's own repository).
 # Save it as .woodpecker.yml (or .woodpecker/deploy.yml) there.
 # Setup, first run and troubleshooting: docs/ci.md in the lst repository.
+# Written for Woodpecker 3 (list syntax for steps and clone).
 #
-# Shell variables are written `$${NAME}`: Woodpecker substitutes `${NAME}`
-# in the file itself before the step runs, and `$$` is its escape for a
-# literal `$`, so the shell sees `${NAME}` and reads the variable at run
-# time.
+# Every `$` the shell should see is written `$$`: Woodpecker substitutes
+# `${NAME}` and `$NAME` in the file itself before the step runs, and `$$`
+# is its escape for a literal `$`. So `$${prev}` reaches the shell as
+# `${prev}`, read at run time.
 
 when:
   # Pushes to the default branch deploy what changed.
@@ -14,15 +15,19 @@ when:
     branch: ${CI_REPO_DEFAULT_BRANCH}
   # A manual run ("Run pipeline" in the UI) deploys every stack.
   - event: manual
+    branch: ${CI_REPO_DEFAULT_BRANCH}
   # Pull requests only get the structural check (no seed, no deploy).
   - event: pull_request
 
 clone:
-  git:
+  - name: git
     image: woodpeckerci/plugin-git
     settings:
-      # --changed-since needs the previous pipeline's commit in the clone.
-      # Pushes of more commits than this fall back to deploying every stack.
+      # --changed-since needs the previous pipeline's commit in the clone,
+      # and the default clone is a single commit. A push of more commits
+      # than this (or any other case where that commit is missing) falls
+      # back to deploying every stack, which is safe, just slower.
+      partial: false
       depth: 50
 
 steps:
@@ -38,13 +43,13 @@ steps:
       LST_TAG: v0.1.0
       CARGO_HOME: /cache/cargo
     volumes:
-      # A host directory (needs the repository to be trusted for volumes).
+      # A host directory (the repository must be trusted for volumes).
       - /var/lib/woodpecker/lst-cache:/cache
     commands:
       - |
         set -eu
         want="lst $${LST_TAG#v}"
-        have=$(/cache/lst/bin/lst --version 2>/dev/null || true)
+        have=$$(/cache/lst/bin/lst --version 2>/dev/null || true)
         if [ "$${have}" = "$${want}" ]; then
           echo "cached: $${have}"
         else
@@ -64,47 +69,68 @@ steps:
       LST_SEED:
         from_secret: lst_seed
     volumes:
-      - /var/lib/woodpecker/lst-cache:/cache
+      - /var/lib/woodpecker/lst-cache:/cache:ro
       # Full control of the host's Docker daemon: see docs/ci.md.
       - /var/run/docker.sock:/var/run/docker.sock
     commands:
       - |
         set -eu
+        if [ -z "$${LST_SEED:-}" ]; then
+          echo "LST_SEED is empty: add the lst_seed secret for push and manual events" >&2
+          exit 1
+        fi
         export PATH="/cache/lst/bin:$${PATH}"
+        # The clone may belong to another user than this step: let git
+        # (which lst runs) read it anyway.
+        git config --global --add safe.directory "$${PWD}"
         lst check
+
+        # --changed-since is only safe from a commit that is known to be
+        # deployed: the previous pipeline must have been a successful
+        # push or manual run on this branch, and its commit must be in the
+        # clone. Anything else deploys every stack (safe: compose leaves
+        # unchanged services alone).
         prev="$${CI_PREV_COMMIT_SHA:-}"
-        if [ "$${CI_PIPELINE_EVENT}" = push ] \
-          && [ "$${CI_PREV_PIPELINE_STATUS:-}" = success ] \
-          && [ -n "$${prev}" ] \
-          && git cat-file -e "$${prev}^{commit}" 2>/dev/null; then
+        reason=
+        if [ "$${CI_PIPELINE_EVENT}" != push ]; then
+          reason="this is a $${CI_PIPELINE_EVENT} run"
+        elif [ -z "$${prev}" ]; then
+          reason="there is no previous pipeline"
+        elif [ "$${CI_PREV_PIPELINE_STATUS:-}" != success ]; then
+          reason="the previous pipeline's status is $${CI_PREV_PIPELINE_STATUS:-unknown}"
+        elif ! { [ "$${CI_PREV_PIPELINE_EVENT:-}" = push ] \
+          || [ "$${CI_PREV_PIPELINE_EVENT:-}" = manual ]; }; then
+          reason="the previous pipeline was a $${CI_PREV_PIPELINE_EVENT:-unknown} run"
+        elif [ "$${CI_PREV_COMMIT_BRANCH:-}" != "$${CI_COMMIT_BRANCH}" ]; then
+          reason="the previous pipeline ran on another branch"
+        elif ! git cat-file -e "$${prev}^{commit}" 2>/dev/null; then
+          reason="its commit $${prev} is not in this clone (clone depth, force push)"
+        fi
+        if [ -z "$${reason}" ]; then
           lst deploy --changed-since "$${prev}"
         else
-          echo "deploying every stack (event $${CI_PIPELINE_EVENT}, previous pipeline" \
-            "$${CI_PREV_PIPELINE_STATUS:-none}, previous commit $${prev:-none}" \
-            "$${prev:+(not in this clone?)})"
+          echo "deploying every stack: $${reason}"
           set --
           for dir in stacks/*/; do
             [ -f "$${dir}compose.yaml" ] || continue
             name="$${dir#stacks/}"
-            set -- "$@" "$${name%/}"
+            set -- "$$@" "$${name%/}"
           done
-          if [ "$#" -gt 0 ]; then
-            lst deploy "$@"
+          if [ "$$#" -gt 0 ]; then
+            lst deploy "$$@"
           else
             echo "no stacks"
           fi
         fi
 
-  # Pull requests: the structural check, without the seed (secrets are
-  # not given to pull request pipelines) and without the Docker socket.
+  # Pull requests: the structural check, without the seed (keep the
+  # lst_seed secret off pull_request events) and without the Docker socket.
+  # Uses the binary the default branch's pipeline built.
   - name: check
     image: docker:cli
     depends_on: []
     when:
       - event: pull_request
-    environment:
-      LST_GIT: https://github.com/thelonesomeprogrammer/lst
-      LST_TAG: v0.1.0
     volumes:
       - /var/lib/woodpecker/lst-cache:/cache:ro
     commands:
@@ -114,4 +140,5 @@ steps:
           echo "lst is not in the cache yet: run the pipeline on the default branch once" >&2
           exit 1
         fi
+        git config --global --add safe.directory "$${PWD}"
         /cache/lst/bin/lst check
