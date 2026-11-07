@@ -71,6 +71,13 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
 - **Strict index:** a staged `compose.yaml` under an invalid or reserved stack name is an error; a non-UTF-8 path anywhere in the index blocks every commit (fail closed).
 - **Renames:** `lst rename <stack>/<old> <new>` moves a gen entry keeping its id (value unchanged) or re-encrypts a manual secret under the new name. An existing target needs `--replace` (the common case: the commit already gave the new name a fresh id). When one name disappears and one appears in the same stack, the hook prints the exact command.
 
+### check, deploy and CI (decided 2026-11-07, before M3)
+- **Seed in CI:** if the `LST_SEED` environment variable is set, lst uses it (same 64-lowercase-hex rules) and never writes it to disk. If `.env` also holds a seed, both must match. The `.env` ignore guard still runs whenever `.env` is read. `lst init` refuses to run while `LST_SEED` is set (init manages `.env`).
+- **`lst check`** lists every problem at once: `.sec/` is current for the working tree (a dry-run sync changes nothing); no `<<set:` in any blob of the `HEAD` tree (it's in history: rotate the secret); every `<<secret:…>>` has an entry. Without a seed it stops there (structural, e.g. for PR pipelines); with a seed it also checks the fingerprint and that every marker resolves (every ciphertext decrypts).
+- **`lst deploy <stack>…`** runs the full check once, then per stack (sorted): render `compose.yaml` and pipe it into `docker compose -p <stack> --project-directory stacks/<stack> -f - up -d --wait --remove-orphans`. Stops at the first failure and says which stacks were deployed. A stack name that isn't a valid compose project name (`[a-z0-9][a-z0-9_-]*`) is an error, not silently lowercased.
+- **`lst deploy --changed-since REV`** deploys the stacks affected by `REV..HEAD`: any change under `stacks/<s>/` or in `.sec/<s>.toml`; a change in `.sec/shared.toml` affects only the stacks using a shared name whose entry changed; a change in `.sec/meta.toml` affects every stack. Deleted stacks are reported, not torn down (M5). Can't be combined with explicit stacks.
+- **Woodpecker:** the example pipeline (`docs/examples/woodpecker.yml`) builds lst with `cargo install --locked --git … --tag …` (cached) and deploys with the Docker socket mounted (trusted repo), `LST_SEED` from a Woodpecker secret. Publishing a prebuilt image is left for later.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).
