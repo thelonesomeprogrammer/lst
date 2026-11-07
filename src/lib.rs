@@ -1,12 +1,14 @@
 //! `lst` (Lazy Secret Tool): fills secret markers in Docker Compose files
 //! with seed-derived or encrypted values at deploy time.
 //!
-//! `marker`, `crypto`, `format`, `envfile`, `render`, `scan` and `hook`
-//! are pure (no filesystem, subprocesses or environment variables; `crypto`
-//! only uses the OS random generator). `git`, `stack`, `store::{load, save}`
-//! and `cli` (the commands behind the binary) do the I/O.
+//! `marker`, `crypto`, `format`, `envfile`, `render`, `scan`, `hook` and
+//! `check` are pure (no filesystem, subprocesses or environment variables;
+//! `crypto` only uses the OS random generator). `git`, `stack`,
+//! `store::{load, read_files, save}` and `cli` (the commands behind the
+//! binary) do the I/O.
 #![forbid(unsafe_code)]
 
+pub mod check;
 pub mod cli;
 pub mod crypto;
 pub mod envfile;

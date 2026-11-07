@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
+use crate::check::{self, Problem};
 use crate::crypto::{CryptoError, Seed};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
@@ -85,6 +86,15 @@ pub enum Command {
         /// The stack: stacks/<STACK>/compose.yaml.
         stack: String,
     },
+    /// Check that the repository is ready to deploy, listing every problem.
+    ///
+    /// .sec/ is current for the working tree (`lst sync` would change
+    /// nothing), no <<set:…>> is in the working tree or in any file
+    /// committed in HEAD (a committed value must be rotated), and every
+    /// <<secret:…>> has a value. With a seed (LST_SEED or .env) also: it is
+    /// the seed of .sec/ and every marker resolves. Without one the check
+    /// is structural only. Read-only; exits 1 if anything is wrong.
+    Check,
     /// Install or run the pre-commit hook.
     Hook {
         #[command(subcommand)]
@@ -163,6 +173,12 @@ pub enum CliError {
     )]
     InitWithEnvVar,
     #[error(
+        "check failed: {count} problem{}{}",
+        if *count == 1 { "" } else { "s" },
+        if *structural { " (structural only: no seed)" } else { "" }
+    )]
+    CheckFailed { count: usize, structural: bool },
+    #[error(
         "this repo is already initialised; put the seed from your password manager into .env \
          as LST_SEED=… (lst will not create a new seed for an existing .sec/)"
     )]
@@ -235,6 +251,7 @@ pub fn run(
             rename(&root, env_seed, &from, &to, replace, stderr)
         }
         Command::Render { stack } => render_stack(&root, env_seed, &stack, stdout),
+        Command::Check => check(&root, env_seed, stderr),
         Command::Hook {
             action: HookAction::Install { force },
         } => hook_install(&root, force, stderr),
@@ -614,6 +631,80 @@ fn render_stack(
         .write_all(rendered.expose().as_bytes())
         .and_then(|()| stdout.flush())
         .map_err(CliError::Stdout)
+}
+
+// ---------------------------------------------------------------------------
+// check
+// ---------------------------------------------------------------------------
+
+/// `lst check`: [`check_repo`] with the seed from `LST_SEED` / `.env`, if
+/// there is one, and a success line.
+fn check(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(), CliError> {
+    let seed = find_seed(root, env_seed)?.seed;
+    check_repo(root, seed.as_ref(), stderr)?;
+    let msg = match seed {
+        Some(_) => "check ok",
+        None => "check ok (structural only: no seed)",
+    };
+    note(stderr, msg);
+    Ok(())
+}
+
+/// Every problem `lst check` looks for (see [`crate::check`]), each
+/// printed as one line on `stderr`; `Err(CheckFailed)` if there is any.
+/// Prints nothing else on success, so `lst deploy` can run it first. With
+/// `seed` `None` only the structural checks run.
+///
+/// Problems are collected, not returned at the first; hard errors (an
+/// unreadable or invalid `.sec/`, a malformed marker, a failing git) still
+/// stop it, because nothing can be decided then.
+pub(crate) fn check_repo(
+    root: &Path,
+    seed: Option<&Seed>,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (meta, sec_files) = Store::read_files(&root.join(SEC_DIR))?;
+    let store = Store::from_files(&meta, &sec_files)?;
+    let loaded = check::loaded_files(&meta, &sec_files);
+    let files = read_stack_files(root)?;
+
+    let mut problems = check::working_tree(&store, &loaded, &files)?;
+    problems.extend(committed_sets(root, stderr)?);
+    if let Some(seed) = seed {
+        problems.extend(check::resolution(&store, seed, &files)?);
+    }
+
+    for p in &problems {
+        note(stderr, &p.to_string());
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::CheckFailed {
+            count: problems.len(),
+            structural: seed.is_none(),
+        })
+    }
+}
+
+/// A problem for every regular file committed in `HEAD` that contains
+/// `<<set:` (any path). Without a commit yet there is nothing to scan.
+fn committed_sets(root: &Path, stderr: &mut dyn Write) -> Result<Vec<Problem>, CliError> {
+    if !git::rev_exists(root, "HEAD")? {
+        note(
+            stderr,
+            "no commit yet, so there is no committed <<set:…>> to look for",
+        );
+        return Ok(Vec::new());
+    }
+    let mut problems = Vec::new();
+    for e in git::tree_entries(root, "HEAD")? {
+        if e.is_file() {
+            let blob = git::read_blob(root, &e.oid)?;
+            problems.extend(check::committed_set(&e.path, &blob));
+        }
+    }
+    Ok(problems)
 }
 
 // ---------------------------------------------------------------------------
