@@ -712,6 +712,16 @@ fn check(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(
     Ok(())
 }
 
+/// What [`check_repo`] read and found consistent, for `lst deploy` to go
+/// on with (rather than read it all again).
+struct Checked {
+    /// `.sec/`; with a seed, one made with that seed.
+    store: Store,
+    /// Every stack file in the working tree ([`read_stack_files`]), keyed
+    /// by stack: every existing stack is a key.
+    files: scan::StackFiles<Contents>,
+}
+
 /// Every problem `lst check` looks for (see [`crate::check`]), each
 /// printed as one line on `stderr`; `Err(CheckFailed)` if there is any.
 /// Prints nothing else on success, so `lst deploy` can run it first. With
@@ -720,11 +730,11 @@ fn check(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(
 /// Problems are collected, not returned at the first; hard errors (an
 /// unreadable or invalid `.sec/`, a malformed marker, a failing git) still
 /// stop it, because nothing can be decided then.
-pub(crate) fn check_repo(
+fn check_repo(
     root: &Path,
     seed: Option<&Seed>,
     stderr: &mut dyn Write,
-) -> Result<(), CliError> {
+) -> Result<Checked, CliError> {
     let (meta, sec_files) = Store::read_files(&root.join(SEC_DIR))?;
     let store = Store::from_files(&meta, &sec_files)?;
     let loaded = check::loaded_files(&meta, &sec_files);
@@ -740,7 +750,7 @@ pub(crate) fn check_repo(
         note(stderr, &p.to_string());
     }
     if problems.is_empty() {
-        Ok(())
+        Ok(Checked { store, files })
     } else {
         Err(CliError::CheckFailed {
             count: problems.len(),
@@ -800,11 +810,11 @@ fn deploy(
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let seed = require_seed(root, env_seed)?;
-    check_repo(root, Some(&seed), stderr)?;
-    let store = Store::load(&root.join(SEC_DIR))?;
-    store.verify_seed(&seed)?;
+    // With the seed, a passing check includes `store.verify_seed`.
+    let checked = check_repo(root, Some(&seed), stderr)?;
+    let store = &checked.store;
     let names = match changed_since {
-        Some(rev) => changed_stacks(root, rev, &store, stderr)?,
+        Some(rev) => changed_stacks(root, rev, &checked, stderr)?,
         None => stacks.into_iter().collect(),
     };
     if names.is_empty() {
@@ -819,7 +829,7 @@ fn deploy(
     }
     let names_of = |ts: &[Stack]| ts.iter().map(|t| t.name.clone()).collect();
     for (i, s) in targets.iter().enumerate() {
-        let result = render_compose(&seed, &store, s)
+        let result = render_compose(&seed, store, s)
             .and_then(|rendered| Ok(deploy::run_compose(root, &s.name, &rendered)?));
         if let Err(e) = result {
             return Err(CliError::DeployFailed {
@@ -839,12 +849,13 @@ fn deploy(
 /// exists and each changed path that can't belong to a stack.
 ///
 /// `.sec/shared.toml` is compared between `REV` and the working tree (the
-/// `store` just checked, which in CI is `HEAD`), and the markers are the
-/// working tree's: the same files `lst check` just found consistent.
+/// store just checked, which in CI is `HEAD`), and the markers and the
+/// existing stacks are the working tree's: the same files `lst check` just
+/// found consistent.
 fn changed_stacks(
     root: &Path,
     rev: &str,
-    store: &Store,
+    checked: &Checked,
     stderr: &mut dyn Write,
 ) -> Result<BTreeSet<String>, CliError> {
     let changed = git::diff_names(root, rev).map_err(|e| match e {
@@ -867,9 +878,9 @@ fn changed_stacks(
         }
     };
     let empty = StackFile::default();
-    let after = store.files().get(SHARED).unwrap_or(&empty);
-    let uses = scan::collect(&read_stack_files(root)?)?.uses;
-    let existing = stack::discover(root)?.into_iter().map(|s| s.name).collect();
+    let after = checked.store.files().get(SHARED).unwrap_or(&empty);
+    let uses = scan::collect(&checked.files)?.uses;
+    let existing = checked.files.keys().cloned().collect();
     let affected = deploy::affected_stacks(&changed, &before, after, &uses, &existing);
     for s in &affected.deleted {
         note(
