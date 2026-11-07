@@ -99,6 +99,7 @@ lst/
 - Compute `lst.render-hash` per service (from rendered inputs) and inject it as a label; find affected services via `volumes:`.
 - `pre` via `docker compose run --rm --no-deps <service> <cmd>`; `post` via `docker compose exec <service> <cmd>` after `--wait`.
 - `when: on-change`: compare the running container's label with the new hash.
+- YAML crate: `serde_yaml_ng`. Details (model, keyed render hash, `run:` forms, file modes, CI mounts) in design.md "x-deploy details".
 - _Done when:_ Mosquitto (password file via `pre`) and a shared Mongo/Postgres user setup (via `post`) deploy correctly and only restart when inputs change.
 
 ### M5 — Lifecycle polish

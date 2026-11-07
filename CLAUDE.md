@@ -5,7 +5,7 @@ Rust CLI that fills secret markers in Docker Compose files with seed-derived or 
 **Source of truth:** `docs/design.md` (decisions) and `docs/plan.md` (milestones). If code and design disagree, stop and ask; don't silently pick one.
 
 ## Frozen invariants: never change these without explicit approval
-- **BLAKE3 `derive_key` context strings:** `"lst v1 gen"`, `"lst v1 sec-encryption"`, `"lst v1 fingerprint"`. Changing any of them changes every secret ever generated.
+- **BLAKE3 `derive_key` context strings:** `"lst v1 gen"`, `"lst v1 sec-encryption"`, `"lst v1 fingerprint"`, `"lst v1 render-hash"` (added for M4, approved 2026-11-07). Changing any of the first three changes every secret ever generated; changing the last restarts every container that carries the label.
 - **Derivation input:** `key_material = seed || id` for generated secrets.
 - **Format encoders** (`alnumN`, `hexN`, `base64-N`, `uuid`; N counts output characters), including the rejection-sampling alphabet, the N limits and the order bytes are consumed from the XOF stream. See `docs/design.md` → "Frozen encoding details".
 - **Encoding details:** ids are 16 random bytes; `seed || id` is the 48 raw bytes; manual-secret AEAD associated data is `"lst v1 secret\0" + full_name`.
