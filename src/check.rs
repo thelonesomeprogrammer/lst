@@ -21,6 +21,11 @@
 //!   pending format change, an unset secret, a `<<set:…>>`) are not
 //!   repeated.
 //!
+//! - **`x-deploy` is valid** ([`xdeploy`]): every stack that uses it
+//!   passes [`crate::xdeploy::check`] (structural: YAML, the model, its
+//!   service and file references, labels); none hides the key where
+//!   [`crate::xdeploy::detect`] can't see it.
+//!
 //! Every [`Problem`] names files and secrets only, never a value.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +34,9 @@ use std::fmt;
 use crate::crypto::Seed;
 use crate::hook;
 use crate::scan::{self, ScanError, StackFiles};
+use crate::stack::{COMPOSE_FILE, STACKS_DIR};
 use crate::store::{FormatChange, META, ResolveError, SHARED, Store, StoreError};
+use crate::xdeploy::{self, Detected, XDeployError};
 
 /// The hint for every "`.sec/` is not current" problem.
 const SYNC_HINT: &str = "run `lst sync` and commit .sec/ (the pre-commit hook does this when \
@@ -60,6 +67,8 @@ pub enum Problem {
     WrongSeed,
     /// A marker of `path` that does not resolve.
     Unresolvable { path: String, error: ResolveError },
+    /// A stack's `x-deploy` section (or its YAML) is invalid.
+    XDeploy(XDeployError),
 }
 
 impl fmt::Display for Problem {
@@ -109,6 +118,7 @@ impl fmt::Display for Problem {
             ),
             Problem::WrongSeed => write!(f, "{}", StoreError::FingerprintMismatch),
             Problem::Unresolvable { path, error } => write!(f, "{path}: {error}"),
+            Problem::XDeploy(e) => write!(f, "{e}"),
         }
     }
 }
@@ -221,6 +231,32 @@ pub fn committed_set(path: &str, blob: &[u8]) -> Option<Problem> {
     scan::contains_set(blob).then(|| Problem::CommittedSet {
         path: path.to_owned(),
     })
+}
+
+/// The `x-deploy` checks: one problem per stack whose `compose.yaml` takes
+/// the YAML path and fails [`xdeploy::check`], or hides the key
+/// ([`Detected::Hidden`]). `files` are the stack files `lst sync` reads
+/// (the scope a `render:` `from` must be in). A stack whose `compose.yaml`
+/// isn't among them or isn't UTF-8 is skipped: [`working_tree`] reports
+/// the latter.
+pub fn xdeploy<B: AsRef<[u8]>>(files: &StackFiles<B>) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    for (stack, list) in files {
+        let compose = format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}");
+        let text = list
+            .iter()
+            .find(|(p, _)| *p == compose)
+            .and_then(|(_, b)| std::str::from_utf8(b.as_ref()).ok());
+        let result = match text.map(|t| (t, xdeploy::detect(t))) {
+            None | Some((_, Detected::Raw)) => continue,
+            Some((_, Detected::Hidden)) => Err(XDeployError::Hidden { path: compose }),
+            Some((t, Detected::XDeploy)) => xdeploy::check(stack, t, list).map(drop),
+        };
+        if let Err(e) = result {
+            problems.push(Problem::XDeploy(e));
+        }
+    }
+    problems
 }
 
 /// The seed checks: `seed` is the store's, and every marker of every file
@@ -537,6 +573,66 @@ mod tests {
                 format!("stacks/db/compose.yaml: `shared/s`: {decrypt}"),
                 format!("stacks/web/compose.yaml: `web/cf`: {decrypt}"),
                 format!("stacks/web/z.conf: `shared/s`: {decrypt}"),
+            ]
+        );
+        assert!(!format!("{msgs:?} {problems:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn x_deploy_problems_per_stack() {
+        let f = files(&[
+            // Valid, with a render: file in scope.
+            (
+                "ok",
+                &[
+                    (
+                        "stacks/ok/compose.yaml",
+                        "services: {a: {}}\nx-deploy:\n  render: [{from: c.conf, to: /x}]\n",
+                    ),
+                    ("stacks/ok/c.conf", "<<gen:x>>"),
+                ],
+            ),
+            // The file is another stack's.
+            (
+                "web",
+                &[(
+                    WEB,
+                    "x-deploy:\n  render: [{from: c.conf, to: /x}]\na: <<set:x:hunter2>>\n",
+                )],
+            ),
+            (
+                "hidden",
+                &[("stacks/hidden/compose.yaml", "{x-deploy: {}}\n")],
+            ),
+            (
+                "yaml",
+                &[("stacks/yaml/compose.yaml", "x-deploy: {}\na: [\n")],
+            ),
+            // Not checked: no x-deploy, invalid YAML on the raw path, no
+            // compose.yaml in scope, not UTF-8.
+            ("raw", &[("stacks/raw/compose.yaml", "a: [x-deploy\n")]),
+            ("none", &[("stacks/none/other", "x-deploy: 1\n")]),
+        ]);
+        let mut f = f;
+        f.insert(
+            "bin".into(),
+            vec![(
+                "stacks/bin/compose.yaml".into(),
+                b"x-deploy: 1\n\xff".to_vec(),
+            )],
+        );
+        let problems = xdeploy(&f);
+        let msgs = messages(&problems);
+        assert_eq!(
+            msgs,
+            [
+                "stacks/hidden/compose.yaml: write the top-level x-deploy key at the start of a \
+                 line (`x-deploy:`); lst decides which stacks use x-deploy from that line",
+                "stacks/web/compose.yaml: x-deploy.render[0].from: no such file in stacks/web/ \
+                 (it must be a regular file that git would commit: not gitignored, not a \
+                 symlink)",
+                "stacks/yaml/compose.yaml:3:1: invalid YAML (lst does not show the parser's \
+                 message: it can quote the file, and so a secret)",
             ]
         );
         assert!(!format!("{msgs:?} {problems:?}").contains("hunter2"));
