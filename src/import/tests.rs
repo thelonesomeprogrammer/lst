@@ -22,6 +22,8 @@ fn try_run(compose: &str, list: &[(&str, &str)], exclude: &[&str]) -> Result<Pla
     let exclude = exclude.iter().map(|s| s.to_string()).collect();
     plan(&Input {
         stack: "web",
+        prefix: "stacks/web/",
+        compose_path: "stacks/web/compose.yaml",
         compose,
         files: &files,
         exclude: &exclude,
@@ -335,6 +337,8 @@ fn unreadable_env_file_is_left_alone() {
     let empty = BTreeSet::new();
     let p = plan(&Input {
         stack: "web",
+        prefix: "stacks/web/",
+        compose_path: "stacks/web/compose.yaml",
         compose: "services:\n  app:\n    env_file: a.env\n",
         files: &fs,
         exclude: &empty,
@@ -831,6 +835,8 @@ fn run_owned(compose: &str, files: &[(String, String)]) -> Result<Plan, ImportEr
     let empty = BTreeSet::new();
     plan(&Input {
         stack: "web",
+        prefix: "stacks/web/",
+        compose_path: "stacks/web/compose.yaml",
         compose,
         files: &fs,
         exclude: &empty,

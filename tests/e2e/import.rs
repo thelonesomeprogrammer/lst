@@ -419,3 +419,36 @@ fn migration_guide_rotate_into_gen() {
     );
     lst(&repo, &["check"]).ok();
 }
+
+/// A stacks directory other than `stacks/`, and a `docker-compose.yml`.
+#[test]
+fn import_follows_the_layout() {
+    let repo = Repo::initialised();
+    lst(&repo, &["stacks-dir", "apps"]).ok();
+    repo.write(".gitignore", "/.env\napps/*/.env\napps/*/*.env\n");
+    repo.write("apps/web/docker-compose.yml", COMPOSE);
+    repo.write("apps/web/.env", format!("DB_PASSWORD='{DB_PW}'\n"));
+    repo.write("apps/web/app.env", format!("API_KEY={API_KEY}\n"));
+    let run = lst(&repo, &["import", "web"]);
+    run.ok();
+    assert!(
+        run.stderr.contains("(from DB_PASSWORD in apps/web/.env)"),
+        "{run:#?}"
+    );
+    assert!(
+        run.stderr.contains("at apps/web/docker-compose.yml:5:26"),
+        "{run:#?}"
+    );
+    let compose = repo.read("apps/web/docker-compose.yml");
+    assert!(compose.contains("POSTGRES_PASSWORD: <<secret:db_password>>"));
+    assert!(compose.contains("API_KEY: '<<secret:api_key>>'"));
+    assert!(!repo.exists("apps/web/.env") && !repo.exists("apps/web/app.env"));
+    assert!(
+        lst(&repo, &["render", "web"])
+            .ok()
+            .contains("API_KEY: '0ld-api-key'")
+    );
+    repo.git(&["add", "-A"]);
+    repo.commit(&["-m", "import"]).ok();
+    lst(&repo, &["check"]).ok();
+}

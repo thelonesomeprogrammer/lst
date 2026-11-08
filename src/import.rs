@@ -41,7 +41,6 @@ use crate::crypto::SecretString;
 use crate::dotenv::{self, DotenvError, Skip};
 use crate::marker::{self, MarkerKind};
 use crate::render;
-use crate::stack::STACKS_DIR;
 use crate::store::{self, StoreError};
 use crate::xdeploy::{self, Detected};
 
@@ -62,6 +61,11 @@ pub enum FileState {
 /// Everything [`plan`] needs.
 pub struct Input<'a> {
     pub stack: &'a str,
+    /// The stack directory as a repo-relative prefix (`stacks/web/`), for
+    /// messages.
+    pub prefix: &'a str,
+    /// The compose file's repo-relative path, for messages.
+    pub compose_path: &'a str,
     /// The text of `stacks/<stack>/compose.yaml`.
     pub compose: &'a str,
     /// Stack-relative path → state, for [`DOT_ENV`] and every path
@@ -213,7 +217,7 @@ enum Parsed {
 }
 
 fn parse_files(
-    stack: &str,
+    prefix: &str,
     files: &BTreeMap<String, FileState>,
 ) -> Result<BTreeMap<String, Parsed>, ImportError> {
     let mut out = BTreeMap::new();
@@ -223,7 +227,7 @@ fn parse_files(
             FileState::Unusable(why) => Parsed::Unusable(why.clone()),
             FileState::Text(text) => {
                 let defs = dotenv::parse(text.expose()).map_err(|source| ImportError::Dotenv {
-                    path: stack_path(stack, rel),
+                    path: stack_path(prefix, rel),
                     source,
                 })?;
                 let mut vars: Vec<(String, Result<SecretString, Skip>)> = Vec::new();
@@ -247,9 +251,9 @@ fn parse_files(
     Ok(out)
 }
 
-/// `stacks/<stack>/<rel>`, for messages.
-pub fn stack_path(stack: &str, rel: &str) -> String {
-    format!("{STACKS_DIR}/{stack}/{rel}")
+/// `<prefix><rel>` (`stacks/web/.env`), for messages.
+pub fn stack_path(prefix: &str, rel: &str) -> String {
+    format!("{prefix}{rel}")
 }
 
 /// A stack-relative `env_file` path in normal form (`./a/./b.env` →
@@ -1027,9 +1031,10 @@ struct Candidate {
 /// Plans the import of one stack. See the module docs.
 pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
     let stack = input.stack;
-    let compose_path = stack_path(stack, crate::stack::COMPOSE_FILE);
+    let prefix = input.prefix;
+    let compose_path = input.compose_path.to_owned();
     let text = input.compose;
-    let files = parse_files(stack, input.files)?;
+    let files = parse_files(prefix, input.files)?;
     let dot = match files.get(DOT_ENV) {
         Some(Parsed::Defs(d)) => Some(d),
         _ => None,
@@ -1054,7 +1059,7 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
             Some(c) if c.value.expose() != value.expose() => Err(ImportError::Conflict {
                 var: var.to_owned(),
                 name: var.to_lowercase(),
-                files: [stack_path(stack, &c.files[0]), stack_path(stack, file)],
+                files: [stack_path(prefix, &c.files[0]), stack_path(prefix, file)],
             }),
             Some(c) => {
                 if !c.files.iter().any(|f| f == file) {
@@ -1140,11 +1145,11 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
             match files.get(&path) {
                 Some(Parsed::Missing) if !r.required => {}
                 Some(Parsed::Missing) | None => {
-                    problem = Some(format!("{} does not exist", stack_path(stack, &path)));
+                    problem = Some(format!("{} does not exist", stack_path(prefix, &path)));
                     break;
                 }
                 Some(Parsed::Unusable(why)) => {
-                    problem = Some(format!("{}: {why}", stack_path(stack, &path)));
+                    problem = Some(format!("{}: {why}", stack_path(prefix, &path)));
                     break;
                 }
                 Some(Parsed::Defs(d)) => {

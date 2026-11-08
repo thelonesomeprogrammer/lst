@@ -34,7 +34,7 @@ use std::fmt;
 use crate::crypto::Seed;
 use crate::hook;
 use crate::scan::{self, ScanError, StackFiles};
-use crate::stack::{COMPOSE_FILE, STACKS_DIR};
+use crate::stack::{self, Layout};
 use crate::store::{FormatChange, META, ResolveError, SHARED, Store, StoreError};
 use crate::xdeploy::{self, Detected, XDeployError};
 
@@ -164,7 +164,7 @@ pub fn working_tree<B: AsRef<[u8]>>(
     loaded: &BTreeMap<String, String>,
     files: &StackFiles<B>,
 ) -> Result<Vec<Problem>, ScanError> {
-    let scan = scan::collect(files)?;
+    let scan = scan::collect(store.layout(), files)?;
     let mut problems = Vec::new();
     let mut being_set = BTreeSet::new();
     for s in scan.sets {
@@ -233,16 +233,18 @@ pub fn committed_set(path: &str, blob: &[u8]) -> Option<Problem> {
     })
 }
 
-/// The `x-deploy` checks: one problem per stack whose `compose.yaml` takes
+/// The `x-deploy` checks: one problem per stack whose compose file takes
 /// the YAML path and fails [`xdeploy::check`], or hides the key
 /// ([`Detected::Hidden`]). `files` are the stack files `lst sync` reads
-/// (the scope a `render:` `from` must be in). A stack whose `compose.yaml`
+/// (the scope a `render:` `from` must be in). A stack whose compose file
 /// isn't among them or isn't UTF-8 is skipped: [`working_tree`] reports
 /// the latter.
-pub fn xdeploy<B: AsRef<[u8]>>(files: &StackFiles<B>) -> Vec<Problem> {
+pub fn xdeploy<B: AsRef<[u8]>>(layout: &Layout, files: &StackFiles<B>) -> Vec<Problem> {
     let mut problems = Vec::new();
     for (stack, list) in files {
-        let compose = format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}");
+        let Some(compose) = stack::compose_in(layout, stack, list) else {
+            continue;
+        };
         let text = list
             .iter()
             .find(|(p, _)| *p == compose)
@@ -250,7 +252,9 @@ pub fn xdeploy<B: AsRef<[u8]>>(files: &StackFiles<B>) -> Vec<Problem> {
         let result = match text.map(|t| (t, xdeploy::detect(t))) {
             None | Some((_, Detected::Raw)) => continue,
             Some((_, Detected::Hidden)) => Err(XDeployError::Hidden { path: compose }),
-            Some((t, Detected::XDeploy)) => xdeploy::check(stack, t, list).map(drop),
+            Some((t, Detected::XDeploy)) => {
+                xdeploy::check(layout, stack, &compose, t, list).map(drop)
+            }
         };
         if let Err(e) = result {
             problems.push(Problem::XDeploy(e));
@@ -277,7 +281,7 @@ pub fn resolution<B: AsRef<[u8]>>(
         list.sort_by(|a, b| a.0.cmp(&b.0));
         for (path, bytes) in list {
             let mut reported = BTreeSet::new();
-            for m in scan::scan_file(stack, path, bytes.as_ref())? {
+            for m in scan::scan_file(store.layout(), stack, path, bytes.as_ref())? {
                 let error = match store.resolve(seed, stack, &m) {
                     // The value is dropped (zeroized) right here.
                     Ok(_) => continue,
@@ -328,7 +332,7 @@ mod tests {
         for (stack, name, value) in secrets {
             store.set_secret(&seed(1), stack, name, value).unwrap();
         }
-        let uses = scan::collect(files).unwrap().uses;
+        let uses = scan::collect(&Layout::default(), files).unwrap().uses;
         store.sync(&hook::secret_uses(uses)).unwrap();
         store
     }
@@ -378,7 +382,11 @@ mod tests {
         // `old` becomes an orphan in the store, then comes back.
         let without_old = files(&[("web", &[(WEB, "a: <<gen:db>>\nb: <<gen:api>>\n")])]);
         store
-            .sync(&scan::collect(&without_old).unwrap().uses)
+            .sync(
+                &scan::collect(&Layout::default(), &without_old)
+                    .unwrap()
+                    .uses,
+            )
             .unwrap();
         let now = files(&[(
             "web",
@@ -624,7 +632,7 @@ mod tests {
                 b"x-deploy: 1\n\xff".to_vec(),
             )],
         );
-        let problems = xdeploy(&f);
+        let problems = xdeploy(&Layout::default(), &f);
         let msgs = messages(&problems);
         assert_eq!(
             msgs,

@@ -18,7 +18,7 @@ git add .gitignore .sec && git commit -m "lst init"
 - **Back up the seed now.** Copy the `LST_SEED=…` line from `.env` into your password manager. Without it, generated secrets can't be recovered and `.sec/` can't be decrypted.
 - **Test the restore path early**, while nothing depends on it yet. Clone the repository somewhere else, create `.env` with the seed from your password manager, run `lst hook install` and `lst deploy --all --dry-run`. If that works, a lost machine costs you a clone and one line. Do this again before you migrate the stacks you can't afford to lose (step 2, last stage).
 - **Gitignore the stacks' own env files** before you start (`stacks/*/.env`, `stacks/*/*.env`, or whatever names you use). `lst import` removes the lines it imports, but other lines stay, and `git add stacks` must not pick them up. If one of them was ever committed, its values are in your history: see [Cleanup](#4-cleanup).
-- Move each stack to `stacks/<name>/compose.yaml` (plus any config files it needs next to it). `lst deploy` runs `docker compose -p <name> --project-directory stacks/<name>`, so the project name is the directory name. Keep it the same as the running project's name, or compose will create a second set of containers.
+- Put each stack in its own directory in the stacks directory, `stacks/<name>/` by default (`lst stacks-dir DIR` sets another, `.` for the repository root), with its compose file (`compose.yaml`, `compose.yml`, `docker-compose.yaml` or `docker-compose.yml`) and any config files it needs next to it. `lst deploy` runs `docker compose -p <name> --project-directory stacks/<name>`, so the project name is the directory name. Keep it the same as the running project's name, or compose will create a second set of containers.
 
 ## 2. Order: pilot first, core last
 
@@ -42,8 +42,8 @@ lst check && lst deploy web
 
 What `lst import <stack>` does:
 
-- It reads `stacks/<stack>/.env` (compose's interpolation file) and every file an `env_file:` names, and stores their values **encrypted in `.sec/`** as manual secrets. The secret's name is the variable name in lowercase (`DB_PASSWORD` → `web/db_password`).
-- In `compose.yaml`, `${DB_PASSWORD}` (and `$DB_PASSWORD`, `${DB_PASSWORD:-…}`, `${DB_PASSWORD:?…}`) becomes `<<secret:db_password>>`. `${VAR:+…}` doesn't evaluate to the value and is left alone.
+- It reads the stack directory's `.env` (compose's interpolation file) and every file an `env_file:` names, and stores their values **encrypted in `.sec/`** as manual secrets. The secret's name is the variable name in lowercase (`DB_PASSWORD` → `web/db_password`).
+- In the compose file, `${DB_PASSWORD}` (and `$DB_PASSWORD`, `${DB_PASSWORD:-…}`, `${DB_PASSWORD:?…}`) becomes `<<secret:db_password>>`. `${VAR:+…}` doesn't evaluate to the value and is left alone.
 - An `env_file:` becomes an `environment:` block of `KEY: '<<secret:key>>'` entries. If the service already has a block-style `environment:`, the entries are added to it; keys it already sets are left out, because they override the file anyway.
 - **Every rewrite is checked.** A rewrite is kept only if compose would read exactly the same values afterwards: lst renders the result in memory (with the real values, as `lst render` would), parses and interpolates it the way compose does, and compares that with the original. A rewrite that fails the check is left as it was and reported:
   - `left ${VAR} as it is`: with the value written in raw, the YAML would read something else: a value with `: ` or ` #` in a plain scalar, `"` inside double quotes, or a value YAML could read as a number, bool or null (`0777`, `1e3`, `yes`, an empty value) standing alone in a plain scalar. Put the scalar in single quotes and run `lst import` again.
