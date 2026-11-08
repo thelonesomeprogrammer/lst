@@ -1,6 +1,7 @@
 //! `lst deploy`, against the fake docker (`tests/fixtures/fake-docker`):
 //! what compose is run with, in which order, what stops a deploy before
-//! anything runs, and which stacks `--changed-since` picks.
+//! anything runs, which stacks `--changed-since` and `--all` pick, and what
+//! `--dry-run` shows (without running anything).
 //!
 //! The fake is put on `PATH` as `docker` through a temp dir holding a
 //! symlink to it, in front of the inherited `PATH`, so a real docker on the
@@ -1572,5 +1573,290 @@ fn dollar_in_values_is_escaped_only_where_compose_reads_it() {
     assert_eq!(
         fs::read_to_string(out.path().join("conf.txt")).unwrap(),
         format!("pw={DOLLAR}\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --dry-run
+// ---------------------------------------------------------------------------
+
+/// The dry-run lines of a stack without x-deploy.
+fn planned_stderr(stacks: &[&str]) -> String {
+    stacks
+        .iter()
+        .map(|s| {
+            format!(
+                "lst: would run docker {}\nlst: dry run: would deploy {s}\n",
+                compose_args(s).join(" ")
+            )
+        })
+        .collect()
+}
+
+/// `lst deploy --dry-run <args>` that must succeed without running docker
+/// (and, through [`deploy`], without writing anything in the repository or
+/// printing a plaintext or the seed); returns stderr.
+#[track_caller]
+fn dry_run(repo: &Repo, fake: &Fake, args: &[&str]) -> String {
+    let mut all = vec!["--dry-run"];
+    all.extend_from_slice(args);
+    let run = deploy_ok(repo, fake, &all);
+    assert!(fake.calls().is_empty(), "docker ran: {run:#?}");
+    assert!(!run.stderr.contains("deployed"), "{run:#?}");
+    run.stderr.clone()
+}
+
+#[test]
+fn dry_run_runs_nothing_for_every_target_form() {
+    let repo = repo();
+    let fake = Fake::new();
+    assert_eq!(
+        dry_run(&repo, &fake, &["d", "a", "d"]),
+        planned_stderr(&["a", "d"])
+    );
+    assert_eq!(
+        dry_run(&repo, &fake, &["--all"]),
+        planned_stderr(&["a", "b", "c", "d"])
+    );
+    repo_change_a(&repo);
+    assert_eq!(
+        dry_run(&repo, &fake, &["--changed-since", "HEAD~1"]),
+        planned_stderr(&["a"])
+    );
+    assert_eq!(
+        dry_run(&repo, &fake, &["--changed-since", "HEAD"]),
+        "lst: nothing to deploy\n"
+    );
+    // The flag goes anywhere.
+    let run = deploy_ok(&repo, &fake, &["b", "--dry-run"]);
+    assert_eq!(run.stderr, planned_stderr(&["b"]));
+    // No value of any stack is shown.
+    let values = [
+        repo.expected_gen("a", "db", "alnum32".parse().unwrap()),
+        repo.expected_gen("shared", "mqtt", "hex64".parse().unwrap()),
+        repo.expected_gen("c", "c1", "uuid".parse().unwrap()),
+    ];
+    let out = dry_run(&repo, &fake, &["--all"]);
+    for v in &values {
+        assert!(!out.contains(v.as_str()), "{v} leaked: {out}");
+    }
+    assert!(fake.calls().is_empty());
+
+    // Even without docker on PATH at all.
+    let git_only = tempfile::tempdir().unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let git = std::env::split_paths(&path)
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .unwrap();
+    symlink(git, git_only.path().join("git")).unwrap();
+    let opts = Opts {
+        path: Some(git_only.path().as_os_str().to_owned()),
+        ..DEFAULT
+    };
+    let run = deploy(&repo, &fake, &["--dry-run", "a"], &repo.seed_hex(), opts);
+    assert_eq!(run.ok(), "");
+    assert_eq!(run.stderr, planned_stderr(&["a"]));
+}
+
+#[test]
+fn dry_run_needs_a_target_like_deploy() {
+    let repo = repo();
+    let fake = Fake::new();
+    let seed = repo.seed_hex();
+    for args in [&["--dry-run"][..], &["--dry-run", "--all", "a"][..]] {
+        let run = deploy(&repo, &fake, args, &seed, DEFAULT);
+        assert_eq!(run.code, Some(2), "{run:#?}");
+        assert!(run.stderr.contains("Usage: lst deploy"), "{run:#?}");
+    }
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn dry_run_fails_where_deploy_would_with_nothing_run() {
+    let repo = repo();
+    let fake = Fake::new();
+    let seed = repo.seed_hex();
+    // No seed.
+    let clone = repo.clone_repo();
+    deploy(&clone, &fake, &["--dry-run", "a"], &seed, DEFAULT)
+        .fails_with(&["no .env file", "LST_SEED environment variable"]);
+    // A wrong seed.
+    let opts = Opts {
+        seed: Some(OTHER_SEED),
+        ..DEFAULT
+    };
+    deploy(&clone, &fake, &["--dry-run", "--all"], &seed, opts)
+        .fails_with(&["wrong seed", "check failed: 1 problem"]);
+    // Unknown or invalid stack names.
+    deploy(&repo, &fake, &["--dry-run", "a", "nope"], &seed, DEFAULT)
+        .fails_with(&["unknown stack \"nope\" (known stacks: a, b, c, d)"]);
+    deploy(&repo, &fake, &["--dry-run", "../a"], &seed, DEFAULT)
+        .fails_with(&["invalid stack name \"../a\""]);
+    // A failing check: a stale store, and a secret that has no value.
+    repo.compose("a", &svc("      PW: <<gen:db>>\n      NEW: <<gen:new>>\n"));
+    let run = deploy(&repo, &fake, &["--dry-run", "b"], &seed, DEFAULT);
+    run.fails_with(&["a/new is new", "check failed: 1 problem"]);
+    assert!(!run.stderr.contains("would"), "{run:#?}");
+    repo.compose("a", &svc("      PW: <<secret:unset>>\n"));
+    commit_all_no_verify(&repo, "unset");
+    let run = deploy(&repo, &fake, &["--dry-run", "--all"], &seed, DEFAULT);
+    run.fails_with(&["check failed"]);
+    assert!(!run.stderr.contains("would"), "{run:#?}");
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn dry_run_invalid_project_name_runs_nothing() {
+    let repo = repo();
+    repo.compose("MyApp", &svc("      X: <<gen:x>>\n"));
+    commit_all(&repo, "bad name");
+    let fake = Fake::new();
+    for args in [
+        &["--dry-run", "a", "MyApp"][..],
+        &["--dry-run", "--all"][..],
+    ] {
+        let run = deploy(&repo, &fake, args, &repo.seed_hex(), DEFAULT);
+        run.fails_with(&["stack name \"MyApp\" is not a valid docker compose project name"]);
+        assert!(!run.stderr.contains("would"), "{run:#?}");
+    }
+    assert!(fake.calls().is_empty());
+}
+
+impl XRepo {
+    /// The exact dry-run stderr of `mq`, with `files` the lines for its
+    /// `render:` files.
+    fn planned(&self, files: &str) -> String {
+        let on_change =
+            "unless its inputs are unchanged (when: on-change; a dry run doesn't check)";
+        format!(
+            "{files}lst: would run x-deploy.pre[0] (mosquitto)\n\
+             lst: would run x-deploy.pre[1] (mosquitto) {on_change}\n\
+             lst: would run docker {}\n\
+             lst: would run x-deploy.post[0] (db) {on_change}\n\
+             lst: would run x-deploy.post[1] (app)\n\
+             lst: dry run: would deploy mq\n",
+            compose_args("mq").join(" ")
+        )
+    }
+
+    /// `lst deploy --dry-run <args>` (see [`XRepo::deploy`]) that must
+    /// succeed without running docker; returns stderr.
+    #[track_caller]
+    fn dry_run(&self, args: &[&str]) -> String {
+        let fake = Fake::new();
+        let mut all = vec!["--dry-run"];
+        all.extend_from_slice(args);
+        let run = self.deploy(&fake, &all, DEFAULT);
+        run.ok();
+        assert!(fake.calls().is_empty(), "docker ran: {run:#?}");
+        for v in [NOTE, "chown", "psql", "mosquitto_passwd", "echo"] {
+            assert!(!run.stderr.contains(v), "{v} shown: {run:#?}");
+        }
+        run.stderr.clone()
+    }
+}
+
+#[test]
+fn x_deploy_dry_run_shows_the_plan_and_writes_nothing() {
+    let x = XRepo::new();
+    let (conf, extra) = (x.conf(), x.extra());
+    // Nothing deployed yet: both files would be written.
+    let both = format!(
+        "lst: would write {}\nlst: would write {}\n",
+        conf.display(),
+        extra.display()
+    );
+    assert_eq!(x.dry_run(&["mq"]), x.planned(&both));
+    assert!(fs::read_dir(x.out.path()).unwrap().next().is_none());
+    // With the plain stacks, sorted.
+    assert_eq!(
+        x.dry_run(&["--all"]),
+        format!(
+            "{}{}{}",
+            planned_stderr(&["a"]),
+            x.planned(&both),
+            planned_stderr(&["z"])
+        )
+    );
+    assert!(fs::read_dir(x.out.path()).unwrap().next().is_none());
+
+    // After a deploy: up to date, so no file line.
+    x.deploy(&Fake::new(), &["mq"], DEFAULT).ok();
+    assert_eq!(x.dry_run(&["mq"]), x.planned(""));
+    // Even if the containers carry the new hashes: not asked.
+    let fake = Fake::new();
+    ps_answer(&fake, "db", &format!("0123abc {}\n", x.hash("db")));
+    let run = x.deploy(&fake, &["--dry-run", "mq"], DEFAULT);
+    assert_eq!(run.stderr, x.planned(""));
+    assert!(fake.calls().is_empty());
+
+    // Differing content, a wrong mode, a missing file: reported, not
+    // fixed.
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(&conf, "edited by hand\n").unwrap();
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o666)).unwrap();
+    let written = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
+    let before = (written(&conf), written(&extra));
+    assert_eq!(
+        x.dry_run(&["mq"]),
+        x.planned(&format!(
+            "lst: would write {}\nlst: would fix the mode of {}\n",
+            conf.display(),
+            extra.display()
+        ))
+    );
+    assert_eq!(fs::read_to_string(&conf).unwrap(), "edited by hand\n");
+    assert_eq!(mode_of(&extra), 0o666);
+    assert_eq!((written(&conf), written(&extra)), before);
+    fs::remove_file(&conf).unwrap();
+    assert!(
+        x.dry_run(&["mq"])
+            .starts_with(&format!("lst: would write {}\n", conf.display()))
+    );
+    assert!(!conf.exists());
+}
+
+#[test]
+fn x_deploy_dry_run_fails_where_deploy_would() {
+    let x = XRepo::new();
+    let fake = Fake::new();
+    // A target lst refuses to write.
+    fs::create_dir_all(x.extra()).unwrap();
+    let run = x.deploy(&fake, &["--dry-run", "a", "mq", "z"], DEFAULT);
+    assert_eq!(run.code, Some(1), "{run:#?}");
+    assert_eq!(
+        run.stderr,
+        format!(
+            "{}lst: would write {}\nlst: refusing to write the rendered file {}: it is not a \
+             regular file (dry run: stopped at stack mq; nothing was run or written)\n",
+            planned_stderr(&["a"]),
+            x.conf().display(),
+            x.extra().display()
+        )
+    );
+    assert!(!x.conf().exists());
+    fs::remove_dir(x.extra()).unwrap();
+
+    // A service name compose would refuse.
+    let text = x
+        .repo
+        .read("stacks/mq/compose.yaml")
+        .replace("  app:\n", "  \"my app\":\n")
+        .replace("    - exec: app\n", "    - exec: my app\n");
+    x.repo.compose("mq", &text);
+    commit_all(&x.repo, "bad service name");
+    x.deploy(&fake, &["--dry-run", "mq"], DEFAULT).fails_with(&[
+        "service name \"my app\" of stack \"mq\" is not a valid docker compose service name",
+        "(dry run: stopped at stack mq; nothing was run or written)",
+    ]);
+    assert!(fake.calls().is_empty());
+    // Only the directory this test made.
+    assert_eq!(fs::read_dir(x.out.path()).unwrap().count(), 1);
+    assert!(
+        fs::read_dir(x.out.path().join("extra"))
+            .unwrap()
+            .next()
+            .is_none()
     );
 }
