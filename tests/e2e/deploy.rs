@@ -397,10 +397,7 @@ fn an_invalid_project_name_deploys_nothing() {
         run.fails_with(&[&format!(
             "stack name {name:?} is not a valid docker compose project name"
         )]);
-        assert!(
-            run.stderr
-                .contains(&format!("rename the directory stacks/{name}"))
-        );
+        assert!(run.stderr.contains("rename the stack's directory"));
     }
     // Picked by --changed-since: the same.
     deploy(&repo, &fake, &["--changed-since", "HEAD~1"], &seed, DEFAULT)

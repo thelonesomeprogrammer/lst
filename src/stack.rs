@@ -1,5 +1,6 @@
-//! Stack discovery: every `<root>/stacks/<name>/` with a compose file is a
-//! stack.
+//! Stack discovery: every `<repo>/<stacks dir>/<name>/` with a compose file
+//! is a stack. The stacks directory is `stacks` unless `.sec/meta.toml` says
+//! otherwise ([`Layout`]); the rules below say `stacks/` for it.
 //!
 //! This module only finds paths; reading the files is the caller's job.
 //!
@@ -38,6 +39,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// The default stacks root.
 pub const STACKS_DIR: &str = "stacks";
 /// The compose file names, in Docker's precedence order (the first present
 /// is the stack's compose file).
@@ -49,6 +51,139 @@ pub const COMPOSE_FILES: [&str; 4] = [
 ];
 /// Names taken by `.sec/` itself (its file stems).
 const RESERVED: &[&str] = &[crate::store::SHARED, crate::store::META];
+
+/// Where the stacks live: the stacks root, relative to the repository root
+/// (`stacks` by default, set in `.sec/meta.toml` as `stacks_dir`). A
+/// stack is a directory directly below it. `.` is the repository root
+/// itself (a flat layout: `./<stack>/compose.yaml`).
+///
+/// The root is a relative path of components made of `A-Z a-z 0-9 . _ -`,
+/// none empty, `.`, `..` or starting with `.` (so it can never be or be
+/// inside `.sec/`, `.git/` or a dot-directory), or exactly `.`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    root: String,
+}
+
+impl Default for Layout {
+    fn default() -> Layout {
+        Layout {
+            root: STACKS_DIR.to_owned(),
+        }
+    }
+}
+
+impl Layout {
+    /// The layout with stacks root `root` (see the type docs for the rules).
+    pub fn new(root: &str) -> Result<Layout, StackError> {
+        let bad = |problem: &str| StackError::InvalidStacksDir {
+            dir: root.to_owned(),
+            problem: problem.to_owned(),
+        };
+        if root == "." {
+            return Ok(Layout {
+                root: root.to_owned(),
+            });
+        }
+        if root.is_empty() {
+            return Err(bad("it is empty (use `.` for the repository root)"));
+        }
+        if root.starts_with('/') {
+            return Err(bad("it must be relative to the repository root"));
+        }
+        let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        for part in root.split('/') {
+            if part.is_empty() {
+                return Err(bad("it has an empty component (`//` or a trailing `/`)"));
+            }
+            if part.starts_with('.') {
+                return Err(bad("no component may be `.`, `..` or start with `.`"));
+            }
+            if !part.chars().all(valid_char) {
+                return Err(bad("use only A-Z, a-z, 0-9, '.', '_', '-' and '/'"));
+            }
+        }
+        Ok(Layout {
+            root: root.to_owned(),
+        })
+    }
+
+    /// The stacks root as written (`stacks`, `apps/stacks`, `.`).
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.root == STACKS_DIR
+    }
+
+    /// Whether the root is the repository root (`.`).
+    pub fn is_flat(&self) -> bool {
+        self.root == "."
+    }
+
+    /// The components of the root (none for `.`).
+    fn below_root_parts(&self) -> impl Iterator<Item = &str> {
+        self.root.split('/').filter(|p| *p != ".")
+    }
+
+    /// The stacks root below the repository at `repo`.
+    pub fn dir(&self, repo: &Path) -> PathBuf {
+        if self.is_flat() {
+            repo.to_owned()
+        } else {
+            repo.join(&self.root)
+        }
+    }
+
+    /// The stacks root as a repo-relative path prefix: `stacks/`, or empty
+    /// for `.`.
+    pub fn prefix(&self) -> String {
+        if self.is_flat() {
+            String::new()
+        } else {
+            format!("{}/", self.root)
+        }
+    }
+
+    /// `stack`'s directory as a repo-relative path prefix (`stacks/web/`).
+    pub fn stack_prefix(&self, stack: &str) -> String {
+        format!("{}{stack}/", self.prefix())
+    }
+
+    /// `stack`'s directory, repo-relative (`stacks/web`).
+    pub fn stack_dir(&self, stack: &str) -> PathBuf {
+        PathBuf::from(format!("{}{stack}", self.prefix()))
+    }
+
+    /// The part of repo-relative `path` below the stacks root, if it is
+    /// below it.
+    pub fn below<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if self.is_flat() {
+            Some(path)
+        } else {
+            path.strip_prefix(&self.root)?.strip_prefix('/')
+        }
+    }
+
+    /// The stack directory name and the path inside it, if repo-relative
+    /// `path` is a file in a (non-dot) directory directly below the root.
+    pub fn split<'a>(&self, path: &'a str) -> Option<(&'a str, &'a str)> {
+        let (dir, rest) = self.below(path)?.split_once('/')?;
+        (!dir.starts_with('.') && !rest.is_empty()).then_some((dir, rest))
+    }
+
+    /// Whether repo-relative `path` is the stacks root, one of its parent
+    /// directories, or a non-dot entry directly in it: the paths that must
+    /// not be links, or the stacks behind them would silently disappear.
+    pub fn is_structural(&self, path: &str) -> bool {
+        if !self.is_flat() && (path == self.root || self.root.starts_with(&format!("{path}/"))) {
+            return true;
+        }
+        self.below(path)
+            .is_some_and(|rest| !rest.contains('/') && !rest.starts_with('.'))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stack {
@@ -62,12 +197,20 @@ pub struct Stack {
     /// Other compose files in the directory, shadowed by `compose_file`
     /// (Docker's precedence), in precedence order.
     pub ignored: Vec<&'static str>,
+    /// The directory as a repo-relative prefix ([`Layout::stack_prefix`]).
+    pub prefix: String,
 }
 
 impl Stack {
+    /// The directory, repo-relative (`stacks/<name>`): compose's project
+    /// directory.
+    pub fn dir_rel(&self) -> PathBuf {
+        PathBuf::from(self.prefix.trim_end_matches('/'))
+    }
+
     /// The compose file's repo-relative path (`stacks/<name>/<file>`).
     pub fn compose_rel(&self) -> String {
-        format!("{STACKS_DIR}/{}/{}", self.name, self.compose_file)
+        format!("{}{}", self.prefix, self.compose_file)
     }
 }
 
@@ -75,8 +218,8 @@ impl Stack {
 /// files by repo-relative path, as [`crate::scan::StackFiles`] holds them),
 /// in precedence order: the first is the compose file, the rest are
 /// shadowed.
-pub fn compose_files_in<B>(stack: &str, files: &[(String, B)]) -> Vec<String> {
-    let prefix = format!("{STACKS_DIR}/{stack}/");
+pub fn compose_files_in<B>(layout: &Layout, stack: &str, files: &[(String, B)]) -> Vec<String> {
+    let prefix = layout.stack_prefix(stack);
     let has = |name: &str| {
         files
             .iter()
@@ -91,8 +234,8 @@ pub fn compose_files_in<B>(stack: &str, files: &[(String, B)]) -> Vec<String> {
 
 /// The repo-relative path of `stack`'s compose file among `files`: the first
 /// of [`compose_files_in`].
-pub fn compose_in<B>(stack: &str, files: &[(String, B)]) -> Option<String> {
-    compose_files_in(stack, files).into_iter().next()
+pub fn compose_in<B>(layout: &Layout, stack: &str, files: &[(String, B)]) -> Option<String> {
+    compose_files_in(layout, stack, files).into_iter().next()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +259,8 @@ pub enum StackError {
     CaseCollision { first: String, second: String },
     #[error("{} exists but is not a regular file", path.display())]
     ComposeNotAFile { path: PathBuf },
+    #[error("invalid stacks directory {dir:?}: {problem}")]
+    InvalidStacksDir { dir: String, problem: String },
     #[error("unknown stack {name:?} (known stacks: {known})")]
     Unknown { name: String, known: String },
     #[error(
@@ -150,13 +295,18 @@ pub fn validate_name(name: &str) -> Result<(), StackError> {
     Ok(())
 }
 
-/// All stacks under `<root>/stacks`, sorted by name (byte order). A missing
+/// All stacks under `layout`'s root in the repository at `root`, sorted by name (byte order). A missing
 /// `stacks/` directory means no stacks.
-pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
-    let dir = root.join(STACKS_DIR);
+pub fn discover(root: &Path, layout: &Layout) -> Result<Vec<Stack>, StackError> {
+    let dir = layout.dir(root);
     let is_link = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
-    if is_link(&dir) {
-        return Err(StackError::Symlink { path: dir });
+    // The root and every directory on the way to it (`.` has none).
+    let mut on_the_way = root.to_owned();
+    for part in layout.below_root_parts() {
+        on_the_way.push(part);
+        if is_link(&on_the_way) {
+            return Err(StackError::Symlink { path: on_the_way });
+        }
     }
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -204,6 +354,7 @@ pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
             dir: path,
             compose_file,
             ignored: ignored.to_vec(),
+            prefix: layout.stack_prefix(name),
         });
     }
     stacks.sort_by(|a, b| a.name.cmp(&b.name));
@@ -234,9 +385,9 @@ pub fn check_case_collisions<'a>(
 /// The stack called `name`. The name is validated before touching the
 /// filesystem, so `../x` never becomes a path. Runs a full [`discover`], so
 /// a broken sibling stack is reported here too.
-pub fn find(root: &Path, name: &str) -> Result<Stack, StackError> {
+pub fn find(root: &Path, layout: &Layout, name: &str) -> Result<Stack, StackError> {
     validate_name(name)?;
-    let stacks = discover(root)?;
+    let stacks = discover(root, layout)?;
     let known = stacks
         .iter()
         .map(|s| s.name.as_str())
@@ -271,7 +422,7 @@ mod tests {
     }
 
     fn names(root: &Path) -> Vec<String> {
-        discover(root)
+        discover(root, &Layout::default())
             .unwrap()
             .into_iter()
             .map(|s| s.name)
@@ -281,16 +432,16 @@ mod tests {
     #[test]
     fn missing_or_empty_stacks_dir() {
         let r = root();
-        assert!(discover(r.path()).unwrap().is_empty());
+        assert!(discover(r.path(), &Layout::default()).unwrap().is_empty());
         fs::create_dir(r.path().join(STACKS_DIR)).unwrap();
-        assert!(discover(r.path()).unwrap().is_empty());
+        assert!(discover(r.path(), &Layout::default()).unwrap().is_empty());
     }
 
     #[test]
     fn stacks_not_a_directory() {
         let r = root();
         fs::write(r.path().join(STACKS_DIR), "").unwrap();
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::Io { path, .. } if path == &r.path().join(STACKS_DIR)),
             "{err:?}"
@@ -314,7 +465,7 @@ mod tests {
         // Invalid names are fine as long as they aren't stacks.
         fs::create_dir_all(s.join("not a stack")).unwrap();
 
-        let stacks = discover(r.path()).unwrap();
+        let stacks = discover(r.path(), &Layout::default()).unwrap();
         let got: Vec<&str> = stacks.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(got, ["Zed", "a.b_c-1", "db", "web"]);
         assert_eq!(
@@ -325,6 +476,7 @@ mod tests {
                 compose: s.join("db").join(COMPOSE_FILES[0]),
                 compose_file: COMPOSE_FILES[0],
                 ignored: vec![],
+                prefix: "stacks/db/".into(),
             }
         );
     }
@@ -338,7 +490,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(file), "").unwrap();
         }
-        let stacks = discover(r.path()).unwrap();
+        let stacks = discover(r.path(), &Layout::default()).unwrap();
         assert_eq!(stacks.len(), COMPOSE_FILES.len());
         for (st, file) in stacks.iter().zip(COMPOSE_FILES) {
             assert_eq!(st.compose_file, file);
@@ -356,7 +508,7 @@ mod tests {
         for file in ["docker-compose.yml", "compose.yml", "docker-compose.yaml"] {
             fs::write(dir.join(file), "").unwrap();
         }
-        let s = &discover(r.path()).unwrap()[0];
+        let s = &discover(r.path(), &Layout::default()).unwrap()[0];
         assert_eq!(s.compose_file, "compose.yml");
         assert_eq!(s.ignored, ["docker-compose.yaml", "docker-compose.yml"]);
     }
@@ -368,7 +520,7 @@ mod tests {
         add_stack(r.path(), "web");
         let link = r.path().join("stacks/web/docker-compose.yml");
         std::os::unix::fs::symlink("compose.yaml", &link).unwrap();
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::Symlink { path } if path == &link),
             "{err:?}"
@@ -383,20 +535,26 @@ mod tests {
                 .map(|n| (format!("stacks/web/{n}"), ()))
                 .collect()
         };
-        assert_eq!(compose_in("web", &files(&["a.conf"])), None);
+        assert_eq!(
+            compose_in(&Layout::default(), "web", &files(&["a.conf"])),
+            None
+        );
         let both = files(&["docker-compose.yml", "compose.yml"]);
         assert_eq!(
-            compose_in("web", &both).as_deref(),
+            compose_in(&Layout::default(), "web", &both).as_deref(),
             Some("stacks/web/compose.yml")
         );
         assert_eq!(
-            compose_files_in("web", &both),
+            compose_files_in(&Layout::default(), "web", &both),
             ["stacks/web/compose.yml", "stacks/web/docker-compose.yml"]
         );
         // Only directly in the stack directory, and only this stack's.
-        assert_eq!(compose_in("web", &files(&["sub/compose.yaml"])), None);
+        assert_eq!(
+            compose_in(&Layout::default(), "web", &files(&["sub/compose.yaml"])),
+            None
+        );
         let other = vec![("stacks/db/compose.yaml".to_owned(), ())];
-        assert_eq!(compose_in("web", &other), None);
+        assert_eq!(compose_in(&Layout::default(), "web", &other), None);
     }
 
     #[cfg(unix)]
@@ -419,7 +577,7 @@ mod tests {
             add_stack(r.path(), "plain");
             let link = r.path().join("stacks/linked");
             symlink(&target, &link).unwrap();
-            let err = discover(r.path()).unwrap_err();
+            let err = discover(r.path(), &Layout::default()).unwrap_err();
             assert!(
                 matches!(&err, StackError::Symlink { path } if path == &link),
                 "{target:?}: {err:?}"
@@ -453,7 +611,7 @@ mod tests {
                 target
             };
             symlink(&target, dir.join(COMPOSE_FILES[0])).unwrap();
-            let err = discover(r.path()).unwrap_err();
+            let err = discover(r.path(), &Layout::default()).unwrap_err();
             assert!(
                 matches!(&err, StackError::Symlink { path } if path == &dir.join(COMPOSE_FILES[0])),
                 "{err:?}"
@@ -463,7 +621,7 @@ mod tests {
         // A symlinked stacks/ directory.
         let r = root();
         symlink(elsewhere.path(), r.path().join(STACKS_DIR)).unwrap();
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::Symlink { path } if path == &r.path().join(STACKS_DIR)),
             "{err:?}"
@@ -475,7 +633,7 @@ mod tests {
         let r = root();
         let compose = r.path().join("stacks/web").join(COMPOSE_FILES[0]);
         fs::create_dir_all(&compose).unwrap();
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::ComposeNotAFile { path } if path == &compose),
             "{err:?}"
@@ -488,7 +646,7 @@ mod tests {
         for name in ["has space", "ünï", "a:b", "a+b"] {
             let r = root();
             add_stack(r.path(), name);
-            let err = discover(r.path()).unwrap_err();
+            let err = discover(r.path(), &Layout::default()).unwrap_err();
             assert!(
                 matches!(&err, StackError::InvalidName { name: n } if n == name),
                 "{err:?}"
@@ -518,7 +676,7 @@ mod tests {
         let bad = s.join(OsStr::from_bytes(b"bad\xff"));
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join(COMPOSE_FILES[0]), "").unwrap();
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::NonUtf8Name { path } if path == &bad),
             "{err:?}"
@@ -531,7 +689,7 @@ mod tests {
         for name in ["shared", "Shared", "SHARED", "meta", "Meta"] {
             let r = root();
             add_stack(r.path(), name);
-            let err = discover(r.path()).unwrap_err();
+            let err = discover(r.path(), &Layout::default()).unwrap_err();
             assert!(
                 matches!(&err, StackError::Reserved { name: n } if n == name),
                 "{err:?}"
@@ -552,7 +710,7 @@ mod tests {
         for name in ["App", "middle", "app"] {
             add_stack(r.path(), name);
         }
-        let err = discover(r.path()).unwrap_err();
+        let err = discover(r.path(), &Layout::default()).unwrap_err();
         assert!(
             matches!(&err, StackError::CaseCollision { first, second }
                 if first == "App" && second == "app"),
@@ -586,7 +744,7 @@ mod tests {
     #[test]
     fn find_stacks() {
         let r = root();
-        let err = find(r.path(), "web").unwrap_err();
+        let err = find(r.path(), &Layout::default(), "web").unwrap_err();
         assert!(
             matches!(&err, StackError::Unknown { name, known } if name == "web" && known == "none"),
             "{err:?}"
@@ -594,18 +752,18 @@ mod tests {
 
         add_stack(r.path(), "web");
         add_stack(r.path(), "db");
-        let web = find(r.path(), "web").unwrap();
+        let web = find(r.path(), &Layout::default(), "web").unwrap();
         assert_eq!(web.name, "web");
         assert_eq!(web.compose, r.path().join("stacks/web/compose.yaml"));
 
-        let err = find(r.path(), "nope").unwrap_err();
+        let err = find(r.path(), &Layout::default(), "nope").unwrap_err();
         assert_eq!(
             err.to_string(),
             "unknown stack \"nope\" (known stacks: db, web)"
         );
         // Exact match only.
         assert!(matches!(
-            find(r.path(), "Web").unwrap_err(),
+            find(r.path(), &Layout::default(), "Web").unwrap_err(),
             StackError::Unknown { .. }
         ));
     }
@@ -616,19 +774,109 @@ mod tests {
         add_stack(r.path(), "web");
         // Would resolve to stacks/../stacks/web if used as a path.
         assert!(matches!(
-            find(r.path(), "../stacks/web").unwrap_err(),
+            find(r.path(), &Layout::default(), "../stacks/web").unwrap_err(),
             StackError::InvalidName { .. }
         ));
         assert!(matches!(
-            find(r.path(), "shared").unwrap_err(),
+            find(r.path(), &Layout::default(), "shared").unwrap_err(),
             StackError::Reserved { .. }
         ));
         // And discovery errors propagate.
         fs::create_dir_all(r.path().join("stacks/meta")).unwrap();
         fs::write(r.path().join("stacks/meta").join(COMPOSE_FILES[0]), "").unwrap();
         assert!(matches!(
-            find(r.path(), "web").unwrap_err(),
+            find(r.path(), &Layout::default(), "web").unwrap_err(),
             StackError::Reserved { .. }
         ));
+    }
+
+    #[test]
+    fn layout_rules() {
+        for ok in [".", "stacks", "apps", "a/b-c/d_e.f", "x.y"] {
+            assert_eq!(Layout::new(ok).unwrap().root(), ok);
+        }
+        for (bad, why) in [
+            ("", "empty"),
+            ("/abs", "relative"),
+            ("a//b", "empty component"),
+            ("a/", "empty component"),
+            ("./a", "start with `.`"),
+            ("a/..", "start with `.`"),
+            ("..", "start with `.`"),
+            (".sec", "start with `.`"),
+            ("a/.git", "start with `.`"),
+            ("a b", "use only"),
+            ("a\\b", "use only"),
+            ("ü", "use only"),
+        ] {
+            let err = Layout::new(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+        assert!(Layout::default().is_default());
+        assert!(!Layout::new(".").unwrap().is_default());
+    }
+
+    #[test]
+    fn layout_paths() {
+        let nested = Layout::new("a/b").unwrap();
+        let flat = Layout::new(".").unwrap();
+        assert_eq!(nested.stack_prefix("web"), "a/b/web/");
+        assert_eq!(flat.stack_prefix("web"), "web/");
+        assert_eq!(nested.stack_dir("web"), Path::new("a/b/web"));
+        assert_eq!(flat.stack_dir("web"), Path::new("web"));
+        assert_eq!(
+            nested.split("a/b/web/compose.yaml"),
+            Some(("web", "compose.yaml"))
+        );
+        assert_eq!(nested.split("a/bweb/compose.yaml"), None);
+        assert_eq!(nested.split("a/b/web"), None);
+        assert_eq!(nested.split("a/b/.x/compose.yaml"), None);
+        assert_eq!(flat.split("web/conf/x"), Some(("web", "conf/x")));
+        assert_eq!(flat.split("README.md"), None);
+        for p in ["a", "a/b", "a/b/web"] {
+            assert!(nested.is_structural(p), "{p}");
+        }
+        for p in ["a/c", "a/b/web/x", "a/b/.x", "ab", "b"] {
+            assert!(!nested.is_structural(p), "{p}");
+        }
+        assert!(flat.is_structural("web"));
+        assert!(!flat.is_structural(".git"));
+        assert!(!flat.is_structural("web/compose.yaml"));
+    }
+
+    #[test]
+    fn discover_in_other_layouts() {
+        let r = root();
+        let write = |rel: &str| {
+            let p = r.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "").unwrap();
+        };
+        write("apps/web/docker-compose.yml");
+        write("db/compose.yaml");
+        write(".sec/meta.toml");
+        write("README.md");
+        let apps = discover(r.path(), &Layout::new("apps").unwrap()).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].compose_rel(), "apps/web/docker-compose.yml");
+        let flat = discover(r.path(), &Layout::new(".").unwrap()).unwrap();
+        let rels: Vec<String> = flat.iter().map(Stack::compose_rel).collect();
+        assert_eq!(rels, ["db/compose.yaml"]);
+        assert!(discover(r.path(), &Layout::default()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_of_the_root_is_an_error() {
+        let r = root();
+        let real = r.path().join("real/b/web");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("compose.yaml"), "").unwrap();
+        std::os::unix::fs::symlink("real", r.path().join("a")).unwrap();
+        let err = discover(r.path(), &Layout::new("a/b").unwrap()).unwrap_err();
+        assert!(
+            matches!(&err, StackError::Symlink { path } if path == &r.path().join("a")),
+            "{err:?}"
+        );
     }
 }

@@ -73,7 +73,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::SecretString;
 use crate::scan::Uses;
-use crate::stack::STACKS_DIR;
+use crate::stack::{COMPOSE_FILES, Layout};
 use crate::store::{self, META, SHARED, StackFile};
 use crate::xdeploy::{self, HASH_LABEL};
 
@@ -88,7 +88,7 @@ const SEC_DIR: &str = ".sec";
 pub enum DeployError {
     #[error(
         "stack name {stack:?} is not a valid docker compose project name (only a-z, 0-9, `_` \
-         and `-`, starting with a letter or digit); rename the directory stacks/{stack}"
+         and `-`, starting with a letter or digit); rename the stack's directory"
     )]
     InvalidProjectName { stack: String },
     #[error("could not run docker (is it installed and on PATH?)")]
@@ -188,34 +188,30 @@ pub fn compose_args(stack: &str, stack_dir_rel: &Path) -> Vec<OsString> {
     args
 }
 
-/// `stacks/<stack>`, relative to the repository root.
-fn stack_dir_rel(stack: &str) -> PathBuf {
-    Path::new(STACKS_DIR).join(stack)
-}
-
 /// Deploys `stack`: runs `docker compose … up` (see the module docs) in
 /// `root` with `rendered` (the stack's rendered `compose.yaml`) on stdin,
 /// and waits for it.
 ///
 /// A non-zero exit is `Compose`; docker not being runnable at all is
 /// `Spawn`. Compose's output goes to lst's stderr as it is produced.
-pub fn run_compose(root: &Path, stack: &str, rendered: &SecretString) -> Result<(), DeployError> {
-    run_compose_with(OsStr::new(DOCKER), root, stack, rendered)
+pub fn run_compose(
+    root: &Path,
+    stack: &str,
+    project_dir: &Path,
+    rendered: &SecretString,
+) -> Result<(), DeployError> {
+    run_compose_with(OsStr::new(DOCKER), root, stack, project_dir, rendered)
 }
 
 fn run_compose_with(
     program: &OsStr,
     root: &Path,
     stack: &str,
+    project_dir: &Path,
     rendered: &SecretString,
 ) -> Result<(), DeployError> {
     validate_project_name(stack)?;
-    let (status, written) = run_piped(
-        program,
-        compose_args(stack, &stack_dir_rel(stack)),
-        root,
-        rendered,
-    )?;
+    let (status, written) = run_piped(program, compose_args(stack, project_dir), root, rendered)?;
     if !status.success() {
         return Err(DeployError::Compose {
             stack: stack.to_owned(),
@@ -377,6 +373,7 @@ pub fn validate_service_name(stack: &str, service: &str) -> Result<(), DeployErr
 pub fn step_args(
     phase: Phase,
     stack: &str,
+    project_dir: &Path,
     service: &str,
     command: &StepCommand,
 ) -> Zeroizing<Vec<String>> {
@@ -385,7 +382,9 @@ pub fn step_args(
     for a in ["compose", "-p", stack, "--project-directory"] {
         push(a);
     }
-    push(&format!("{STACKS_DIR}/{stack}"));
+    // Lossless: stack names and stacks roots are ASCII (`Layout::new`,
+    // `stack::validate_name`).
+    push(&project_dir.to_string_lossy());
     push("-f");
     push("-");
     let sub: &[&str] = match phase {
@@ -421,6 +420,7 @@ pub fn step_args(
 pub fn run_pre(
     root: &Path,
     stack: &str,
+    project_dir: &Path,
     compose: &SecretString,
     index: usize,
     service: &str,
@@ -431,7 +431,15 @@ pub fn run_pre(
         index,
         service,
     };
-    run_step_with(OsStr::new(DOCKER), root, stack, compose, step, command)
+    run_step_with(
+        OsStr::new(DOCKER),
+        root,
+        stack,
+        project_dir,
+        compose,
+        step,
+        command,
+    )
 }
 
 /// Runs step `index` of the `post` list in the running container of
@@ -439,6 +447,7 @@ pub fn run_pre(
 pub fn run_post(
     root: &Path,
     stack: &str,
+    project_dir: &Path,
     compose: &SecretString,
     index: usize,
     service: &str,
@@ -449,7 +458,15 @@ pub fn run_post(
         index,
         service,
     };
-    run_step_with(OsStr::new(DOCKER), root, stack, compose, step, command)
+    run_step_with(
+        OsStr::new(DOCKER),
+        root,
+        stack,
+        project_dir,
+        compose,
+        step,
+        command,
+    )
 }
 
 /// Which step is running, for its arguments and errors.
@@ -464,13 +481,14 @@ fn run_step_with(
     program: &OsStr,
     root: &Path,
     stack: &str,
+    project_dir: &Path,
     compose: &SecretString,
     step: StepRef<'_>,
     command: &StepCommand,
 ) -> Result<(), DeployError> {
     validate_project_name(stack)?;
     validate_service_name(stack, step.service)?;
-    let args = step_args(step.phase, stack, step.service, command);
+    let args = step_args(step.phase, stack, project_dir, step.service, command);
     let (status, written) = run_piped(program, args.iter(), root, compose)?;
     if !status.success() {
         return Err(DeployError::Step {
@@ -826,7 +844,7 @@ fn replace(
 pub struct Affected {
     /// Affected stacks that exist now (are in `existing`): deploy these.
     pub deploy: BTreeSet<String>,
-    /// Affected stacks that have no `compose.yaml` now: reported, not
+    /// Affected stacks that have no compose file now: reported, not
     /// deployed and not torn down (no teardown: decided for M5).
     pub deleted: BTreeSet<String>,
     /// Changed paths under `stacks/<name>/` or of the form
@@ -860,23 +878,28 @@ fn stack_class(name: &str) -> PathClass<'_> {
     }
 }
 
-fn classify(path: &str) -> PathClass<'_> {
-    if let Some(rest) = path
-        .strip_prefix(STACKS_DIR)
-        .and_then(|r| r.strip_prefix('/'))
-    {
-        return match rest.split_once('/') {
-            // A file directly in stacks/ (or a bare `stacks/<s>/`) is no
-            // stack's file.
-            Some((name, inner)) if !inner.is_empty() => stack_class(name),
-            _ => PathClass::Other,
-        };
-    }
+fn classify<'a>(layout: &Layout, path: &'a str) -> PathClass<'a> {
+    // `.sec/` first: with the stacks root `.`, it is also "below the root".
     if let Some(file) = path.strip_prefix(SEC_DIR).and_then(|r| r.strip_prefix('/')) {
         return match file.strip_suffix(".toml") {
             Some(SHARED) => PathClass::Shared,
             Some(META) => PathClass::Meta,
             Some(name) if !name.contains('/') => stack_class(name),
+            _ => PathClass::Other,
+        };
+    }
+    if let Some(rest) = layout.below(path) {
+        return match rest.split_once('/') {
+            // A file directly in the root (or a bare `<root>/<s>/`) is no
+            // stack's file, and dot-directories are never stacks.
+            Some((name, inner)) if !inner.is_empty() && !name.starts_with('.') => {
+                match stack_class(name) {
+                    // In a flat layout most top-level directories are not
+                    // stacks; an odd name there is just another directory.
+                    PathClass::Invalid if layout.is_flat() => PathClass::Other,
+                    class => class,
+                }
+            }
             _ => PathClass::Other,
         };
     }
@@ -942,6 +965,7 @@ fn users_of(keys: &BTreeSet<&str>, uses: &Uses) -> Vec<String> {
 /// never had a `compose.yaml`: from the paths alone lst can't tell it from
 /// a deleted stack.
 pub fn affected_stacks(
+    layout: &Layout,
     changed: &[String],
     shared_before: &StackFile,
     shared_after: &StackFile,
@@ -950,8 +974,16 @@ pub fn affected_stacks(
 ) -> Affected {
     let mut out = Affected::default();
     let mut stacks = BTreeSet::new();
+    // Stacks one of whose compose files changed (was deleted, if the stack
+    // is gone).
+    let mut compose_changed = BTreeSet::new();
     for path in changed {
-        match classify(path) {
+        if let Some((dir, rest)) = layout.split(path) {
+            if COMPOSE_FILES.contains(&rest) {
+                compose_changed.insert(dir);
+            }
+        }
+        match classify(layout, path) {
             PathClass::Stack(s) => {
                 stacks.insert(s.to_owned());
             }
@@ -969,7 +1001,10 @@ pub fn affected_stacks(
     for s in stacks {
         if existing.contains(&s) {
             out.deploy.insert(s);
-        } else {
+        } else if !layout.is_flat() || compose_changed.contains(s.as_str()) {
+            // In a flat layout a missing top-level directory is usually not
+            // a stack (docs/, scripts/): only one that lost a compose file
+            // is reported.
             out.deleted.insert(s);
         }
     }
@@ -1012,13 +1047,13 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "stack name \"My.App\" is not a valid docker compose project name (only a-z, 0-9, \
-             `_` and `-`, starting with a letter or digit); rename the directory stacks/My.App"
+             `_` and `-`, starting with a letter or digit); rename the stack's directory"
         );
     }
 
     #[test]
     fn exact_compose_args() {
-        let args = compose_args("web", &stack_dir_rel("web"));
+        let args = compose_args("web", &Layout::default().stack_dir("web"));
         assert_eq!(
             args,
             [
@@ -1069,7 +1104,13 @@ mod tests {
     fn invalid_name_is_refused_before_running_anything() {
         let dir = tempfile::tempdir().unwrap();
         // Through the public entry point: never reaches a real docker.
-        let err = run_compose(dir.path(), "Web", &SecretString::new(payload(1))).unwrap_err();
+        let err = run_compose(
+            dir.path(),
+            "Web",
+            &Layout::default().stack_dir("Web"),
+            &SecretString::new(payload(1)),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, DeployError::InvalidProjectName { .. }),
             "{err:?}"
@@ -1080,6 +1121,7 @@ mod tests {
             missing.as_os_str(),
             dir.path(),
             "-p",
+            &Layout::default().stack_dir("-p"),
             &SecretString::default(),
         )
         .unwrap_err();
@@ -1097,6 +1139,7 @@ mod tests {
             missing.as_os_str(),
             dir.path(),
             "web",
+            &Layout::default().stack_dir("web"),
             &SecretString::default(),
         )
         .unwrap_err();
@@ -1114,6 +1157,7 @@ mod tests {
             OsStr::new("true"),
             &dir.path().join("gone"),
             "web",
+            &Layout::default().stack_dir("web"),
             &SecretString::default(),
         )
         .unwrap_err();
@@ -1127,8 +1171,14 @@ mod tests {
         // the broken pipe).
         for rendered in [payload(1), payload(LARGE)] {
             let rendered = SecretString::new(rendered);
-            let err =
-                run_compose_with(OsStr::new("false"), dir.path(), "web", &rendered).unwrap_err();
+            let err = run_compose_with(
+                OsStr::new("false"),
+                dir.path(),
+                "web",
+                &Layout::default().stack_dir("web"),
+                &rendered,
+            )
+            .unwrap_err();
             assert!(
                 matches!(&err, DeployError::Compose { stack, status }
                     if stack == "web" && status.code() == Some(1)),
@@ -1147,10 +1197,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = OsStr::new("true");
         // Nothing to send: fine.
-        run_compose_with(t, dir.path(), "web", &SecretString::default()).unwrap();
+        run_compose_with(
+            t,
+            dir.path(),
+            "web",
+            &Layout::default().stack_dir("web"),
+            &SecretString::default(),
+        )
+        .unwrap();
         // `true` exits 0 without reading: compose never saw the file.
-        let err =
-            run_compose_with(t, dir.path(), "web", &SecretString::new(payload(LARGE))).unwrap_err();
+        let err = run_compose_with(
+            t,
+            dir.path(),
+            "web",
+            &Layout::default().stack_dir("web"),
+            &SecretString::new(payload(LARGE)),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, DeployError::Stdin { stack, source }
                 if stack == "web" && source.kind() == io::ErrorKind::BrokenPipe),
@@ -1189,7 +1252,13 @@ mod tests {
         let repeat: usize = env::var(CHILD_REPEAT).unwrap().parse().unwrap();
         let rendered = SecretString::new(payload(repeat));
         let fake = fixture("fake-docker");
-        let result = run_compose_with(fake.as_os_str(), Path::new(&root), &stack, &rendered);
+        let result = run_compose_with(
+            fake.as_os_str(),
+            Path::new(&root),
+            &stack,
+            &Layout::default().stack_dir(&stack),
+            &rendered,
+        );
         let expect = env::var(CHILD_EXPECT).unwrap();
         match expect.strip_prefix("exit:") {
             None => result.unwrap(),
@@ -1390,7 +1459,14 @@ mod tests {
     }
 
     fn args_of(phase: Phase, stack: &str, service: &str, command: &StepCommand) -> Vec<String> {
-        step_args(phase, stack, service, command).to_vec()
+        step_args(
+            phase,
+            stack,
+            &Layout::default().stack_dir(stack),
+            service,
+            command,
+        )
+        .to_vec()
     }
 
     #[test]
@@ -1589,12 +1665,30 @@ mod tests {
         let cmd = shell("true");
         // Through the public entry points: never reaches a real docker.
         for run in [run_pre, run_post] {
-            let err = run(dir.path(), "Web", &c, 0, "svc", &cmd).unwrap_err();
+            let err = run(
+                dir.path(),
+                "Web",
+                &Layout::default().stack_dir("Web"),
+                &c,
+                0,
+                "svc",
+                &cmd,
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, DeployError::InvalidProjectName { .. }),
                 "{err:?}"
             );
-            let err = run(dir.path(), "web", &c, 0, "a b", &cmd).unwrap_err();
+            let err = run(
+                dir.path(),
+                "web",
+                &Layout::default().stack_dir("web"),
+                &c,
+                0,
+                "a b",
+                &cmd,
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, DeployError::InvalidServiceName { .. }),
                 "{err:?}"
@@ -1621,6 +1715,7 @@ mod tests {
                 missing.as_os_str(),
                 dir.path(),
                 "web",
+                &Layout::default().stack_dir("web"),
                 &secret(""),
                 step(phase, 0, "svc"),
                 &shell("true"),
@@ -1649,6 +1744,7 @@ mod tests {
                 OsStr::new("false"),
                 dir.path(),
                 "web",
+                &Layout::default().stack_dir("web"),
                 &SecretString::new(rendered),
                 step(phase, index, "db"),
                 &shell("echo PW-in-command"),
@@ -1667,6 +1763,7 @@ mod tests {
             OsStr::new("false"),
             dir.path(),
             "web",
+            &Layout::default().stack_dir("web"),
             &secret(""),
             step(Phase::Pre, 3, "mosquitto"),
             &exec(&["x"]),
@@ -1683,9 +1780,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = OsStr::new("true");
         let s = step(Phase::Post, 0, "svc");
-        run_step_with(t, dir.path(), "web", &secret(""), s, &shell("x")).unwrap();
+        run_step_with(
+            t,
+            dir.path(),
+            "web",
+            &Layout::default().stack_dir("web"),
+            &secret(""),
+            s,
+            &shell("x"),
+        )
+        .unwrap();
         let big = SecretString::new(payload(LARGE));
-        let err = run_step_with(t, dir.path(), "web", &big, s, &shell("x")).unwrap_err();
+        let err = run_step_with(
+            t,
+            dir.path(),
+            "web",
+            &Layout::default().stack_dir("web"),
+            &big,
+            s,
+            &shell("x"),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, DeployError::Stdin { stack, source }
                 if stack == "web" && source.kind() == io::ErrorKind::BrokenPipe),
@@ -1815,7 +1930,15 @@ mod tests {
         };
         let compose = SecretString::new(payload(repeat));
         let s = step(phase, index, &service);
-        let result = run_step_with(program, &root, &stack, &compose, s, &command);
+        let result = run_step_with(
+            program,
+            &root,
+            &stack,
+            &Layout::default().stack_dir(&stack),
+            &compose,
+            s,
+            &command,
+        );
         match expect.strip_prefix("step:") {
             None => result.unwrap(),
             Some(code) => {
@@ -2639,7 +2762,14 @@ mod tests {
     }
 
     fn affected(changed: &[&str], before: &StackFile, after: &StackFile) -> Affected {
-        affected_stacks(&paths(changed), before, after, &uses(), &existing())
+        affected_stacks(
+            &Layout::default(),
+            &paths(changed),
+            before,
+            after,
+            &uses(),
+            &existing(),
+        )
     }
 
     fn deploys(changed: &[&str]) -> BTreeSet<String> {
@@ -2700,7 +2830,6 @@ mod tests {
     fn invalid_stack_names_are_ignored_and_listed() {
         let changed = [
             "stacks/Bad Name/compose.yaml",
-            "stacks/.hidden/x",
             "stacks/shared/compose.yaml",
             "stacks/META/compose.yaml",
             "stacks/ünï/compose.yaml",
@@ -2712,7 +2841,45 @@ mod tests {
         let a = affected(&changed, &shared_base(), &shared_base());
         assert_eq!(a.deploy, set(&["web"]));
         assert!(a.deleted.is_empty());
-        assert_eq!(a.ignored, set(&changed[..8]));
+        assert_eq!(a.ignored, set(&changed[..7]));
+        // Dot-directories are never stacks (as in discovery): not listed.
+        let a = affected(&["stacks/.hidden/x"], &shared_base(), &shared_base());
+        assert_eq!(a, Affected::default());
+    }
+
+    #[test]
+    fn changed_since_in_other_layouts() {
+        let existing: BTreeSet<String> = ["web".to_owned()].into();
+        let uses = Uses::new();
+        let run = |layout: &str, changed: &[&str]| {
+            let changed: Vec<String> = changed.iter().map(|p| (*p).to_owned()).collect();
+            let layout = Layout::new(layout).unwrap();
+            let base = shared_base();
+            affected_stacks(&layout, &changed, &base, &base, &uses, &existing)
+        };
+        let a = run(
+            "apps",
+            &["apps/web/x", "apps/gone/compose.yml", "stacks/web/x"],
+        );
+        assert_eq!(a.deploy, set(&["web"]));
+        assert_eq!(a.deleted, set(&["gone"]));
+        // Flat: top-level directories that never were stacks are quiet; one
+        // that lost its compose file is reported; .sec/ is still .sec/.
+        let a = run(
+            ".",
+            &[
+                "web/compose.yaml",
+                "docs/index.md",
+                "My Notes/x",
+                ".github/ci.yml",
+                "README.md",
+                "gone/docker-compose.yml",
+                ".sec/meta.toml",
+            ],
+        );
+        assert_eq!(a.deploy, set(&["web"]));
+        assert_eq!(a.deleted, set(&["gone"]));
+        assert!(a.ignored.is_empty(), "{:?}", a.ignored);
     }
 
     #[test]
@@ -2722,6 +2889,7 @@ mod tests {
         let mut ex = existing();
         ex.insert("My.App".into());
         let a = affected_stacks(
+            &Layout::default(),
             &paths(&["stacks/My.App/compose.yaml"]),
             &shared_base(),
             &shared_base(),
@@ -2753,6 +2921,7 @@ mod tests {
     fn meta_affects_every_existing_stack() {
         assert_eq!(deploys(&[".sec/meta.toml"]), existing());
         let a = affected_stacks(
+            &Layout::default(),
             &paths(&[".sec/meta.toml", "stacks/old/compose.yaml"]),
             &shared_base(),
             &shared_base(),
@@ -2763,6 +2932,7 @@ mod tests {
         assert_eq!(a.deleted, set(&["old"]));
         // No stacks at all.
         let a = affected_stacks(
+            &Layout::default(),
             &paths(&[".sec/meta.toml"]),
             &shared_base(),
             &shared_base(),
@@ -2898,6 +3068,7 @@ mod tests {
         let mut after = shared_base();
         after.secrets.remove("smtp");
         let a = affected_stacks(
+            &Layout::default(),
             &paths(&[".sec/shared.toml"]),
             &shared_base(),
             &after,
@@ -2909,12 +3080,27 @@ mod tests {
 
     #[test]
     fn classify_paths() {
-        assert_eq!(classify("stacks/web/compose.yaml"), PathClass::Stack("web"));
-        assert_eq!(classify(".sec/web.toml"), PathClass::Stack("web"));
-        assert_eq!(classify(".sec/shared.toml"), PathClass::Shared);
-        assert_eq!(classify(".sec/meta.toml"), PathClass::Meta);
-        assert_eq!(classify("stacks/shared/x"), PathClass::Invalid);
-        assert_eq!(classify("stacks/web"), PathClass::Other);
-        assert_eq!(classify("README"), PathClass::Other);
+        assert_eq!(
+            classify(&Layout::default(), "stacks/web/compose.yaml"),
+            PathClass::Stack("web")
+        );
+        assert_eq!(
+            classify(&Layout::default(), ".sec/web.toml"),
+            PathClass::Stack("web")
+        );
+        assert_eq!(
+            classify(&Layout::default(), ".sec/shared.toml"),
+            PathClass::Shared
+        );
+        assert_eq!(
+            classify(&Layout::default(), ".sec/meta.toml"),
+            PathClass::Meta
+        );
+        assert_eq!(
+            classify(&Layout::default(), "stacks/shared/x"),
+            PathClass::Invalid
+        );
+        assert_eq!(classify(&Layout::default(), "stacks/web"), PathClass::Other);
+        assert_eq!(classify(&Layout::default(), "README"), PathClass::Other);
     }
 }

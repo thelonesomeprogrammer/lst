@@ -411,13 +411,14 @@ services:
     let argv = |v: &[&str]| StepCommand::from_argv(v.iter().map(|a| s(a)).collect()).unwrap();
     let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
     let r = root.path();
+    let pdir = lst::stack::Layout::default().stack_dir(&project);
 
     // Nothing is up yet: no container, no hash.
     assert_eq!(deploy::existing_hash(r, &project, "app").unwrap(), None);
 
     // pre, shell form, with the volume of the service.
     let cmd = StepCommand::Shell(s("printf '%s' 'pw ü€' > /out/shell"));
-    deploy::run_pre(r, &project, &compose, 0, "app", &cmd).unwrap();
+    deploy::run_pre(r, &project, &pdir, &compose, 0, "app", &cmd).unwrap();
     assert_eq!(read("shell"), "pw ü€");
     // pre, exec form, arguments starting with `-` passed through.
     let cmd = argv(&[
@@ -429,16 +430,16 @@ services:
         "--rm",
         "",
     ]);
-    deploy::run_pre(r, &project, &compose, 1, "app", &cmd).unwrap();
+    deploy::run_pre(r, &project, &pdir, &compose, 1, "app", &cmd).unwrap();
     assert_eq!(read("exec"), "-d|--rm||");
     // pre, a shell string starting with `+`: `sh -c --` keeps busybox from
     // reading it as options (`+e` is then just a command that isn't found).
     let cmd = StepCommand::Shell(s("+e; printf ok > /out/plus"));
-    deploy::run_pre(r, &project, &compose, 2, "app", &cmd).unwrap();
+    deploy::run_pre(r, &project, &pdir, &compose, 2, "app", &cmd).unwrap();
     assert_eq!(read("plus"), "ok");
     // A failing pre step.
     let fail = StepCommand::Shell(s("exit 3"));
-    let err = deploy::run_pre(r, &project, &compose, 3, "app", &fail).unwrap_err();
+    let err = deploy::run_pre(r, &project, &pdir, &compose, 3, "app", &fail).unwrap_err();
     assert!(
         matches!(&err, DeployError::Step { phase: Phase::Pre, index: 3, status, .. }
             if status.code() == Some(3)),
@@ -447,7 +448,7 @@ services:
     // `run --rm` containers are gone, and never count as the service's.
     assert_eq!(deploy::existing_hash(r, &project, "app").unwrap(), None);
 
-    deploy::run_compose(r, &project, &compose).unwrap();
+    deploy::run_compose(r, &project, &pdir, &compose).unwrap();
     assert_eq!(
         deploy::existing_hash(r, &project, "app")
             .unwrap()
@@ -459,10 +460,10 @@ services:
 
     // post, in the running container.
     let cmd = argv(&["sh", "-c", "printf post > /out/post"]);
-    deploy::run_post(r, &project, &compose, 0, "app", &cmd).unwrap();
+    deploy::run_post(r, &project, &pdir, &compose, 0, "app", &cmd).unwrap();
     assert_eq!(read("post"), "post");
     let cmd = StepCommand::Shell(s("-x"));
-    let err = deploy::run_post(r, &project, &compose, 1, "plain", &cmd).unwrap_err();
+    let err = deploy::run_post(r, &project, &pdir, &compose, 1, "plain", &cmd).unwrap_err();
     // `-x` ran as a command (not found: 127), not as a shell option.
     assert!(
         matches!(&err, DeployError::Step { phase: Phase::Post, index: 1, status, .. }

@@ -46,7 +46,7 @@ use crate::crypto::SecretString;
 use crate::git::IndexEntry;
 use crate::marker::{self, MarkerKind};
 use crate::scan::{self, ScanError, Uses};
-use crate::stack::{self, COMPOSE_FILES, STACKS_DIR, StackError};
+use crate::stack::{self, COMPOSE_FILES, Layout, StackError};
 use crate::store::{self, ResolveError, SHARED, StoreError, SyncReport};
 
 /// The hook script `lst hook install` writes (mode 0755). Not finding `lst`
@@ -80,8 +80,8 @@ pub enum HookError {
     )]
     Submodule { path: String },
     #[error(
-        "{path}: contains `<<set:` but is not a file of a stack (stacks/<stack>/ with a \
-         compose file), so lst would not process it and the value would be committed as \
+        "{path}: contains `<<set:` but is not a file of a stack (a directory in the stacks \
+         root with a compose file), so lst would not process it and the value would be committed as \
          plaintext. Move the marker into a stack file, or remove it"
     )]
     SetOutsideStacks { path: String },
@@ -138,26 +138,11 @@ pub enum Role {
     Skip,
 }
 
-/// The directory name of `path` if it is `stacks/<dir>/<compose file>`
+/// The directory name of `path` if it is `<root>/<dir>/<compose file>`
 /// (any of [`COMPOSE_FILES`]).
-fn compose_dir(path: &str) -> Option<&str> {
-    let (dir, rest) = path.strip_prefix("stacks/")?.split_once('/')?;
-    (COMPOSE_FILES.contains(&rest) && !dir.starts_with('.')).then_some(dir)
-}
-
-/// The first component below `stacks/`, if `path` is deeper than that.
-fn stack_dir(path: &str) -> Option<&str> {
-    path.strip_prefix("stacks/")?
-        .split_once('/')
-        .map(|(dir, _)| dir)
-}
-
-/// Whether `path` is `stacks` itself or a (non-dot) entry directly in it.
-fn is_stacks_entry(path: &str) -> bool {
-    path == STACKS_DIR
-        || path
-            .strip_prefix("stacks/")
-            .is_some_and(|rest| !rest.contains('/') && !rest.starts_with('.'))
+fn compose_dir<'a>(layout: &Layout, path: &'a str) -> Option<&'a str> {
+    let (dir, rest) = layout.split(path)?;
+    COMPOSE_FILES.contains(&rest).then_some(dir)
 }
 
 /// The error for a link where a stack's directory or compose file must be.
@@ -176,13 +161,13 @@ fn link_error(e: &IndexEntry) -> HookError {
 
 /// The role of every entry of the index, in the same order (see the
 /// module docs). Fails on a broken stack, like [`stack::discover`].
-pub fn classify(entries: &[IndexEntry]) -> Result<Vec<Role>, HookError> {
+pub fn classify(layout: &Layout, entries: &[IndexEntry]) -> Result<Vec<Role>, HookError> {
     let mut stacks = BTreeSet::new();
     for e in entries {
-        if is_stacks_entry(&e.path) && !e.is_file() {
+        if layout.is_structural(&e.path) && !e.is_file() {
             return Err(link_error(e));
         }
-        if let Some(dir) = compose_dir(&e.path) {
+        if let Some(dir) = compose_dir(layout, &e.path) {
             if !e.is_file() {
                 return Err(link_error(e));
             }
@@ -198,8 +183,8 @@ pub fn classify(entries: &[IndexEntry]) -> Result<Vec<Role>, HookError> {
         if let Some(rest) = e.path.strip_prefix(SEC_PREFIX) {
             return Role::Sec(rest.to_owned());
         }
-        match stack_dir(&e.path) {
-            Some(dir) if stacks.contains(dir) => Role::Stack(dir.to_owned()),
+        match layout.split(&e.path) {
+            Some((dir, _)) if stacks.contains(dir) => Role::Stack(dir.to_owned()),
             _ => Role::Other,
         }
     };
@@ -497,7 +482,7 @@ mod tests {
             entry("120000", "elsewhere"),
             file("stacksfoo/compose.yaml"),
         ];
-        let roles = classify(&entries).unwrap();
+        let roles = classify(&Layout::default(), &entries).unwrap();
         let stack = |s: &str| Role::Stack(s.into());
         assert_eq!(
             roles,
@@ -520,7 +505,7 @@ mod tests {
                 Role::Other,
             ]
         );
-        assert_eq!(classify(&[]).unwrap(), []);
+        assert_eq!(classify(&Layout::default(), &[]).unwrap(), []);
     }
 
     #[test]
@@ -529,30 +514,36 @@ mod tests {
             let entries = [file(&format!("stacks/web/{name}")), file("stacks/web/x")];
             let stack = Role::Stack("web".into());
             assert_eq!(
-                classify(&entries).unwrap(),
+                classify(&Layout::default(), &entries).unwrap(),
                 [stack.clone(), stack],
                 "{name}"
             );
         }
         // Several: still one stack; a shadowed one is an ordinary stack file
         // (its markers are scanned and its <<set:…>> values stored).
-        let roles = classify(&[
-            file("stacks/web/compose.yaml"),
-            file("stacks/web/docker-compose.yml"),
-        ])
+        let roles = classify(
+            &Layout::default(),
+            &[
+                file("stacks/web/compose.yaml"),
+                file("stacks/web/docker-compose.yml"),
+            ],
+        )
         .unwrap();
         assert_eq!(
             roles,
             [Role::Stack("web".into()), Role::Stack("web".into())]
         );
         // Not Docker's names: not a stack.
-        let roles = classify(&[file("stacks/web/compose.yaml.bak")]).unwrap();
+        let roles = classify(&Layout::default(), &[file("stacks/web/compose.yaml.bak")]).unwrap();
         assert_eq!(roles, [Role::Other]);
         // A shadowed compose file that is a link is refused too.
-        let err = classify(&[
-            file("stacks/web/compose.yaml"),
-            entry("120000", "stacks/web/docker-compose.yml"),
-        ])
+        let err = classify(
+            &Layout::default(),
+            &[
+                file("stacks/web/compose.yaml"),
+                entry("120000", "stacks/web/docker-compose.yml"),
+            ],
+        )
         .unwrap_err();
         assert!(
             err.to_string()
@@ -582,14 +573,18 @@ mod tests {
                 "stacks/web/compose.yaml is a submodule",
             ),
         ] {
-            let err = classify(&[file("stacks/ok/compose.yaml"), e]).unwrap_err();
+            let err =
+                classify(&Layout::default(), &[file("stacks/ok/compose.yaml"), e]).unwrap_err();
             assert!(err.to_string().starts_with(want), "{err}");
         }
         // Dot-entries are not stacks, links or not.
-        let roles = classify(&[
-            entry("120000", "stacks/.cache"),
-            entry("120000", "stacks/.x/compose.yaml"),
-        ])
+        let roles = classify(
+            &Layout::default(),
+            &[
+                entry("120000", "stacks/.cache"),
+                entry("120000", "stacks/.x/compose.yaml"),
+            ],
+        )
         .unwrap();
         assert_eq!(roles, [Role::Skip, Role::Skip]);
     }
@@ -606,13 +601,16 @@ mod tests {
                 "stack name \"Shared\" is reserved",
             ),
         ] {
-            let err = classify(&[file(path)]).unwrap_err();
+            let err = classify(&Layout::default(), &[file(path)]).unwrap_err();
             assert!(err.to_string().starts_with(want), "{err}");
         }
-        let err = classify(&[
-            file("stacks/App/compose.yaml"),
-            file("stacks/app/compose.yaml"),
-        ])
+        let err = classify(
+            &Layout::default(),
+            &[
+                file("stacks/App/compose.yaml"),
+                file("stacks/app/compose.yaml"),
+            ],
+        )
         .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -620,7 +618,7 @@ mod tests {
         );
         // Without a compose.yaml a bad name is just a directory.
         assert_eq!(
-            classify(&[file("stacks/has space/x")]).unwrap(),
+            classify(&Layout::default(), &[file("stacks/has space/x")]).unwrap(),
             [Role::Other]
         );
     }

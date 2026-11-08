@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 
 use crate::marker::{self, MarkerKind, ParseError, ParseErrorKind};
-use crate::stack::{COMPOSE_FILES, STACKS_DIR};
+use crate::stack::{COMPOSE_FILES, Layout};
 
 /// Stack name → every marker used in its files, in file order.
 pub type Uses = BTreeMap<String, Vec<MarkerKind>>;
@@ -96,13 +96,18 @@ pub fn contains_set(bytes: &[u8]) -> bool {
 }
 
 /// The markers in one file of `stack` (see the module docs for the rules).
-pub fn scan_file(stack: &str, path: &str, bytes: &[u8]) -> Result<Vec<MarkerKind>, ScanError> {
+pub fn scan_file(
+    layout: &Layout,
+    stack: &str,
+    path: &str,
+    bytes: &[u8],
+) -> Result<Vec<MarkerKind>, ScanError> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         let path = path.to_owned();
         if contains_set(bytes) {
             return Err(ScanError::SetInNonUtf8 { path });
         }
-        let name = path.strip_prefix(&format!("{STACKS_DIR}/{stack}/"));
+        let name = path.strip_prefix(&layout.stack_prefix(stack));
         if name.is_some_and(|n| COMPOSE_FILES.contains(&n)) {
             return Err(ScanError::ComposeNotUtf8 { path });
         }
@@ -114,14 +119,14 @@ pub fn scan_file(stack: &str, path: &str, bytes: &[u8]) -> Result<Vec<MarkerKind
 
 /// Scans every file of every stack: stack name → `(repo-relative path,
 /// contents)`. Returns the first error, in stack and path order.
-pub fn collect<B: AsRef<[u8]>>(stacks: &StackFiles<B>) -> Result<Scan, ScanError> {
+pub fn collect<B: AsRef<[u8]>>(layout: &Layout, stacks: &StackFiles<B>) -> Result<Scan, ScanError> {
     let mut scan = Scan::default();
     for (stack, files) in stacks {
         let mut files: Vec<_> = files.iter().collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
         let used = scan.uses.entry(stack.clone()).or_default();
         for (path, bytes) in files {
-            for kind in scan_file(stack, path, bytes.as_ref())? {
+            for kind in scan_file(layout, stack, path, bytes.as_ref())? {
                 if let MarkerKind::Set { name, .. } = &kind {
                     scan.sets.push(SetSite {
                         path: path.clone(),
@@ -177,7 +182,7 @@ mod tests {
             ("empty", &[]),
             ("plain", &[("stacks/plain/compose.yaml", b"a: 1\n")]),
         ]);
-        let scan = collect(&input).unwrap();
+        let scan = collect(&Layout::default(), &input).unwrap();
         assert_eq!(
             scan.uses.keys().collect::<Vec<_>>(),
             ["empty", "plain", "web"]
@@ -192,7 +197,7 @@ mod tests {
             .map(|(s, fs)| (s, fs.into_iter().map(|(p, b)| (p, b.into())).collect()))
             .collect();
         assert_eq!(
-            names(&collect(&z).unwrap().uses["web"]),
+            names(&collect(&Layout::default(), &z).unwrap().uses["web"]),
             ["first", "db", "cf", "conf"]
         );
     }
@@ -206,7 +211,7 @@ mod tests {
                 ("stacks/web/compose.yaml", b"<<set:cf:hunter2>> <<gen:db>>"),
             ],
         )]);
-        let scan = collect(&input).unwrap();
+        let scan = collect(&Layout::default(), &input).unwrap();
         assert_eq!(names(&scan.uses["web"]), ["cf", "db", "shared/smtp"]);
         assert_eq!(
             scan.sets,
@@ -229,6 +234,7 @@ mod tests {
     #[test]
     fn errors_name_the_file() {
         let err = scan_file(
+            &Layout::default(),
             "web",
             "stacks/web/config/x",
             "ä\n  <<gen:bad name>>".as_bytes(),
@@ -240,18 +246,36 @@ mod tests {
              . _ - and single `/` separators)"
         );
 
-        let err = scan_file("web", "stacks/web/x", b"<<gen:a:hex9999>>\n<<gen:b:zz>>").unwrap_err();
+        let err = scan_file(
+            &Layout::default(),
+            "web",
+            "stacks/web/x",
+            b"<<gen:a:hex9999>>\n<<gen:b:zz>>",
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "stacks/web/x:1:9: format length must be between 32 and 256"
         );
-        let err = scan_file("web", "stacks/web/x", b"\n <<gen:b:zz>>").unwrap_err();
+        let err = scan_file(
+            &Layout::default(),
+            "web",
+            "stacks/web/x",
+            b"\n <<gen:b:zz>>",
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "stacks/web/x:2:10: unknown format (expected alnumN, hexN, base64-N or uuid)"
         );
 
-        let err = scan_file("web", "stacks/web/bin", b"\xff<<set:cf:hunter2>>").unwrap_err();
+        let err = scan_file(
+            &Layout::default(),
+            "web",
+            "stacks/web/bin",
+            b"\xff<<set:cf:hunter2>>",
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             ScanError::SetInNonUtf8 {
@@ -264,7 +288,13 @@ mod tests {
             "{msg}"
         );
 
-        let err = scan_file("web", "stacks/web/compose.yaml", b"a: \xff").unwrap_err();
+        let err = scan_file(
+            &Layout::default(),
+            "web",
+            "stacks/web/compose.yaml",
+            b"a: \xff",
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"
@@ -272,25 +302,35 @@ mod tests {
         // Every compose file name counts, shadowed or not.
         for name in COMPOSE_FILES {
             let path = format!("stacks/web/{name}");
-            let err = scan_file("web", &path, b"\xff").unwrap_err();
+            let err = scan_file(&Layout::default(), "web", &path, b"\xff").unwrap_err();
             assert_eq!(err, ScanError::ComposeNotUtf8 { path });
         }
         // Only the stack's own compose files must be UTF-8.
         assert!(
-            scan_file("web", "stacks/web/sub/compose.yaml", b"\xff")
-                .unwrap()
-                .is_empty()
+            scan_file(
+                &Layout::default(),
+                "web",
+                "stacks/web/sub/compose.yaml",
+                b"\xff"
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            scan_file("web", "stacks/db/compose.yaml", b"\xff")
+            scan_file(&Layout::default(), "web", "stacks/db/compose.yaml", b"\xff")
                 .unwrap()
                 .is_empty()
         );
         // `<<set` without the colon is no marker.
         assert!(
-            scan_file("web", "stacks/web/bin", b"\xff<<set<<se")
-                .unwrap()
-                .is_empty()
+            scan_file(
+                &Layout::default(),
+                "web",
+                "stacks/web/bin",
+                b"\xff<<set<<se"
+            )
+            .unwrap()
+            .is_empty()
         );
 
         // collect stops at the first error in path order.
@@ -302,7 +342,7 @@ mod tests {
             ],
         )]);
         assert!(matches!(
-            collect(&input).unwrap_err(),
+            collect(&Layout::default(), &input).unwrap_err(),
             ScanError::SetInNonUtf8 { path } if path == "stacks/web/a"
         ));
     }
