@@ -110,8 +110,9 @@ pub enum Command {
     Check,
     /// Deploy stacks: check, render, x-deploy steps, `docker compose up`.
     ///
-    /// Needs the seed (LST_SEED or .env). Runs the full `lst check` first
-    /// and deploys nothing if it finds a problem. Then, per stack in sorted
+    /// Give the stacks, --changed-since REV or --all (exactly one). Needs
+    /// the seed (LST_SEED or .env). Runs the full `lst check` first and
+    /// deploys nothing if it finds a problem. Then, per stack in sorted
     /// order, renders compose.yaml (as `lst render` does) and pipes it into
     /// `docker compose -p <stack> --project-directory stacks/<stack> -f -
     /// up -d --wait --remove-orphans`, run in the repository root. Stops at
@@ -129,7 +130,7 @@ pub enum Command {
     #[command(group(
         clap::ArgGroup::new("target")
             .required(true)
-            .args(["stacks", "changed_since"])
+            .args(["stacks", "changed_since", "all"])
     ))]
     Deploy {
         /// The stacks to deploy (stacks/<STACK>/compose.yaml).
@@ -142,6 +143,10 @@ pub enum Command {
         /// stacks are reported, not torn down.
         #[arg(long, value_name = "REV")]
         changed_since: Option<String>,
+        /// Deploy every stack instead (every stacks/<STACK>/compose.yaml), in
+        /// sorted order.
+        #[arg(long)]
+        all: bool,
     },
     /// Install or run the pre-commit hook.
     Hook {
@@ -346,7 +351,15 @@ pub fn run(
         Command::Deploy {
             stacks,
             changed_since,
-        } => deploy(&root, env_seed, stacks, changed_since.as_deref(), stderr),
+            all,
+        } => {
+            let targets = match (changed_since, all) {
+                (Some(rev), _) => Targets::ChangedSince(rev),
+                (None, true) => Targets::All,
+                (None, false) => Targets::Stacks(stacks),
+            };
+            deploy(&root, env_seed, targets, stderr)
+        }
         Command::Hook {
             action: HookAction::Install { force },
         } => hook_install(&root, force, stderr),
@@ -892,9 +905,19 @@ fn list_or_none(names: &[String]) -> String {
     }
 }
 
-/// `lst deploy STACK…` / `lst deploy --changed-since REV` (clap makes sure
-/// exactly one of the two is given). See [`crate::deploy`] for how compose
-/// runs.
+/// Which stacks `lst deploy` deploys (clap makes sure exactly one form is
+/// given).
+enum Targets {
+    /// `lst deploy STACK…`.
+    Stacks(Vec<String>),
+    /// `lst deploy --changed-since REV`: [`changed_stacks`].
+    ChangedSince(String),
+    /// `lst deploy --all`: every existing stack.
+    All,
+}
+
+/// `lst deploy STACK…` / `--changed-since REV` / `--all`. See
+/// [`crate::deploy`] for how compose runs.
 ///
 /// Everything that can be decided before running compose is decided first:
 /// the full check, the set of stacks (deduplicated and sorted), each stack
@@ -906,17 +929,18 @@ fn list_or_none(names: &[String]) -> String {
 fn deploy(
     root: &Path,
     env_seed: EnvSeed<'_>,
-    stacks: Vec<String>,
-    changed_since: Option<&str>,
+    targets: Targets,
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let seed = require_seed(root, env_seed)?;
     // With the seed, a passing check includes `store.verify_seed`.
     let checked = check_repo(root, Some(&seed), stderr)?;
     let store = &checked.store;
-    let names = match changed_since {
-        Some(rev) => changed_stacks(root, rev, &checked, stderr)?,
-        None => stacks.into_iter().collect(),
+    let names = match targets {
+        Targets::ChangedSince(rev) => changed_stacks(root, &rev, &checked, stderr)?,
+        // Every existing stack is a key of the files just checked.
+        Targets::All => checked.files.keys().cloned().collect(),
+        Targets::Stacks(stacks) => stacks.into_iter().collect(),
     };
     if names.is_empty() {
         note(stderr, "nothing to deploy");

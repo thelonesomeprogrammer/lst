@@ -424,6 +424,77 @@ fn usage_errors_exit_2_and_deploy_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// --all
+// ---------------------------------------------------------------------------
+
+#[test]
+fn all_deploys_every_stack_sorted() {
+    let repo = repo();
+    // Created out of order; a directory without compose.yaml is no stack.
+    repo.compose("0first", &svc("      X: <<gen:x>>\n"));
+    repo.write("stacks/notes/README.md", "not a stack\n");
+    commit_all(&repo, "more");
+    let fake = Fake::new();
+    let run = deploy_ok(&repo, &fake, &["--all"]);
+    let all = ["0first", "a", "b", "c", "d"];
+    assert_eq!(run.stderr, deployed_stderr(&all, 1));
+    let calls = fake.calls();
+    assert_eq!(calls.len(), all.len());
+    for (c, s) in calls.iter().zip(all) {
+        assert_eq!(c.args, compose_args(s));
+        assert_eq!(c.stdin, render(&repo, s).as_bytes());
+        assert_eq!(c.seed, "<unset>");
+    }
+}
+
+#[test]
+fn all_with_no_stacks_deploys_nothing() {
+    let repo = Repo::initialised();
+    let fake = Fake::new();
+    let run = deploy_ok(&repo, &fake, &["--all"]);
+    assert_eq!(
+        run.stderr,
+        "lst: no commit yet, so there is no committed <<set:…>> to look for\n\
+         lst: nothing to deploy\n"
+    );
+    // An empty stacks/ too.
+    fs::create_dir(repo.path().join("stacks")).unwrap();
+    let run = deploy_ok(&repo, &fake, &["--all"]);
+    assert!(run.stderr.ends_with("lst: nothing to deploy\n"), "{run:#?}");
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn all_stops_at_an_invalid_project_name_before_anything_runs() {
+    let repo = repo();
+    repo.compose("MyApp", &svc("      X: <<gen:x>>\n"));
+    commit_all(&repo, "bad name");
+    let fake = Fake::new();
+    deploy(&repo, &fake, &["--all"], &repo.seed_hex(), DEFAULT)
+        .fails_with(&["stack name \"MyApp\" is not a valid docker compose project name"]);
+    assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn all_conflicts_with_stacks_and_changed_since() {
+    let repo = repo();
+    let fake = Fake::new();
+    let seed = repo.seed_hex();
+    for args in [
+        &["--all", "a"][..],
+        &["a", "--all"][..],
+        &["--all", "--changed-since", "HEAD"][..],
+        &["--all", "a", "--changed-since", "HEAD"][..],
+    ] {
+        let run = deploy(&repo, &fake, args, &seed, DEFAULT);
+        assert_eq!(run.code, Some(2), "{args:?}: {run:#?}");
+        assert!(run.stderr.contains("cannot be used with"), "{run:#?}");
+        assert!(run.stderr.contains("Usage: lst deploy"), "{run:#?}");
+    }
+    assert!(fake.calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // failures
 // ---------------------------------------------------------------------------
 
