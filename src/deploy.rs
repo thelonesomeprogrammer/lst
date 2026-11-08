@@ -827,7 +827,7 @@ pub struct Affected {
     /// Affected stacks that exist now (are in `existing`): deploy these.
     pub deploy: BTreeSet<String>,
     /// Affected stacks that have no `compose.yaml` now: reported, not
-    /// deployed and not torn down (that's M5).
+    /// deployed and not torn down (no teardown: decided for M5).
     pub deleted: BTreeSet<String>,
     /// Changed paths under `stacks/<name>/` or of the form
     /// `.sec/<name>.toml` whose `<name>` isn't a valid stack name (or is
