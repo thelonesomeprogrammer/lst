@@ -3,8 +3,9 @@
 //!
 //! Every command works on the git repository containing the current
 //! directory. Output rules:
-//! - stdout carries nothing but `lst render`'s rendered text (`lst deploy`
-//!   sends compose's own output to stderr too, see [`crate::deploy`]);
+//! - stdout carries nothing but `lst render`'s rendered text and `lst gc`'s
+//!   list of orphans (`lst deploy` sends compose's own output to stderr
+//!   too, see [`crate::deploy`]);
 //! - diagnostics go to stderr, prefixed `lst: `;
 //! - no secret value and never the seed appear in any message: errors name
 //!   secrets (`stack/name`) and files (`path:line:col`), nothing else.
@@ -84,6 +85,34 @@ pub enum Command {
         /// sync or commit just gave it).
         #[arg(long)]
         replace: bool,
+    },
+    /// Give a generated secret a new value (a fresh random id).
+    ///
+    /// Only for a <<gen:…>> secret in use; it keeps its format. (A manual
+    /// secret gets a new value from <<set:name:VALUE>>.) Commit .sec/ and
+    /// deploy the stacks that use it afterwards. An app that only reads the
+    /// value on first start (e.g. a database's initial password) keeps the
+    /// old one: change it inside the app too.
+    Rotate {
+        /// The full name: <stack>/<name> or shared/<name>.
+        name: String,
+    },
+    /// List orphaned secrets (no marker uses them any more), or remove them.
+    ///
+    /// Without --remove, read-only: prints the full name of every orphan on
+    /// stdout, one per line, sorted. With --remove, deletes every orphan
+    /// from .sec/, or only the NAMEs given (each must be an orphan, otherwise
+    /// nothing is removed). A removed generated secret that comes back gets
+    /// a new id, so a new value. Refuses while .sec/ is not current for the
+    /// working tree's orphans (run `lst sync` first).
+    Gc {
+        /// Delete the orphans (all of them, or only the NAMEs) from .sec/.
+        #[arg(long)]
+        remove: bool,
+        /// Full names (<stack>/<name> or shared/<name>) of the orphans to
+        /// remove; needs --remove.
+        #[arg(value_name = "NAME", requires = "remove")]
+        names: Vec<String>,
     },
     /// Print the resolved compose file of a stack to stdout.
     ///
@@ -297,6 +326,12 @@ pub enum CliError {
     #[error("--changed-since {rev}: in that revision, .sec/{SHARED}.toml is not valid UTF-8")]
     OldSharedNotUtf8 { rev: String },
     #[error(
+        ".sec/ is not current for the working tree ({}: orphaned or used again since the last \
+         sync); run `lst sync` first, so lst gc sees what is really unused",
+        names.join(", ")
+    )]
+    GcStale { names: Vec<String> },
+    #[error(
         "{path} already exists and is not lst's hook (or was changed); lst won't overwrite it. \
          Run `lst hook install --force` to replace it (move what it does elsewhere first if you \
          still need it)"
@@ -316,8 +351,8 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + '_ {
 /// so nothing below `run` looks at the process environment for it.
 type EnvSeed<'a> = Option<&'a [u8]>;
 
-/// Runs `cli` in the repository containing `cwd`. Only `render` writes to
-/// `stdout`; diagnostics go to `stderr`.
+/// Runs `cli` in the repository containing `cwd`. Only `render` and `gc`
+/// write to `stdout`; diagnostics go to `stderr`.
 ///
 /// `env_seed` is the value of the `LST_SEED` environment variable, if set
 /// (`std::env::var_os("LST_SEED")`): commands that need the seed use it,
@@ -339,6 +374,8 @@ pub fn run(
         Command::Rename { from, to, replace } => {
             rename(&root, env_seed, &from, &to, replace, stderr)
         }
+        Command::Rotate { name } => rotate(&root, env_seed, &name, stderr),
+        Command::Gc { remove, names } => gc(&root, env_seed, remove, &names, stdout, stderr),
         Command::Render { stack, file } => {
             render_stack(&root, env_seed, &stack, file.as_deref(), stdout)
         }
@@ -708,6 +745,102 @@ fn rename(
         "lst rename does not edit your files: change the markers to the new name if you \
          haven't yet, then commit .sec/",
     );
+    Ok(())
+}
+
+/// `lst rotate NAME`: a fresh id for a generated secret in use (see
+/// [`Store::rotate`]). The stacks named in the message are those whose
+/// working-tree files use the name as `<<gen:…>>` (for `shared/…`, every
+/// such stack).
+fn rotate(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    name: &str,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (_seed, mut store) = open_store(root, env_seed)?;
+    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let done = store.rotate(name)?;
+    store.save(&root.join(SEC_DIR))?;
+    let users: Vec<&str> = uses
+        .iter()
+        .filter(|(stack, markers)| {
+            markers.iter().any(|m| {
+                matches!(m, MarkerKind::Gen { .. })
+                    && store::scope(stack, m.name()).is_ok_and(|sc| sc.full_name == done.name)
+            })
+        })
+        .map(|(stack, _)| stack.as_str())
+        .collect();
+    let stacks = if users.is_empty() {
+        "the stacks that use it".to_owned()
+    } else {
+        users.join(", ")
+    };
+    note(
+        stderr,
+        &format!(
+            "rotated {} (new id, same format {}, so a new value); commit .sec/, then deploy \
+             {stacks}",
+            done.name, done.format
+        ),
+    );
+    note(
+        stderr,
+        "note: an app that only reads it on first start (e.g. a database's initial password) \
+         keeps the old value; change it inside the app too",
+    );
+    Ok(())
+}
+
+/// `lst gc [--remove [NAME…]]` (clap makes NAME need `--remove`). Lists
+/// the orphans on `stdout`, or removes them ([`Store::remove_orphans`]).
+///
+/// The orphan flags must be current for the working tree first (a dry-run
+/// sync over the files `lst sync` reads orphans and un-orphans nothing):
+/// otherwise a name whose marker came back since the last sync could be
+/// deleted, and its next sync would give it a new value.
+fn gc(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    remove: bool,
+    names: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (_seed, mut store) = open_store(root, env_seed)?;
+    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let report = store.clone().sync(&hook::secret_uses(uses))?;
+    let mut stale: Vec<String> = report
+        .orphaned
+        .into_iter()
+        .chain(report.unorphaned)
+        .collect();
+    if !stale.is_empty() {
+        stale.sort();
+        return Err(CliError::GcStale { names: stale });
+    }
+    if !remove {
+        let orphans: BTreeSet<String> = store.orphans().into_iter().map(|o| o.name).collect();
+        if orphans.is_empty() {
+            note(stderr, "no orphans");
+        }
+        for name in orphans {
+            writeln!(stdout, "{name}").map_err(CliError::Stdout)?;
+        }
+        return stdout.flush().map_err(CliError::Stdout);
+    }
+    let removed = store.remove_orphans((!names.is_empty()).then_some(names))?;
+    if removed.is_empty() {
+        note(stderr, "no orphans");
+        return Ok(());
+    }
+    store.save(&root.join(SEC_DIR))?;
+    let removed: BTreeSet<String> = removed.into_iter().map(|o| o.name).collect();
+    for name in &removed {
+        note(stderr, &format!("removed {name}"));
+    }
+    note(stderr, "commit .sec/");
     Ok(())
 }
 
