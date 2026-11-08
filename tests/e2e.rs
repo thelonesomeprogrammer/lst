@@ -729,7 +729,8 @@ fn rename_errors_change_nothing() {
         ),
         (
             &["rename", "db", "x"],
-            "invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>)",
+            "invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>; a name \
+             allows A-Z a-z 0-9 . _ - and single `/` separators)",
         ),
         (
             &["rename", "web/db", "a:b"],
