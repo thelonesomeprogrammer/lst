@@ -36,8 +36,8 @@
 //! fingerprint are committed), but errors still never quote field values,
 //! only file names, secret names and field names.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -139,6 +139,25 @@ pub enum StoreError {
         moving: EntryKind,
         existing: EntryKind,
     },
+    #[error(
+        "`{name}` has no entry in .sec/ to rotate (if a <<gen:…>> marker uses it, run `lst sync` \
+         first)"
+    )]
+    RotateMissing { name: String },
+    #[error(
+        "`{name}` is a manual secret, and lst rotate only gives generated secrets a new value; \
+         write <<set:{marker_name}:VALUE>> to replace it"
+    )]
+    RotateManual { name: String, marker_name: String },
+    #[error(
+        "`{name}` is an orphan (no marker uses it), so there is nothing to rotate; `lst gc \
+         --remove {name}` removes it"
+    )]
+    RotateOrphan { name: String },
+    #[error("`{name}` has no entry in .sec/")]
+    GcMissing { name: String },
+    #[error("`{name}` is in use, not an orphan; lst gc only removes orphans")]
+    GcNotOrphan { name: String },
     #[error("`{name}`: {source}")]
     Crypto {
         name: String,
@@ -211,6 +230,16 @@ pub fn scope(stack: &str, name: &str) -> Result<Scope, StoreError> {
 
 fn full_name(file: &str, key: &str) -> String {
     format!("{file}/{key}")
+}
+
+/// The name a marker for `sc` is written with: the key in a stack
+/// (`web/cf` → `cf`), the full name for `shared/…`.
+fn marker_name(sc: &Scope) -> &str {
+    if sc.file == SHARED {
+        &sc.full_name
+    } else {
+        &sc.key
+    }
 }
 
 /// Parses a full name as errors and reports print it: `<stack>/<name>` or
@@ -380,6 +409,23 @@ pub struct RenameOutcome {
     pub kind: EntryKind,
     /// Whether an existing entry of `to` was overwritten.
     pub replaced: bool,
+}
+
+/// What [`Store::rotate`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotateOutcome {
+    /// The full name of the rotated generated secret.
+    pub name: String,
+    /// Its format (unchanged).
+    pub format: Format,
+}
+
+/// An orphaned entry, as [`Store::orphans`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Orphan {
+    /// Full name (`web/old`, `shared/x`).
+    pub name: String,
+    pub kind: EntryKind,
 }
 
 /// An entry on its way to its new name.
@@ -710,6 +756,109 @@ impl Store {
             kind,
             replaced: same,
         })
+    }
+
+    /// Gives the generated secret `name` (a full name, see
+    /// [`parse_full_name`]) a fresh random id, keeping its format: its value
+    /// changes. Needs no seed (nothing is derived).
+    ///
+    /// Only an entry in use is rotated: a manual secret is refused (its
+    /// value comes from `<<set:…>>`), and so is an orphan (nothing uses it).
+    /// A gen entry in use is rotated even if an orphaned manual entry of the
+    /// same name exists (left over from a marker that switched kind). Other
+    /// entries are never touched. Atomic: on error the store is unchanged.
+    pub fn rotate(&mut self, name: &str) -> Result<RotateOutcome, StoreError> {
+        let sc = parse_full_name(name)?;
+        let (generated, secret) = match self.files.get_mut(&sc.file) {
+            Some(f) => (f.generated.get_mut(&sc.key), f.secrets.get(&sc.key)),
+            None => (None, None),
+        };
+        match (generated, secret) {
+            (Some(e), _) if !e.orphan => {
+                e.id = GenId::generate().map_err(crypto_err(&sc.full_name))?;
+                Ok(RotateOutcome {
+                    name: sc.full_name,
+                    format: e.format,
+                })
+            }
+            (_, Some(s)) if !s.orphan => Err(StoreError::RotateManual {
+                marker_name: marker_name(&sc).to_owned(),
+                name: sc.full_name,
+            }),
+            (None, None) => Err(StoreError::RotateMissing { name: sc.full_name }),
+            _ => Err(StoreError::RotateOrphan { name: sc.full_name }),
+        }
+    }
+
+    /// Every orphaned entry, sorted by full name (then kind: one name can
+    /// be an orphan of both kinds after its marker switched kind).
+    pub fn orphans(&self) -> Vec<Orphan> {
+        let mut out = Vec::new();
+        for (stem, file) in &self.files {
+            let gens = file.generated.iter().filter(|(_, e)| e.orphan);
+            let secrets = file.secrets.iter().filter(|(_, e)| e.orphan);
+            let all = gens
+                .map(|(k, _)| (k, EntryKind::Gen))
+                .chain(secrets.map(|(k, _)| (k, EntryKind::Secret)));
+            out.extend(all.map(|(key, kind)| Orphan {
+                name: full_name(stem, key),
+                kind,
+            }));
+        }
+        out.sort();
+        out
+    }
+
+    /// Deletes orphaned entries: all of them (`names` `None`), or the
+    /// orphaned entries of each full name in `names` (duplicates are fine).
+    /// Each named entry must exist and be an orphan, otherwise nothing is
+    /// removed (atomic). Entries in use are never removed. A file that loses
+    /// its last entry stays in the store and is written as just the header,
+    /// as after [`Store::rename`]. Returns what was removed, sorted like
+    /// [`Store::orphans`].
+    pub fn remove_orphans(&mut self, names: Option<&[String]>) -> Result<Vec<Orphan>, StoreError> {
+        let wanted = match names {
+            None => None,
+            Some(names) => {
+                let orphans: BTreeSet<String> =
+                    self.orphans().into_iter().map(|o| o.name).collect();
+                let mut wanted = BTreeSet::new();
+                for name in names {
+                    let sc = parse_full_name(name)?;
+                    if !orphans.contains(&sc.full_name) {
+                        let exists = self.files.get(&sc.file).is_some_and(|f| {
+                            f.generated.contains_key(&sc.key) || f.secrets.contains_key(&sc.key)
+                        });
+                        return Err(if exists {
+                            StoreError::GcNotOrphan { name: sc.full_name }
+                        } else {
+                            StoreError::GcMissing { name: sc.full_name }
+                        });
+                    }
+                    wanted.insert(sc.full_name);
+                }
+                Some(wanted)
+            }
+        };
+        // Nothing below fails, so the store is only changed once every name
+        // has been checked.
+        let mut removed = Vec::new();
+        for (stem, file) in &mut self.files {
+            let mut take = |key: &str, orphan: bool, kind| {
+                let name = full_name(stem, key);
+                let go = orphan && wanted.as_ref().is_none_or(|w| w.contains(&name));
+                if go {
+                    removed.push(Orphan { name, kind });
+                }
+                !go
+            };
+            file.generated
+                .retain(|key, e| take(key, e.orphan, EntryKind::Gen));
+            file.secrets
+                .retain(|key, e| take(key, e.orphan, EntryKind::Secret));
+        }
+        removed.sort();
+        Ok(removed)
     }
 
     /// The value of `marker` as used in `stack`. Read-only. Orphaned
@@ -2390,6 +2539,283 @@ orphan = false
         ));
         assert_eq!(store, before);
         assert!(!format!("{err:?}").contains("t0ken"));
+    }
+
+    // --- rotate --------------------------------------------------------------
+
+    #[test]
+    fn rotate_gives_a_gen_entry_a_new_id_and_keeps_everything_else() {
+        let (s1, mut store) = renamable();
+        let before = store.clone();
+        let old = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+
+        let out = store.rotate("web/db").unwrap();
+        assert_eq!(
+            out,
+            RotateOutcome {
+                name: "web/db".into(),
+                format: Format::Hex(64),
+            }
+        );
+        let e = gen_entry(&store, "web", "db");
+        assert_ne!(e.id, gen_entry(&before, "web", "db").id);
+        assert_eq!((e.format, e.orphan), (Format::Hex(64), false));
+        let new = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        assert_ne!(new, old);
+        assert_eq!(new.len(), 64);
+
+        // Only that entry changed.
+        let mut back = store.clone();
+        back.files
+            .get_mut("web")
+            .unwrap()
+            .generated
+            .get_mut("db")
+            .unwrap()
+            .id = gen_entry(&before, "web", "db").id;
+        assert_eq!(back, before);
+        let (old_files, new_files) = (before.to_files(), store.to_files());
+        for (name, text) in &old_files {
+            if name != "web.toml" {
+                assert_eq!(&new_files[name], text, "{name}");
+            }
+        }
+
+        // Shared names too.
+        let x = gen_entry(&store, SHARED, "x").id;
+        store.rotate("shared/x").unwrap();
+        assert_ne!(gen_entry(&store, SHARED, "x").id, x);
+    }
+
+    #[test]
+    fn rotate_refuses_manual_orphaned_and_unknown_entries() {
+        let (_, mut store) = renamable();
+        let mut shared_secret = store.clone();
+        shared_secret
+            .files
+            .entry(SHARED.into())
+            .or_default()
+            .secrets
+            .insert("cf".into(), store.files()["web"].secrets["cf"].clone());
+        gen_entry_mut(&mut store, "web", "other").orphan = true;
+        let before = store.clone();
+        let check = |store: &mut Store, name: &str| {
+            let err = store.rotate(name).unwrap_err();
+            assert_eq!(*store, before);
+            err.to_string()
+        };
+
+        assert_eq!(
+            check(&mut store, "web/cf"),
+            "`web/cf` is a manual secret, and lst rotate only gives generated secrets a new \
+             value; write <<set:cf:VALUE>> to replace it"
+        );
+        assert_eq!(
+            check(&mut store, "web/other"),
+            "`web/other` is an orphan (no marker uses it), so there is nothing to rotate; \
+             `lst gc --remove web/other` removes it"
+        );
+        assert_eq!(
+            check(&mut store, "web/nope"),
+            "`web/nope` has no entry in .sec/ to rotate (if a <<gen:…>> marker uses it, run \
+             `lst sync` first)"
+        );
+        assert!(matches!(
+            store.rotate("gone/db"),
+            Err(StoreError::RotateMissing { ref name }) if name == "gone/db"
+        ));
+        assert!(matches!(
+            store.rotate("db"),
+            Err(StoreError::InvalidFullName(ref n)) if n == "db"
+        ));
+        assert_eq!(store, before);
+
+        // An orphaned manual secret is an orphan too.
+        secret_entry_mut(&mut store, "web", "cf").orphan = true;
+        assert!(matches!(
+            store.rotate("web/cf"),
+            Err(StoreError::RotateOrphan { .. })
+        ));
+        // The hint for a shared secret uses the shared marker name.
+        let err = shared_secret.rotate("shared/cf").unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("write <<set:shared/cf:VALUE>> to replace it"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rotate_a_gen_entry_in_use_next_to_an_orphaned_secret() {
+        let (s1, mut store) = renamable();
+        store.set_secret(&s1, "web", "db", "v").unwrap();
+        secret_entry_mut(&mut store, "web", "db").orphan = true;
+        let id = gen_entry(&store, "web", "db").id;
+        store.rotate("web/db").unwrap();
+        assert_ne!(gen_entry(&store, "web", "db").id, id);
+        // Used as a secret, with an orphaned gen entry left over.
+        secret_entry_mut(&mut store, "web", "db").orphan = false;
+        gen_entry_mut(&mut store, "web", "db").orphan = true;
+        assert!(matches!(
+            store.rotate("web/db"),
+            Err(StoreError::RotateManual { .. })
+        ));
+    }
+
+    // --- orphans -------------------------------------------------------------
+
+    fn gen_entry_mut<'a>(store: &'a mut Store, file: &str, key: &str) -> &'a mut GenEntry {
+        store
+            .files
+            .get_mut(file)
+            .unwrap()
+            .generated
+            .get_mut(key)
+            .unwrap()
+    }
+
+    fn orphan(name: &str, kind: EntryKind) -> Orphan {
+        Orphan {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    /// web: db, old (orphan), cf (secret), gone (secret orphan);
+    /// web-x: y (orphan); shared: x (orphan); api: db.
+    fn with_orphans() -> (Seed, Store) {
+        let (s1, mut store) = renamable();
+        store.set_secret(&s1, "web", "gone", "v").unwrap();
+        store
+            .sync(&uses(&[
+                ("web", vec![gen_m("db", "hex64"), secret_m("cf")]),
+                ("web-x", vec![gen_m("y", "uuid")]),
+                ("api", vec![gen_m("db", "uuid")]),
+            ]))
+            .unwrap();
+        store
+            .sync(&uses(&[
+                ("web", vec![gen_m("db", "hex64"), secret_m("cf")]),
+                ("api", vec![gen_m("db", "uuid")]),
+            ]))
+            .unwrap();
+        (s1, store)
+    }
+
+    #[test]
+    fn orphans_are_listed_sorted_by_full_name() {
+        let (_, store) = with_orphans();
+        // `web-x/…` sorts before `web/…` ('-' < '/'), though the files sort
+        // the other way round.
+        assert_eq!(
+            store.orphans(),
+            vec![
+                orphan("shared/x", EntryKind::Gen),
+                orphan("web-x/y", EntryKind::Gen),
+                orphan("web/gone", EntryKind::Secret),
+                orphan("web/other", EntryKind::Gen),
+            ]
+        );
+        assert!(renamable().1.orphans().is_empty());
+    }
+
+    #[test]
+    fn remove_all_orphans_keeps_entries_in_use_and_empty_files() {
+        let (s1, mut store) = with_orphans();
+        let api = store.files()["api"].clone();
+        let removed = store.remove_orphans(None).unwrap();
+        assert_eq!(removed.len(), 4);
+        assert_eq!(removed, {
+            let mut v = removed.clone();
+            v.sort();
+            v
+        });
+        assert!(store.orphans().is_empty());
+        let web = &store.files()["web"];
+        assert_eq!(web.generated.keys().collect::<Vec<_>>(), ["db"]);
+        assert_eq!(web.secrets.keys().collect::<Vec<_>>(), ["cf"]);
+        assert_eq!(store.files()["api"], api);
+        // Emptied files stay, written as just the header.
+        assert_eq!(store.files()[SHARED], StackFile::default());
+        assert_eq!(store.to_files()["shared.toml"], HEADER);
+        assert_eq!(store.to_files()["web-x.toml"], HEADER);
+        assert_eq!(resolved(&store, &s1, "web", &secret_m("cf")), "t0ken:value");
+        // Nothing left: removing again is a no-op.
+        let before = store.clone();
+        assert!(store.remove_orphans(None).unwrap().is_empty());
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn remove_named_orphans_only() {
+        let (_, mut store) = with_orphans();
+        let names = names(&["web/other", "shared/x", "web/other"]);
+        let removed = store.remove_orphans(Some(&names)).unwrap();
+        assert_eq!(
+            removed,
+            vec![
+                orphan("shared/x", EntryKind::Gen),
+                orphan("web/other", EntryKind::Gen),
+            ]
+        );
+        assert_eq!(
+            store.orphans(),
+            vec![
+                orphan("web-x/y", EntryKind::Gen),
+                orphan("web/gone", EntryKind::Secret),
+            ]
+        );
+        assert!(store.remove_orphans(Some(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_named_orphans_is_all_or_nothing() {
+        let (_, mut store) = with_orphans();
+        let before = store.clone();
+        for (list, want) in [
+            (
+                &["web/other", "web/db"][..],
+                "`web/db` is in use, not an orphan; lst gc only removes orphans",
+            ),
+            (
+                &["web/other", "web/cf"],
+                "`web/cf` is in use, not an orphan; lst gc only removes orphans",
+            ),
+            (
+                &["shared/x", "web/nope"],
+                "`web/nope` has no entry in .sec/",
+            ),
+            (&["gone/x"], "`gone/x` has no entry in .sec/"),
+            (
+                &["web/other", "other"],
+                "invalid full secret name \"other\"",
+            ),
+        ] {
+            let err = store.remove_orphans(Some(&names(list))).unwrap_err();
+            assert!(err.to_string().starts_with(want), "{list:?}: {err}");
+            assert_eq!(store, before, "{list:?}");
+        }
+    }
+
+    #[test]
+    fn remove_orphans_of_both_kinds_of_one_name() {
+        let (s1, mut store) = with_orphans();
+        store.set_secret(&s1, "web", "other", "v").unwrap();
+        secret_entry_mut(&mut store, "web", "other").orphan = true;
+        let removed = store.remove_orphans(Some(&names(&["web/other"]))).unwrap();
+        assert_eq!(
+            removed,
+            vec![
+                orphan("web/other", EntryKind::Gen),
+                orphan("web/other", EntryKind::Secret),
+            ]
+        );
+        // An orphaned gen entry next to a secret in use: only the orphan goes.
+        store.set_secret(&s1, "web", "db", "v").unwrap();
+        gen_entry_mut(&mut store, "web", "db").orphan = true;
+        let removed = store.remove_orphans(Some(&names(&["web/db"]))).unwrap();
+        assert_eq!(removed, vec![orphan("web/db", EntryKind::Gen)]);
+        assert!(store.files()["web"].secrets.contains_key("db"));
     }
 
     // --- resolve -----------------------------------------------------------
