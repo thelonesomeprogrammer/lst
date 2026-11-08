@@ -67,7 +67,7 @@ pub enum ScanError {
         col: usize,
         kind: ParseErrorKind,
     },
-    #[error("{path}: stream did not contain valid UTF-8")]
+    #[error("{path}: not valid UTF-8; convert the file to UTF-8")]
     ComposeNotUtf8 { path: String },
     #[error(
         "{path}: not valid UTF-8 but contains `<<set:`; lst only processes markers in UTF-8 \
@@ -238,6 +238,17 @@ mod tests {
              . _ - and single `/` separators)"
         );
 
+        let err = scan_file("web", "stacks/web/x", b"<<gen:a:hex9999>>\n<<gen:b:zz>>").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "stacks/web/x:1:9: format length must be between 32 and 256"
+        );
+        let err = scan_file("web", "stacks/web/x", b"\n <<gen:b:zz>>").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "stacks/web/x:2:10: unknown format (expected alnumN, hexN, base64-N or uuid)"
+        );
+
         let err = scan_file("web", "stacks/web/bin", b"\xff<<set:cf:hunter2>>").unwrap_err();
         assert_eq!(
             err,
@@ -254,7 +265,7 @@ mod tests {
         let err = scan_file("web", "stacks/web/compose.yaml", b"a: \xff").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "stacks/web/compose.yaml: stream did not contain valid UTF-8"
+            "stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"
         );
         // Only the stack's own compose.yaml must be UTF-8.
         assert!(

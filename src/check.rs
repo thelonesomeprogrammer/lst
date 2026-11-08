@@ -82,21 +82,21 @@ impl fmt::Display for Problem {
             ),
             Problem::Conflict(e) => write!(f, "{e}"),
             Problem::New { name } => {
-                write!(f, ".sec/ is not current: {name} is new; {SYNC_HINT}")
+                write!(f, ".sec/ is not current: `{name}` is new; {SYNC_HINT}")
             }
             Problem::FormatChanged(c) => write!(
                 f,
-                ".sec/ is not current: {} changed format ({} -> {}); {SYNC_HINT}",
+                ".sec/ is not current: `{}` changed format ({} -> {}); {SYNC_HINT}",
                 c.name, c.from, c.to
             ),
             Problem::Orphaned { name } => write!(
                 f,
-                ".sec/ is not current: {name} is no longer used but not marked as an orphan; \
+                ".sec/ is not current: `{name}` is no longer used but not marked as an orphan; \
                  {SYNC_HINT}"
             ),
             Problem::Unorphaned { name } => write!(
                 f,
-                ".sec/ is not current: {name} is used again but marked as an orphan; \
+                ".sec/ is not current: `{name}` is used again but marked as an orphan; \
                  {SYNC_HINT}"
             ),
             Problem::NotCanonical { file } => write!(
@@ -389,13 +389,13 @@ mod tests {
         assert_eq!(
             messages(&problems),
             [
-                ".sec/ is not current: web/new is new; run `lst sync` and commit .sec/ (the \
+                ".sec/ is not current: `web/new` is new; run `lst sync` and commit .sec/ (the \
                  pre-commit hook does this when you commit)",
-                ".sec/ is not current: web/db changed format (alnum32 -> hex32); run `lst \
+                ".sec/ is not current: `web/db` changed format (alnum32 -> hex32); run `lst \
                  sync` and commit .sec/ (the pre-commit hook does this when you commit)",
-                ".sec/ is not current: web/api is no longer used but not marked as an orphan; \
+                ".sec/ is not current: `web/api` is no longer used but not marked as an orphan; \
                  run `lst sync` and commit .sec/ (the pre-commit hook does this when you commit)",
-                ".sec/ is not current: web/old is used again but marked as an orphan; run `lst \
+                ".sec/ is not current: `web/old` is used again but marked as an orphan; run `lst \
                  sync` and commit .sec/ (the pre-commit hook does this when you commit)",
             ]
         );
@@ -520,7 +520,10 @@ mod tests {
         let problems = resolution(&store, &seed(2), &f).unwrap();
         assert_eq!(
             messages(&problems),
-            ["wrong seed: its fingerprint does not match .sec/meta.toml"]
+            [
+                "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable"
+            ]
         );
     }
 

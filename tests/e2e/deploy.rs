@@ -570,7 +570,7 @@ fn a_stale_store_deploys_nothing() {
     let fake = Fake::new();
     repo.compose("a", &svc("      PW: <<gen:db>>\n      NEW: <<gen:new>>\n"));
     let run = deploy(&repo, &fake, &["b"], &repo.seed_hex(), DEFAULT);
-    run.fails_with(&["a/new is new", "check failed: 1 problem"]);
+    run.fails_with(&["`a/new` is new", "check failed: 1 problem"]);
     assert!(fake.calls().is_empty());
 }
 
@@ -1309,7 +1309,7 @@ fn x_deploy_rewrites_changed_files_and_fixes_modes() {
     run.ok();
     assert!(
         run.stderr.contains(&format!(
-            "\nlst: wrote {}\nlst: mode fixed {}\n",
+            "\nlst: wrote {}\nlst: fixed the mode of {}\n",
             conf.display(),
             extra.display()
         )),
@@ -1696,7 +1696,7 @@ fn dry_run_fails_where_deploy_would_with_nothing_run() {
     // A failing check: a stale store, and a secret that has no value.
     repo.compose("a", &svc("      PW: <<gen:db>>\n      NEW: <<gen:new>>\n"));
     let run = deploy(&repo, &fake, &["--dry-run", "b"], &seed, DEFAULT);
-    run.fails_with(&["a/new is new", "check failed: 1 problem"]);
+    run.fails_with(&["`a/new` is new", "check failed: 1 problem"]);
     assert!(!run.stderr.contains("would"), "{run:#?}");
     repo.compose("a", &svc("      PW: <<secret:unset>>\n"));
     commit_all_no_verify(&repo, "unset");

@@ -193,7 +193,8 @@ fn rotate_errors_change_nothing() {
         ),
         (
             &["rotate", "db"],
-            "lst: invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>)\n",
+            "lst: invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>; a \
+             name allows A-Z a-z 0-9 . _ - and single `/` separators)\n",
         ),
     ] {
         let run = lst(&repo, args);

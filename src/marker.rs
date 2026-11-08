@@ -74,7 +74,7 @@ pub enum ParseErrorKind {
     InvalidName,
     #[error("invalid escape in value (only `\\\\` and `\\>` are allowed)")]
     InvalidEscape,
-    #[error("invalid format: {0}")]
+    #[error("{0}")]
     InvalidFormat(FormatError),
     #[error("missing value: write <<set:name:VALUE>>")]
     MissingValue,

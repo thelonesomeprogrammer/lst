@@ -143,7 +143,7 @@ pub enum DeployError {
         .path.display()
     )]
     RenderNotFile { path: PathBuf },
-    #[error("could not write the rendered file {}", .path.display())]
+    #[error("could not write the rendered file {}: {source}", .path.display())]
     RenderWrite {
         path: PathBuf,
         #[source]
@@ -2357,19 +2357,22 @@ mod tests {
         );
     }
 
-    /// Asserts `err` is a `RenderWrite` for `path` that shows neither
-    /// `content` nor anything but the path.
+    /// Asserts `err` is a `RenderWrite` for `path` that shows the path and
+    /// the I/O error, but not `content`.
     fn assert_write_error(err: &DeployError, path: &Path, content: &str) {
         assert!(
             matches!(err, DeployError::RenderWrite { path: p, .. } if p == path),
             "{err:?}"
         );
+        let source = std::error::Error::source(err).unwrap().to_string();
         assert_eq!(
             err.to_string(),
-            format!("could not write the rendered file {}", path.display())
+            format!(
+                "could not write the rendered file {}: {source}",
+                path.display()
+            )
         );
-        let source = std::error::Error::source(err).unwrap().to_string();
-        let shown = format!("{err:?} {source}");
+        let shown = format!("{err:?} {err}");
         assert!(!shown.contains(content), "{shown}");
     }
 

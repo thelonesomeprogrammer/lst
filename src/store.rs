@@ -97,11 +97,17 @@ pub enum StoreError {
          `shared` and `meta` are reserved)"
     )]
     InvalidStack(String),
-    #[error("invalid secret name {0:?}")]
+    #[error("invalid secret name {0:?} (allowed: A-Z a-z 0-9 . _ - and single `/` separators)")]
     InvalidName(String),
-    #[error("invalid full secret name {0:?} (expected <stack>/<name> or shared/<name>)")]
+    #[error(
+        "invalid full secret name {0:?} (expected <stack>/<name> or shared/<name>; a name \
+         allows A-Z a-z 0-9 . _ - and single `/` separators)"
+    )]
     InvalidFullName(String),
-    #[error("wrong seed: its fingerprint does not match .sec/meta.toml")]
+    #[error(
+        "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+         (from your password manager) in .env or the LST_SEED environment variable"
+    )]
     FingerprintMismatch,
     #[error("`{name}` is used with two different formats: {first} and {second}")]
     FormatConflict {
@@ -3165,7 +3171,7 @@ orphan = false
         );
         assert_eq!(
             StoreError::InvalidName("a:b".into()).to_string(),
-            "invalid secret name \"a:b\""
+            "invalid secret name \"a:b\" (allowed: A-Z a-z 0-9 . _ - and single `/` separators)"
         );
         assert_eq!(
             StoreError::InvalidFileName {
