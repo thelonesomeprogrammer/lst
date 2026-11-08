@@ -36,7 +36,7 @@ use crate::hook::{self, HookError, Role};
 use crate::marker::MarkerKind;
 use crate::render::{self, RenderError};
 use crate::scan::{self, ScanError};
-use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, Stack, StackError};
+use crate::stack::{self, STACKS_DIR, Stack, StackError};
 use crate::store::{
     self, EntryKind, META, ResolveError, SHARED, StackFile, Store, StoreError, SyncReport,
 };
@@ -67,7 +67,7 @@ pub enum Command {
     /// Update .sec/ from the stack files in the working tree.
     ///
     /// Reads every file under stacks/<stack>/ that git would stage (not only
-    /// compose.yaml; gitignored files and symlinks are skipped). Gives
+    /// the compose file; gitignored files and symlinks are skipped). Gives
     /// new <<gen:…>> names an id, marks names that are no longer used as
     /// orphans (never deletes them) and un-orphans names that come back.
     Sync,
@@ -121,7 +121,8 @@ pub enum Command {
     /// x-deploy is removed and services with rendered inputs get an
     /// lst.render-hash label.
     Render {
-        /// The stack: stacks/<STACK>/compose.yaml.
+        /// The stack: stacks/<STACK>/ with a compose file (compose.yaml,
+        /// compose.yml, docker-compose.yaml or docker-compose.yml).
         stack: String,
         /// Print the rendered x-deploy render: file whose `from` is FROM
         /// (relative to stacks/<STACK>/) instead of the compose file.
@@ -142,7 +143,7 @@ pub enum Command {
     /// Give the stacks, --changed-since REV or --all (exactly one). Needs
     /// the seed (LST_SEED or .env). Runs the full `lst check` first and
     /// deploys nothing if it finds a problem. Then, per stack in sorted
-    /// order, renders compose.yaml (as `lst render` does) and pipes it into
+    /// order, renders the compose file (as `lst render` does) and pipes it into
     /// `docker compose -p <stack> --project-directory stacks/<stack> -f -
     /// up -d --wait --remove-orphans`, run in the repository root. Stops at
     /// the first failure and says which stacks were deployed.
@@ -171,7 +172,7 @@ pub enum Command {
             .args(["stacks", "changed_since", "all"])
     ))]
     Deploy {
-        /// The stacks to deploy (stacks/<STACK>/compose.yaml).
+        /// The stacks to deploy (stacks/<STACK>/ with a compose file).
         #[arg(value_name = "STACK")]
         stacks: Vec<String>,
         /// Deploy the stacks affected by the commits REV..HEAD instead: a
@@ -181,7 +182,7 @@ pub enum Command {
         /// stacks are reported, not torn down.
         #[arg(long, value_name = "REV")]
         changed_since: Option<String>,
-        /// Deploy every stack instead (every stacks/<STACK>/compose.yaml), in
+        /// Deploy every stack instead (every stacks/<STACK>/ with a compose file), in
         /// sorted order.
         #[arg(long)]
         all: bool,
@@ -399,7 +400,7 @@ pub fn run(
         Command::Rotate { name } => rotate(&root, env_seed, &name, stderr),
         Command::Gc { remove, names } => gc(&root, env_seed, remove, &names, stdout, stderr),
         Command::Render { stack, file } => {
-            render_stack(&root, env_seed, &stack, file.as_deref(), stdout)
+            render_stack(&root, env_seed, &stack, file.as_deref(), stdout, stderr)
         }
         Command::Check => check(&root, env_seed, stderr),
         Command::Deploy {
@@ -640,7 +641,7 @@ fn init_store(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
 /// `<<set:…>>` may hold a plaintext value) and its repo-relative path for
 /// messages.
 fn read_compose(stack: &Stack) -> Result<(String, Zeroizing<String>), CliError> {
-    let path = format!("{STACKS_DIR}/{}/{COMPOSE_FILE}", stack.name);
+    let path = stack.compose_rel();
     let bytes = Zeroizing::new(fs::read(&stack.compose).map_err(io_err(Path::new(&path)))?);
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Err(ScanError::ComposeNotUtf8 { path }.into());
@@ -658,15 +659,42 @@ type Contents = Zeroizing<Vec<u8>>;
 /// pre-commit hook sees once they are staged). Gitignored files (bind-mounted
 /// data, say) are not read. Symlinks are skipped, not followed: git commits
 /// them as links, so the hook never sees what they point to
-/// ([`stack::discover`] already refused a symlinked `compose.yaml`).
-/// Directories (an untracked nested repository) are skipped too.
-fn read_stack_files(root: &Path) -> Result<scan::StackFiles<Contents>, CliError> {
+/// ([`stack::discover`] already refused a symlinked compose file).
+/// Directories (an untracked nested repository) are skipped too. Warns about
+/// shadowed compose files ([`warn_shadowed`]).
+fn read_stack_files(
+    root: &Path,
+    stderr: &mut dyn Write,
+) -> Result<scan::StackFiles<Contents>, CliError> {
     let mut out = BTreeMap::new();
     for s in stack::discover(root)? {
+        warn_shadowed(stderr, &s);
         let files = read_one_stack(root, &s)?;
         out.insert(s.name, files);
     }
     Ok(out)
+}
+
+/// Warns about each compose file of `s` that Docker's precedence shadows: lst
+/// renders and deploys only [`Stack::compose_file`], as `docker compose`
+/// would read it.
+fn warn_shadowed(stderr: &mut dyn Write, s: &Stack) {
+    let used = s.compose_rel();
+    for file in &s.ignored {
+        let ignored = format!("{STACKS_DIR}/{}/{file}", s.name);
+        shadow_note(stderr, &s.name, &used, &ignored);
+    }
+}
+
+/// The warning for a shadowed compose file (repo-relative paths).
+fn shadow_note(stderr: &mut dyn Write, stack: &str, used: &str, ignored: &str) {
+    note(
+        stderr,
+        &format!(
+            "stack {stack}: using {used}, ignoring {ignored} (Docker's precedence); merge it \
+             into the first or remove it"
+        ),
+    );
 }
 
 /// The files of one stack, as [`read_stack_files`] reads them.
@@ -685,7 +713,7 @@ fn read_one_stack(root: &Path, s: &Stack) -> Result<Vec<(String, Contents)>, Cli
 
 fn sync(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Result<(), CliError> {
     let (_seed, mut store) = open_store(root, env_seed)?;
-    let scan = scan::collect(&read_stack_files(root)?)?;
+    let scan = scan::collect(&read_stack_files(root, stderr)?)?;
     if let Some(site) = scan.sets.into_iter().next() {
         return Err(CliError::SetInWorkingTree {
             path: site.path,
@@ -795,7 +823,7 @@ fn rotate(
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let (_seed, mut store) = open_store(root, env_seed)?;
-    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let uses = scan::collect(&read_stack_files(root, stderr)?)?.uses;
     let done = store.rotate(name)?;
     store.save(&root.join(SEC_DIR))?;
     let users: Vec<&str> = uses
@@ -845,7 +873,7 @@ fn gc(
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let (_seed, mut store) = open_store(root, env_seed)?;
-    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let uses = scan::collect(&read_stack_files(root, stderr)?)?.uses;
     let report = store.clone().sync(&hook::secret_uses(uses))?;
     let mut stale: Vec<String> = report
         .orphaned
@@ -888,9 +916,11 @@ fn render_stack(
     name: &str,
     file: Option<&str>,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let (seed, store) = open_store(root, env_seed)?;
     let s = stack::find(root, name)?;
+    warn_shadowed(stderr, &s);
     let rendered = render_full(root, &seed, &store, &s)?;
     let out = match file {
         None => &rendered.compose,
@@ -952,7 +982,7 @@ pub(crate) fn render_full(
         Detected::XDeploy => {
             let files = read_one_stack(root, s)?;
             let key = crypto::render_hash_key(seed);
-            xdeploy::render(&s.name, &text, &files, &key, resolve).map_err(|e| match e {
+            xdeploy::render(&s.name, &path, &text, &files, &key, resolve).map_err(|e| match e {
                 Failure::XDeploy(e) => e.into(),
                 Failure::Unresolved(list) => CliError::Render {
                     path,
@@ -1006,7 +1036,7 @@ fn check_repo(
     let (meta, sec_files) = Store::read_files(&root.join(SEC_DIR))?;
     let store = Store::from_files(&meta, &sec_files)?;
     let loaded = check::loaded_files(&meta, &sec_files);
-    let files = read_stack_files(root)?;
+    let files = read_stack_files(root, stderr)?;
 
     let mut problems = check::working_tree(&store, &loaded, &files)?;
     problems.extend(check::xdeploy(&files));
@@ -1350,7 +1380,7 @@ fn changed_stacks(
         note(
             stderr,
             &format!(
-                "not deploying {s}: it changed but has no {STACKS_DIR}/{s}/{COMPOSE_FILE} any \
+                "not deploying {s}: it changed but {STACKS_DIR}/{s}/ has no compose file any \
                  more (lst does not tear stacks down; run `docker compose -p {s} down` if it \
                  should go)"
             ),
@@ -1518,6 +1548,14 @@ fn hook_run(root: &Path, env_seed: EnvSeed<'_>, stderr: &mut dyn Write) -> Resul
             }
             Role::Sec(name) => {
                 staged_sec.insert(name, git::read_blob(root, &e.oid)?);
+            }
+        }
+    }
+
+    for (stack, files) in &stack_files {
+        if let [used, ignored @ ..] = stack::compose_files_in(stack, files).as_slice() {
+            for file in ignored {
+                shadow_note(stderr, stack, used, file);
             }
         }
     }

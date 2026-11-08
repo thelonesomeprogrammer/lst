@@ -1,4 +1,5 @@
-//! Stack discovery: every `<root>/stacks/<name>/compose.yaml` is a stack.
+//! Stack discovery: every `<root>/stacks/<name>/` with a compose file is a
+//! stack.
 //!
 //! This module only finds paths; reading the files is the caller's job.
 //!
@@ -10,9 +11,13 @@
 //!   they would collide with `.sec/shared.toml` and `.sec/meta.toml` (also
 //!   on case-insensitive filesystems). Two stacks whose names differ only
 //!   in case are an error for the same reason.
-//! - Only `compose.yaml` counts (not `compose.yml` or
-//!   `docker-compose.yaml`). Directories without it are not stacks and are
-//!   skipped, whatever their name.
+//! - The compose file is any of [`COMPOSE_FILES`] (Docker's own names).
+//!   Directories without one are not stacks and are skipped, whatever their
+//!   name. With more than one, the first in Docker's precedence order wins
+//!   (as `docker compose` does) and the others are listed in
+//!   [`Stack::ignored`] so the CLI can warn. Ignored compose files are
+//!   still ordinary stack files: their markers are scanned and their
+//!   `<<set:…>>` values stored, so nothing leaks.
 //! - Entries starting with `.` are skipped. So are regular files and other
 //!   non-directories.
 //! - Symlinks are **not** followed (changed in M2; M1 followed them). git
@@ -20,8 +25,9 @@
 //!   index, can't see what it points to. To keep `sync`, `render` and the
 //!   hook seeing the same stacks, a symlinked `stacks/` directory, a symlink
 //!   directly in `stacks/` (whatever it points to, dangling included) and a
-//!   symlinked `compose.yaml` are errors rather than silently skipped.
-//! - A directory that has a `compose.yaml` but whose name is not valid
+//!   symlinked compose file (any of the names) are errors rather than
+//!   silently skipped.
+//! - A directory that has a compose file but whose name is not valid
 //!   UTF-8, or not a valid stack name, is an error rather than skipped, so
 //!   a stack never silently disappears from `sync`/`render`.
 //!
@@ -33,7 +39,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub const STACKS_DIR: &str = "stacks";
-pub const COMPOSE_FILE: &str = "compose.yaml";
+/// The compose file names, in Docker's precedence order (the first present
+/// is the stack's compose file).
+pub const COMPOSE_FILES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
 /// Names taken by `.sec/` itself (its file stems).
 const RESERVED: &[&str] = &[crate::store::SHARED, crate::store::META];
 
@@ -42,8 +55,44 @@ pub struct Stack {
     pub name: String,
     /// `<root>/stacks/<name>` (not canonicalised).
     pub dir: PathBuf,
-    /// `<root>/stacks/<name>/compose.yaml`.
+    /// `<root>/stacks/<name>/<compose file>`.
     pub compose: PathBuf,
+    /// The compose file's name (one of [`COMPOSE_FILES`]).
+    pub compose_file: &'static str,
+    /// Other compose files in the directory, shadowed by `compose_file`
+    /// (Docker's precedence), in precedence order.
+    pub ignored: Vec<&'static str>,
+}
+
+impl Stack {
+    /// The compose file's repo-relative path (`stacks/<name>/<file>`).
+    pub fn compose_rel(&self) -> String {
+        format!("{STACKS_DIR}/{}/{}", self.name, self.compose_file)
+    }
+}
+
+/// The repo-relative paths of `stack`'s compose files among `files` (its
+/// files by repo-relative path, as [`crate::scan::StackFiles`] holds them),
+/// in precedence order: the first is the compose file, the rest are
+/// shadowed.
+pub fn compose_files_in<B>(stack: &str, files: &[(String, B)]) -> Vec<String> {
+    let prefix = format!("{STACKS_DIR}/{stack}/");
+    let has = |name: &str| {
+        files
+            .iter()
+            .any(|(p, _)| p.strip_prefix(&prefix) == Some(name))
+    };
+    COMPOSE_FILES
+        .into_iter()
+        .filter(|f| has(f))
+        .map(|f| format!("{prefix}{f}"))
+        .collect()
+}
+
+/// The repo-relative path of `stack`'s compose file among `files`: the first
+/// of [`compose_files_in`].
+pub fn compose_in<B>(stack: &str, files: &[(String, B)]) -> Option<String> {
+    compose_files_in(stack, files).into_iter().next()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,23 +179,31 @@ pub fn discover(root: &Path) -> Result<Vec<Stack>, StackError> {
         if !file_type.is_dir() {
             continue;
         }
-        let compose = path.join(COMPOSE_FILE);
-        match crate::git::lstat(&compose).map_err(io_err(&compose))? {
-            None => continue,
-            Some(m) if m.file_type().is_symlink() => {
-                return Err(StackError::Symlink { path: compose });
+        let mut found = Vec::new();
+        for file in COMPOSE_FILES {
+            let compose = path.join(file);
+            match crate::git::lstat(&compose).map_err(io_err(&compose))? {
+                None => continue,
+                Some(m) if m.file_type().is_symlink() => {
+                    return Err(StackError::Symlink { path: compose });
+                }
+                Some(m) if m.is_file() => found.push(file),
+                Some(_) => return Err(StackError::ComposeNotAFile { path: compose }),
             }
-            Some(m) if m.is_file() => {}
-            Some(_) => return Err(StackError::ComposeNotAFile { path: compose }),
         }
+        let Some((&compose_file, ignored)) = found.split_first() else {
+            continue;
+        };
         let Some(name) = file_name.to_str() else {
             return Err(StackError::NonUtf8Name { path });
         };
         validate_name(name)?;
         stacks.push(Stack {
             name: name.to_owned(),
+            compose: path.join(compose_file),
             dir: path,
-            compose,
+            compose_file,
+            ignored: ignored.to_vec(),
         });
     }
     stacks.sort_by(|a, b| a.name.cmp(&b.name));
@@ -210,7 +267,7 @@ mod tests {
     fn add_stack(root: &Path, name: &str) {
         let dir = root.join(STACKS_DIR).join(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(COMPOSE_FILE), "services: {}\n").unwrap();
+        fs::write(dir.join(COMPOSE_FILES[0]), "services: {}\n").unwrap();
     }
 
     fn names(root: &Path) -> Vec<String> {
@@ -250,9 +307,9 @@ mod tests {
         }
         add_stack(r.path(), ".hidden");
         fs::create_dir_all(s.join("no-compose/sub")).unwrap();
-        fs::create_dir_all(s.join("yml-only")).unwrap();
-        fs::write(s.join("yml-only/compose.yml"), "").unwrap();
-        fs::write(s.join("yml-only/docker-compose.yaml"), "").unwrap();
+        // Not a compose file name Docker knows.
+        fs::create_dir_all(s.join("other-name")).unwrap();
+        fs::write(s.join("other-name/compose.yaml.bak"), "").unwrap();
         fs::write(s.join("README.md"), "").unwrap();
         // Invalid names are fine as long as they aren't stacks.
         fs::create_dir_all(s.join("not a stack")).unwrap();
@@ -265,9 +322,81 @@ mod tests {
             Stack {
                 name: "db".into(),
                 dir: s.join("db"),
-                compose: s.join("db").join(COMPOSE_FILE),
+                compose: s.join("db").join(COMPOSE_FILES[0]),
+                compose_file: COMPOSE_FILES[0],
+                ignored: vec![],
             }
         );
+    }
+
+    #[test]
+    fn every_compose_file_name_counts() {
+        let r = root();
+        let s = r.path().join(STACKS_DIR);
+        for (i, file) in COMPOSE_FILES.iter().enumerate() {
+            let dir = s.join(format!("s{i}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(file), "").unwrap();
+        }
+        let stacks = discover(r.path()).unwrap();
+        assert_eq!(stacks.len(), COMPOSE_FILES.len());
+        for (st, file) in stacks.iter().zip(COMPOSE_FILES) {
+            assert_eq!(st.compose_file, file);
+            assert_eq!(st.compose, st.dir.join(file));
+            assert_eq!(st.compose_rel(), format!("stacks/{}/{file}", st.name));
+            assert!(st.ignored.is_empty());
+        }
+    }
+
+    #[test]
+    fn several_compose_files_follow_docker_precedence() {
+        let r = root();
+        let dir = r.path().join("stacks/web");
+        fs::create_dir_all(&dir).unwrap();
+        for file in ["docker-compose.yml", "compose.yml", "docker-compose.yaml"] {
+            fs::write(dir.join(file), "").unwrap();
+        }
+        let s = &discover(r.path()).unwrap()[0];
+        assert_eq!(s.compose_file, "compose.yml");
+        assert_eq!(s.ignored, ["docker-compose.yaml", "docker-compose.yml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_shadowed_compose_file_is_still_an_error() {
+        let r = root();
+        add_stack(r.path(), "web");
+        let link = r.path().join("stacks/web/docker-compose.yml");
+        std::os::unix::fs::symlink("compose.yaml", &link).unwrap();
+        let err = discover(r.path()).unwrap_err();
+        assert!(
+            matches!(&err, StackError::Symlink { path } if path == &link),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn compose_in_uses_the_same_precedence() {
+        let files = |names: &[&str]| -> Vec<(String, ())> {
+            names
+                .iter()
+                .map(|n| (format!("stacks/web/{n}"), ()))
+                .collect()
+        };
+        assert_eq!(compose_in("web", &files(&["a.conf"])), None);
+        let both = files(&["docker-compose.yml", "compose.yml"]);
+        assert_eq!(
+            compose_in("web", &both).as_deref(),
+            Some("stacks/web/compose.yml")
+        );
+        assert_eq!(
+            compose_files_in("web", &both),
+            ["stacks/web/compose.yml", "stacks/web/docker-compose.yml"]
+        );
+        // Only directly in the stack directory, and only this stack's.
+        assert_eq!(compose_in("web", &files(&["sub/compose.yaml"])), None);
+        let other = vec![("stacks/db/compose.yaml".to_owned(), ())];
+        assert_eq!(compose_in("web", &other), None);
     }
 
     #[cfg(unix)]
@@ -277,11 +406,15 @@ mod tests {
         let elsewhere = root();
         let real = elsewhere.path().join("real");
         fs::create_dir(&real).unwrap();
-        fs::write(real.join(COMPOSE_FILE), "").unwrap();
+        fs::write(real.join(COMPOSE_FILES[0]), "").unwrap();
 
         // A symlink directly in stacks/: to a stack directory, to a file,
         // or dangling.
-        for target in [real.clone(), real.join(COMPOSE_FILE), real.join("nowhere")] {
+        for target in [
+            real.clone(),
+            real.join(COMPOSE_FILES[0]),
+            real.join("nowhere"),
+        ] {
             let r = root();
             add_stack(r.path(), "plain");
             let link = r.path().join("stacks/linked");
@@ -307,7 +440,7 @@ mod tests {
 
         // A symlinked compose.yaml: to a file, dangling, or looping.
         for target in [
-            real.join(COMPOSE_FILE),
+            real.join(COMPOSE_FILES[0]),
             real.join("nowhere"),
             PathBuf::new(),
         ] {
@@ -315,14 +448,14 @@ mod tests {
             let dir = r.path().join("stacks/file-link");
             fs::create_dir_all(&dir).unwrap();
             let target = if target.as_os_str().is_empty() {
-                dir.join(COMPOSE_FILE)
+                dir.join(COMPOSE_FILES[0])
             } else {
                 target
             };
-            symlink(&target, dir.join(COMPOSE_FILE)).unwrap();
+            symlink(&target, dir.join(COMPOSE_FILES[0])).unwrap();
             let err = discover(r.path()).unwrap_err();
             assert!(
-                matches!(&err, StackError::Symlink { path } if path == &dir.join(COMPOSE_FILE)),
+                matches!(&err, StackError::Symlink { path } if path == &dir.join(COMPOSE_FILES[0])),
                 "{err:?}"
             );
         }
@@ -340,7 +473,7 @@ mod tests {
     #[test]
     fn compose_must_be_a_file() {
         let r = root();
-        let compose = r.path().join("stacks/web").join(COMPOSE_FILE);
+        let compose = r.path().join("stacks/web").join(COMPOSE_FILES[0]);
         fs::create_dir_all(&compose).unwrap();
         let err = discover(r.path()).unwrap_err();
         assert!(
@@ -374,7 +507,8 @@ mod tests {
         // Hidden or without compose.yaml: skipped.
         fs::create_dir_all(s.join(OsStr::from_bytes(b".hid\xff"))).unwrap();
         fs::write(
-            s.join(OsStr::from_bytes(b".hid\xff")).join(COMPOSE_FILE),
+            s.join(OsStr::from_bytes(b".hid\xff"))
+                .join(COMPOSE_FILES[0]),
             "",
         )
         .unwrap();
@@ -383,7 +517,7 @@ mod tests {
 
         let bad = s.join(OsStr::from_bytes(b"bad\xff"));
         fs::create_dir_all(&bad).unwrap();
-        fs::write(bad.join(COMPOSE_FILE), "").unwrap();
+        fs::write(bad.join(COMPOSE_FILES[0]), "").unwrap();
         let err = discover(r.path()).unwrap_err();
         assert!(
             matches!(&err, StackError::NonUtf8Name { path } if path == &bad),
@@ -491,7 +625,7 @@ mod tests {
         ));
         // And discovery errors propagate.
         fs::create_dir_all(r.path().join("stacks/meta")).unwrap();
-        fs::write(r.path().join("stacks/meta").join(COMPOSE_FILE), "").unwrap();
+        fs::write(r.path().join("stacks/meta").join(COMPOSE_FILES[0]), "").unwrap();
         assert!(matches!(
             find(r.path(), "web").unwrap_err(),
             StackError::Reserved { .. }

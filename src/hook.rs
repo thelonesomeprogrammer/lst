@@ -9,10 +9,12 @@
 //! Only the index (whichever one `GIT_INDEX_FILE` names), never the working
 //! tree, and every staged file, not only the changed ones (so orphans are
 //! decided on the whole tree):
-//! - A **stack** is `stacks/<name>/` with a staged `compose.yaml`, under the
-//!   same rules as [`stack::discover`]: the name must be valid, not
-//!   reserved and not differ from another only in case; dot-directories are
-//!   not stacks; `compose.yaml` must be a regular file.
+//! - A **stack** is `stacks/<name>/` with a staged compose file (any of
+//!   [`stack::COMPOSE_FILES`]), under the same rules as [`stack::discover`]:
+//!   the name must be valid, not reserved and not differ from another only
+//!   in case; dot-directories are not stacks; every compose file must be a
+//!   regular file. With several, Docker's precedence picks one
+//!   ([`stack::compose_files_in`]); the others are still stack files.
 //! - Every regular file of a stack is scanned for markers
 //!   ([`scan::collect`], which also decides about non-UTF-8 files).
 //! - Every other regular file (outside `stacks/`, directly in it, or in a
@@ -21,7 +23,7 @@
 //! - `.sec/` is lst's own and is not scanned.
 //! - Symlinks and submodules have no content lst can scan and are skipped,
 //!   except where they would hide a stack: `stacks` itself, an entry
-//!   directly in `stacks/` and a stack's `compose.yaml` must not be links
+//!   directly in `stacks/` and a stack's compose files must not be links
 //!   (git stores the link, not what it points to).
 //!
 //! # Temporary index
@@ -44,7 +46,7 @@ use crate::crypto::SecretString;
 use crate::git::IndexEntry;
 use crate::marker::{self, MarkerKind};
 use crate::scan::{self, ScanError, Uses};
-use crate::stack::{self, COMPOSE_FILE, STACKS_DIR, StackError};
+use crate::stack::{self, COMPOSE_FILES, STACKS_DIR, StackError};
 use crate::store::{self, ResolveError, SHARED, StoreError, SyncReport};
 
 /// The hook script `lst hook install` writes (mode 0755). Not finding `lst`
@@ -79,7 +81,7 @@ pub enum HookError {
     Submodule { path: String },
     #[error(
         "{path}: contains `<<set:` but is not a file of a stack (stacks/<stack>/ with a \
-         compose.yaml), so lst would not process it and the value would be committed as \
+         compose file), so lst would not process it and the value would be committed as \
          plaintext. Move the marker into a stack file, or remove it"
     )]
     SetOutsideStacks { path: String },
@@ -136,10 +138,11 @@ pub enum Role {
     Skip,
 }
 
-/// The directory name of `path` if it is `stacks/<dir>/compose.yaml`.
+/// The directory name of `path` if it is `stacks/<dir>/<compose file>`
+/// (any of [`COMPOSE_FILES`]).
 fn compose_dir(path: &str) -> Option<&str> {
     let (dir, rest) = path.strip_prefix("stacks/")?.split_once('/')?;
-    (rest == COMPOSE_FILE && !dir.starts_with('.')).then_some(dir)
+    (COMPOSE_FILES.contains(&rest) && !dir.starts_with('.')).then_some(dir)
 }
 
 /// The first component below `stacks/`, if `path` is deeper than that.
@@ -157,7 +160,7 @@ fn is_stacks_entry(path: &str) -> bool {
             .is_some_and(|rest| !rest.contains('/') && !rest.starts_with('.'))
 }
 
-/// The error for a link where a stack's directory or `compose.yaml` must be.
+/// The error for a link where a stack's directory or compose file must be.
 fn link_error(e: &IndexEntry) -> HookError {
     if e.mode == SYMLINK_MODE {
         StackError::Symlink {
@@ -518,6 +521,44 @@ mod tests {
             ]
         );
         assert_eq!(classify(&[]).unwrap(), []);
+    }
+
+    #[test]
+    fn classify_accepts_every_compose_file_name() {
+        for name in COMPOSE_FILES {
+            let entries = [file(&format!("stacks/web/{name}")), file("stacks/web/x")];
+            let stack = Role::Stack("web".into());
+            assert_eq!(
+                classify(&entries).unwrap(),
+                [stack.clone(), stack],
+                "{name}"
+            );
+        }
+        // Several: still one stack; a shadowed one is an ordinary stack file
+        // (its markers are scanned and its <<set:…>> values stored).
+        let roles = classify(&[
+            file("stacks/web/compose.yaml"),
+            file("stacks/web/docker-compose.yml"),
+        ])
+        .unwrap();
+        assert_eq!(
+            roles,
+            [Role::Stack("web".into()), Role::Stack("web".into())]
+        );
+        // Not Docker's names: not a stack.
+        let roles = classify(&[file("stacks/web/compose.yaml.bak")]).unwrap();
+        assert_eq!(roles, [Role::Other]);
+        // A shadowed compose file that is a link is refused too.
+        let err = classify(&[
+            file("stacks/web/compose.yaml"),
+            entry("120000", "stacks/web/docker-compose.yml"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("stacks/web/docker-compose.yml is a symlink"),
+            "{err}"
+        );
     }
 
     #[test]

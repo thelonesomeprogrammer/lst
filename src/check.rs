@@ -34,7 +34,7 @@ use std::fmt;
 use crate::crypto::Seed;
 use crate::hook;
 use crate::scan::{self, ScanError, StackFiles};
-use crate::stack::{COMPOSE_FILE, STACKS_DIR};
+use crate::stack;
 use crate::store::{FormatChange, META, ResolveError, SHARED, Store, StoreError};
 use crate::xdeploy::{self, Detected, XDeployError};
 
@@ -233,16 +233,18 @@ pub fn committed_set(path: &str, blob: &[u8]) -> Option<Problem> {
     })
 }
 
-/// The `x-deploy` checks: one problem per stack whose `compose.yaml` takes
+/// The `x-deploy` checks: one problem per stack whose compose file takes
 /// the YAML path and fails [`xdeploy::check`], or hides the key
 /// ([`Detected::Hidden`]). `files` are the stack files `lst sync` reads
-/// (the scope a `render:` `from` must be in). A stack whose `compose.yaml`
+/// (the scope a `render:` `from` must be in). A stack whose compose file
 /// isn't among them or isn't UTF-8 is skipped: [`working_tree`] reports
 /// the latter.
 pub fn xdeploy<B: AsRef<[u8]>>(files: &StackFiles<B>) -> Vec<Problem> {
     let mut problems = Vec::new();
     for (stack, list) in files {
-        let compose = format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}");
+        let Some(compose) = stack::compose_in(stack, list) else {
+            continue;
+        };
         let text = list
             .iter()
             .find(|(p, _)| *p == compose)
@@ -250,7 +252,7 @@ pub fn xdeploy<B: AsRef<[u8]>>(files: &StackFiles<B>) -> Vec<Problem> {
         let result = match text.map(|t| (t, xdeploy::detect(t))) {
             None | Some((_, Detected::Raw)) => continue,
             Some((_, Detected::Hidden)) => Err(XDeployError::Hidden { path: compose }),
-            Some((t, Detected::XDeploy)) => xdeploy::check(stack, t, list).map(drop),
+            Some((t, Detected::XDeploy)) => xdeploy::check(stack, &compose, t, list).map(drop),
         };
         if let Err(e) = result {
             problems.push(Problem::XDeploy(e));

@@ -116,6 +116,11 @@ _Started 2026-11-06. Own tool, written in Rust. Status: M0–M5 implemented. Bin
   - *Dry run:* runs everything a deploy runs before docker (seed, full check, target selection, rendering, step service names, the read-only comparison of each `render:` file with its target) and prints `would …` lines on stderr in deploy order. It is silent for `render:` files that are up to date, and never prints a value or a step's command, only `x-deploy.<phase>[i] (<service>)` and the compose arguments. A failure is reported with its own wording (stopped at stack X; nothing was run or written) instead of the deploy's deployed/failed/not-attempted summary.
   - *`--all`* deploys every existing stack, sorted, and is exclusive with explicit stacks and `--changed-since` (one target form per call).
 
+### Repository layout (decided 2026-11-08, after M5, raised by a user complaint)
+- **Compose file names:** a stack is `stacks/<name>/` with any of Docker's four compose file names: `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`. Most existing repositories use `docker-compose.yml`; accepting all four removes the need to rename files first.
+- **Several in one stack (decided by tlp): Docker's precedence**, in the order above. lst renders and deploys the first, as `docker compose` would read it, and warns on stderr (`sync`, `check`, `render`, `deploy`, the hook) naming the file it uses and the ones it ignores. A shadowed compose file is still an ordinary stack file: its markers are scanned (it must be UTF-8, like the used one) and its `<<set:…>>` values are stored, so nothing leaks through it.
+- The symlink, strict-index and UTF-8 rules below that name `compose.yaml` apply to every compose file name, shadowed ones included. Pure modules (`scan`, `check`, `xdeploy`) pick the compose file from the stack's file list with the same precedence (`stack::compose_files_in`). `deploy` pipes the rendered file with `-f -`, so compose never sees the name.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).

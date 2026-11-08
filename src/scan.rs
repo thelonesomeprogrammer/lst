@@ -11,8 +11,9 @@
 //! - A file that is not valid UTF-8 can't be parsed, so it is skipped,
 //!   unless its bytes contain `<<set:`: that may be a plaintext value lst
 //!   can't process, so it is an error (fail closed).
-//! - The stack's own `compose.yaml` must be valid UTF-8 (skipping it would
-//!   orphan everything it uses).
+//! - The stack's compose files (any of [`COMPOSE_FILES`] directly in its
+//!   directory, shadowed ones included) must be valid UTF-8 (skipping one
+//!   would orphan everything it uses).
 //! - Files are processed in byte order of their paths, whatever order the
 //!   caller passes them in, so results and the first error reported are
 //!   deterministic.
@@ -27,7 +28,7 @@
 use std::collections::BTreeMap;
 
 use crate::marker::{self, MarkerKind, ParseError, ParseErrorKind};
-use crate::stack::{COMPOSE_FILE, STACKS_DIR};
+use crate::stack::{COMPOSE_FILES, STACKS_DIR};
 
 /// Stack name → every marker used in its files, in file order.
 pub type Uses = BTreeMap<String, Vec<MarkerKind>>;
@@ -101,7 +102,8 @@ pub fn scan_file(stack: &str, path: &str, bytes: &[u8]) -> Result<Vec<MarkerKind
         if contains_set(bytes) {
             return Err(ScanError::SetInNonUtf8 { path });
         }
-        if path == format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}") {
+        let name = path.strip_prefix(&format!("{STACKS_DIR}/{stack}/"));
+        if name.is_some_and(|n| COMPOSE_FILES.contains(&n)) {
             return Err(ScanError::ComposeNotUtf8 { path });
         }
         return Ok(Vec::new());
@@ -267,7 +269,13 @@ mod tests {
             err.to_string(),
             "stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"
         );
-        // Only the stack's own compose.yaml must be UTF-8.
+        // Every compose file name counts, shadowed or not.
+        for name in COMPOSE_FILES {
+            let path = format!("stacks/web/{name}");
+            let err = scan_file("web", &path, b"\xff").unwrap_err();
+            assert_eq!(err, ScanError::ComposeNotUtf8 { path });
+        }
+        // Only the stack's own compose files must be UTF-8.
         assert!(
             scan_file("web", "stacks/web/sub/compose.yaml", b"\xff")
                 .unwrap()
