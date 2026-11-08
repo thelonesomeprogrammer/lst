@@ -24,6 +24,9 @@ mod deploy;
 #[path = "e2e/xdeploy.rs"]
 mod xdeploy;
 
+#[path = "e2e/lifecycle.rs"]
+mod lifecycle;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
