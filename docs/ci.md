@@ -51,6 +51,8 @@ The M3 goal (`docs/plan.md`) is that a push to Gitea deploys the pilot stack wit
 
 ## First run
 
+To see beforehand what the first pipeline will do, run `lst deploy --all --dry-run` on the deploy host: it runs the same checks and renders, compares the `render:` targets there, and prints the files it would write and the steps and `docker compose` calls it would run, without running or writing anything.
+
 Commit `.woodpecker.yml` and push. The first pipeline has no previous pipeline, so it builds lst (a few minutes, once per version) and deploys every stack:
 
 ```text

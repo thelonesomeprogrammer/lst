@@ -104,6 +104,7 @@ lst/
 
 ### M5 — Lifecycle polish
 - `lst rotate`, `lst gc`, `lst deploy --all`, good error messages, `--dry-run` for deploy.
+- _Done 2026-11-08._ Decisions and implementation choices in design.md "M5 lifecycle".
 
 ## Migration order (pilot → core)
 1. **Throwaway test stack** (Postgres + whoami/adminer): M1–M3.
