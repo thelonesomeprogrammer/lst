@@ -570,7 +570,7 @@ fn a_stale_store_deploys_nothing() {
     let fake = Fake::new();
     repo.compose("a", &svc("      PW: <<gen:db>>\n      NEW: <<gen:new>>\n"));
     let run = deploy(&repo, &fake, &["b"], &repo.seed_hex(), DEFAULT);
-    run.fails_with(&["a/new is new", "check failed: 1 problem"]);
+    run.fails_with(&["`a/new` is new", "check failed: 1 problem"]);
     assert!(fake.calls().is_empty());
 }
 
@@ -1696,7 +1696,7 @@ fn dry_run_fails_where_deploy_would_with_nothing_run() {
     // A failing check: a stale store, and a secret that has no value.
     repo.compose("a", &svc("      PW: <<gen:db>>\n      NEW: <<gen:new>>\n"));
     let run = deploy(&repo, &fake, &["--dry-run", "b"], &seed, DEFAULT);
-    run.fails_with(&["a/new is new", "check failed: 1 problem"]);
+    run.fails_with(&["`a/new` is new", "check failed: 1 problem"]);
     assert!(!run.stderr.contains("would"), "{run:#?}");
     repo.compose("a", &svc("      PW: <<secret:unset>>\n"));
     commit_all_no_verify(&repo, "unset");

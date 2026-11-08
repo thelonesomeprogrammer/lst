@@ -149,7 +149,7 @@ fn a_stale_store_is_reported() {
     fails_exactly(
         &check(&repo, &seed),
         &[&format!(
-            ".sec/ is not current: web/new is new; {NOT_CURRENT}"
+            ".sec/ is not current: `web/new` is new; {NOT_CURRENT}"
         )],
         "check failed: 1 problem",
     );
@@ -160,10 +160,10 @@ fn a_stale_store_is_reported() {
         &check(&repo, &seed),
         &[
             &format!(
-                ".sec/ is not current: web/db changed format (alnum32 -> hex32); {NOT_CURRENT}"
+                ".sec/ is not current: `web/db` changed format (alnum32 -> hex32); {NOT_CURRENT}"
             ),
             &format!(
-                ".sec/ is not current: shared/m is no longer used but not marked as an orphan; \
+                ".sec/ is not current: `shared/m` is no longer used but not marked as an orphan; \
                  {NOT_CURRENT}"
             ),
         ],
@@ -180,7 +180,7 @@ fn a_stale_store_is_reported() {
     fails_exactly(
         &check(&repo, &seed),
         &[&format!(
-            ".sec/ is not current: shared/m is used again but marked as an orphan; {NOT_CURRENT}"
+            ".sec/ is not current: `shared/m` is used again but marked as an orphan; {NOT_CURRENT}"
         )],
         "check failed: 1 problem",
     );
@@ -383,7 +383,7 @@ fn without_a_seed_the_structural_checks_still_run() {
             "stacks/web/compose.yaml: <<set:x:…>> is not committed yet; commit the file, and \
              the pre-commit hook encrypts the value into .sec/ and rewrites the marker to \
              <<secret:x>>",
-            &format!(".sec/ is not current: web/new is new; {NOT_CURRENT}"),
+            &format!(".sec/ is not current: `web/new` is new; {NOT_CURRENT}"),
             "`web/tok` is not set; write <<set:tok:VALUE>> to set it",
         ],
         "check failed: 3 problems (structural only: no seed)",
@@ -413,12 +413,12 @@ fn every_problem_is_listed_in_one_run() {
             "stacks/web/x.conf: <<set:y:…>> is not committed yet; commit the file, and the \
              pre-commit hook encrypts the value into .sec/ and rewrites the marker to \
              <<secret:y>>",
-            &format!(".sec/ is not current: web/new is new; {NOT_CURRENT}"),
+            &format!(".sec/ is not current: `web/new` is new; {NOT_CURRENT}"),
             &format!(
-                ".sec/ is not current: web/db changed format (alnum32 -> hex32); {NOT_CURRENT}"
+                ".sec/ is not current: `web/db` changed format (alnum32 -> hex32); {NOT_CURRENT}"
             ),
             &format!(
-                ".sec/ is not current: shared/m is no longer used but not marked as an orphan; \
+                ".sec/ is not current: `shared/m` is no longer used but not marked as an orphan; \
                  {NOT_CURRENT}"
             ),
             "`web/tok` is not set; write <<set:tok:VALUE>> to set it",
