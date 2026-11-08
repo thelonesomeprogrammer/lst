@@ -24,6 +24,9 @@ mod deploy;
 #[path = "e2e/xdeploy.rs"]
 mod xdeploy;
 
+#[path = "e2e/lifecycle.rs"]
+mod lifecycle;
+
 use std::fs::{self, File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
@@ -400,9 +403,9 @@ fn sync_and_render_report_unreadable_compose_files() {
     repo.compose("web", "a: 1\n");
     repo.write("stacks/web/compose.yaml", b"a: \xff\n");
     repo.lst(&["sync"])
-        .fails_with(&["stacks/web/compose.yaml: stream did not contain valid UTF-8"]);
+        .fails_with(&["stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"]);
     repo.lst(&["render", "web"])
-        .fails_with(&["stacks/web/compose.yaml: stream did not contain valid UTF-8"]);
+        .fails_with(&["stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"]);
 }
 
 #[test]
@@ -726,7 +729,8 @@ fn rename_errors_change_nothing() {
         ),
         (
             &["rename", "db", "x"],
-            "invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>)",
+            "invalid full secret name \"db\" (expected <stack>/<name> or shared/<name>; a name \
+             allows A-Z a-z 0-9 . _ - and single `/` separators)",
         ),
         (
             &["rename", "web/db", "a:b"],
@@ -906,7 +910,10 @@ fn render_fails_with_the_wrong_seed() {
     let before = repo.snapshot();
     for cmd in [&["render", "web"][..], &["sync"]] {
         let run = repo.lst(cmd);
-        run.fails_with(&["wrong seed: its fingerprint does not match .sec/meta.toml"]);
+        run.fails_with(&[
+            "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable",
+        ]);
         assert_no_seed(&run, OTHER_SEED);
     }
     assert_eq!(repo.snapshot(), before);

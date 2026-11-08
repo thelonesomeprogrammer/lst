@@ -3,8 +3,9 @@
 //!
 //! Every command works on the git repository containing the current
 //! directory. Output rules:
-//! - stdout carries nothing but `lst render`'s rendered text (`lst deploy`
-//!   sends compose's own output to stderr too, see [`crate::deploy`]);
+//! - stdout carries nothing but `lst render`'s rendered text and `lst gc`'s
+//!   list of orphans (`lst deploy` sends compose's own output to stderr
+//!   too, see [`crate::deploy`]);
 //! - diagnostics go to stderr, prefixed `lst: `;
 //! - no secret value and never the seed appear in any message: errors name
 //!   secrets (`stack/name`) and files (`path:line:col`), nothing else.
@@ -85,6 +86,34 @@ pub enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Give a generated secret a new value (a fresh random id).
+    ///
+    /// Only for a <<gen:…>> secret in use; it keeps its format. (A manual
+    /// secret gets a new value from <<set:name:VALUE>>.) Commit .sec/ and
+    /// deploy the stacks that use it afterwards. An app that only reads the
+    /// value on first start (e.g. a database's initial password) keeps the
+    /// old one: change it inside the app too.
+    Rotate {
+        /// The full name: <stack>/<name> or shared/<name>.
+        name: String,
+    },
+    /// List orphaned secrets (no marker uses them any more), or remove them.
+    ///
+    /// Without --remove, read-only: prints the full name of every orphan on
+    /// stdout, one per line, sorted. With --remove, deletes every orphan
+    /// from .sec/, or only the NAMEs given (each must be an orphan, otherwise
+    /// nothing is removed). A removed generated secret that comes back gets
+    /// a new id, so a new value. Refuses while .sec/ is not current for the
+    /// working tree's orphans (run `lst sync` first).
+    Gc {
+        /// Delete the orphans (all of them, or only the NAMEs) from .sec/.
+        #[arg(long)]
+        remove: bool,
+        /// Full names (<stack>/<name> or shared/<name>) of the orphans to
+        /// remove; needs --remove.
+        #[arg(value_name = "NAME", requires = "remove")]
+        names: Vec<String>,
+    },
     /// Print the resolved compose file of a stack to stdout.
     ///
     /// Read-only: never writes .sec/, .env or any x-deploy render: target.
@@ -110,8 +139,9 @@ pub enum Command {
     Check,
     /// Deploy stacks: check, render, x-deploy steps, `docker compose up`.
     ///
-    /// Needs the seed (LST_SEED or .env). Runs the full `lst check` first
-    /// and deploys nothing if it finds a problem. Then, per stack in sorted
+    /// Give the stacks, --changed-since REV or --all (exactly one). Needs
+    /// the seed (LST_SEED or .env). Runs the full `lst check` first and
+    /// deploys nothing if it finds a problem. Then, per stack in sorted
     /// order, renders compose.yaml (as `lst render` does) and pipes it into
     /// `docker compose -p <stack> --project-directory stacks/<stack> -f -
     /// up -d --wait --remove-orphans`, run in the repository root. Stops at
@@ -126,10 +156,19 @@ pub enum Command {
     /// before `up` (files already written stay). Apart from render:
     /// targets, nothing is written; the compose file only goes through the
     /// pipe.
+    ///
+    /// With --dry-run, goes as far as it can without changing anything and
+    /// prints the plan: it needs the seed, runs the full check, picks and
+    /// renders the stacks (so every error a deploy would meet before
+    /// running docker shows up), and compares each render: file with its
+    /// target. It never runs docker, never writes a file, and never shows
+    /// a secret value or a step's command (they contain secrets). Because
+    /// docker isn't asked for the existing containers' lst.render-hash, it
+    /// can't tell whether an on-change step would be skipped, and says so.
     #[command(group(
         clap::ArgGroup::new("target")
             .required(true)
-            .args(["stacks", "changed_since"])
+            .args(["stacks", "changed_since", "all"])
     ))]
     Deploy {
         /// The stacks to deploy (stacks/<STACK>/compose.yaml).
@@ -142,6 +181,13 @@ pub enum Command {
         /// stacks are reported, not torn down.
         #[arg(long, value_name = "REV")]
         changed_since: Option<String>,
+        /// Deploy every stack instead (every stacks/<STACK>/compose.yaml), in
+        /// sorted order.
+        #[arg(long)]
+        all: bool,
+        /// Only show what would be done: run nothing, write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Install or run the pre-commit hook.
     Hook {
@@ -286,6 +332,11 @@ pub enum CliError {
         not_attempted: Vec<String>,
         source: Box<CliError>,
     },
+    #[error("{source} (dry run: stopped at stack {stack}; nothing was run or written)")]
+    DryRunFailed {
+        stack: String,
+        source: Box<CliError>,
+    },
     #[error(
         "--changed-since: unknown revision {rev:?} (not a commit in this repository). Is this a \
          shallow clone? Fetch more history (in Woodpecker: a larger `clone: depth`), or deploy \
@@ -296,6 +347,12 @@ pub enum CliError {
     OldShared { rev: String, source: StoreError },
     #[error("--changed-since {rev}: in that revision, .sec/{SHARED}.toml is not valid UTF-8")]
     OldSharedNotUtf8 { rev: String },
+    #[error(
+        ".sec/ is not current for the working tree ({}: orphaned or used again since the last \
+         sync); run `lst sync` first, so lst gc sees what is really unused",
+        names.join(", ")
+    )]
+    GcStale { names: Vec<String> },
     #[error(
         "{path} already exists and is not lst's hook (or was changed); lst won't overwrite it. \
          Run `lst hook install --force` to replace it (move what it does elsewhere first if you \
@@ -316,8 +373,8 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + '_ {
 /// so nothing below `run` looks at the process environment for it.
 type EnvSeed<'a> = Option<&'a [u8]>;
 
-/// Runs `cli` in the repository containing `cwd`. Only `render` writes to
-/// `stdout`; diagnostics go to `stderr`.
+/// Runs `cli` in the repository containing `cwd`. Only `render` and `gc`
+/// write to `stdout`; diagnostics go to `stderr`.
 ///
 /// `env_seed` is the value of the `LST_SEED` environment variable, if set
 /// (`std::env::var_os("LST_SEED")`): commands that need the seed use it,
@@ -339,6 +396,8 @@ pub fn run(
         Command::Rename { from, to, replace } => {
             rename(&root, env_seed, &from, &to, replace, stderr)
         }
+        Command::Rotate { name } => rotate(&root, env_seed, &name, stderr),
+        Command::Gc { remove, names } => gc(&root, env_seed, remove, &names, stdout, stderr),
         Command::Render { stack, file } => {
             render_stack(&root, env_seed, &stack, file.as_deref(), stdout)
         }
@@ -346,7 +405,17 @@ pub fn run(
         Command::Deploy {
             stacks,
             changed_since,
-        } => deploy(&root, env_seed, stacks, changed_since.as_deref(), stderr),
+            all,
+            dry_run,
+        } => {
+            let targets = match (changed_since, all) {
+                (Some(rev), _) => Targets::ChangedSince(rev),
+                (None, true) => Targets::All,
+                (None, false) => Targets::Stacks(stacks),
+            };
+            let mode = if dry_run { Mode::DryRun } else { Mode::Deploy };
+            deploy(&root, env_seed, targets, mode, stderr)
+        }
         Command::Hook {
             action: HookAction::Install { force },
         } => hook_install(&root, force, stderr),
@@ -572,8 +641,12 @@ fn init_store(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
 /// messages.
 fn read_compose(stack: &Stack) -> Result<(String, Zeroizing<String>), CliError> {
     let path = format!("{STACKS_DIR}/{}/{COMPOSE_FILE}", stack.name);
-    let text = fs::read_to_string(&stack.compose).map_err(io_err(Path::new(&path)))?;
-    Ok((path, Zeroizing::new(text)))
+    let bytes = Zeroizing::new(fs::read(&stack.compose).map_err(io_err(Path::new(&path)))?);
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Err(ScanError::ComposeNotUtf8 { path }.into());
+    };
+    let text = Zeroizing::new(text.to_owned());
+    Ok((path, text))
 }
 
 /// The contents of a stack file (zeroized on drop: an uncommitted
@@ -708,6 +781,102 @@ fn rename(
         "lst rename does not edit your files: change the markers to the new name if you \
          haven't yet, then commit .sec/",
     );
+    Ok(())
+}
+
+/// `lst rotate NAME`: a fresh id for a generated secret in use (see
+/// [`Store::rotate`]). The stacks named in the message are those whose
+/// working-tree files use the name as `<<gen:…>>` (for `shared/…`, every
+/// such stack).
+fn rotate(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    name: &str,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (_seed, mut store) = open_store(root, env_seed)?;
+    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let done = store.rotate(name)?;
+    store.save(&root.join(SEC_DIR))?;
+    let users: Vec<&str> = uses
+        .iter()
+        .filter(|(stack, markers)| {
+            markers.iter().any(|m| {
+                matches!(m, MarkerKind::Gen { .. })
+                    && store::scope(stack, m.name()).is_ok_and(|sc| sc.full_name == done.name)
+            })
+        })
+        .map(|(stack, _)| stack.as_str())
+        .collect();
+    let stacks = if users.is_empty() {
+        "the stacks that use it".to_owned()
+    } else {
+        users.join(", ")
+    };
+    note(
+        stderr,
+        &format!(
+            "rotated {} (new id, same format {}, so a new value); commit .sec/, then deploy \
+             {stacks}",
+            done.name, done.format
+        ),
+    );
+    note(
+        stderr,
+        "note: an app that only reads it on first start (e.g. a database's initial password) \
+         keeps the old value; change it inside the app too",
+    );
+    Ok(())
+}
+
+/// `lst gc [--remove [NAME…]]` (clap makes NAME need `--remove`). Lists
+/// the orphans on `stdout`, or removes them ([`Store::remove_orphans`]).
+///
+/// The orphan flags must be current for the working tree first (a dry-run
+/// sync over the files `lst sync` reads orphans and un-orphans nothing):
+/// otherwise a name whose marker came back since the last sync could be
+/// deleted, and its next sync would give it a new value.
+fn gc(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    remove: bool,
+    names: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (_seed, mut store) = open_store(root, env_seed)?;
+    let uses = scan::collect(&read_stack_files(root)?)?.uses;
+    let report = store.clone().sync(&hook::secret_uses(uses))?;
+    let mut stale: Vec<String> = report
+        .orphaned
+        .into_iter()
+        .chain(report.unorphaned)
+        .collect();
+    if !stale.is_empty() {
+        stale.sort();
+        return Err(CliError::GcStale { names: stale });
+    }
+    if !remove {
+        let orphans: BTreeSet<String> = store.orphans().into_iter().map(|o| o.name).collect();
+        if orphans.is_empty() {
+            note(stderr, "no orphans");
+        }
+        for name in orphans {
+            writeln!(stdout, "{name}").map_err(CliError::Stdout)?;
+        }
+        return stdout.flush().map_err(CliError::Stdout);
+    }
+    let removed = store.remove_orphans((!names.is_empty()).then_some(names))?;
+    if removed.is_empty() {
+        note(stderr, "no orphans");
+        return Ok(());
+    }
+    store.save(&root.join(SEC_DIR))?;
+    let removed: BTreeSet<String> = removed.into_iter().map(|o| o.name).collect();
+    for name in &removed {
+        note(stderr, &format!("removed {name}"));
+    }
+    note(stderr, "commit .sec/");
     Ok(())
 }
 
@@ -892,9 +1061,27 @@ fn list_or_none(names: &[String]) -> String {
     }
 }
 
-/// `lst deploy STACK…` / `lst deploy --changed-since REV` (clap makes sure
-/// exactly one of the two is given). See [`crate::deploy`] for how compose
-/// runs.
+/// Which stacks `lst deploy` deploys (clap makes sure exactly one form is
+/// given).
+enum Targets {
+    /// `lst deploy STACK…`.
+    Stacks(Vec<String>),
+    /// `lst deploy --changed-since REV`: [`changed_stacks`].
+    ChangedSince(String),
+    /// `lst deploy --all`: every existing stack.
+    All,
+}
+
+/// Whether `lst deploy` deploys or only shows what it would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Deploy,
+    /// `--dry-run`: [`plan_stack`] instead of [`deploy_stack`].
+    DryRun,
+}
+
+/// `lst deploy STACK…` / `--changed-since REV` / `--all`. See
+/// [`crate::deploy`] for how compose runs.
 ///
 /// Everything that can be decided before running compose is decided first:
 /// the full check, the set of stacks (deduplicated and sorted), each stack
@@ -903,20 +1090,26 @@ fn list_or_none(names: &[String]) -> String {
 /// stops it, and the error says which stacks were deployed and which were
 /// not attempted. Only `x-deploy` `render:` targets are written to disk:
 /// the rendered compose text only goes into compose's stdin.
+///
+/// [`Mode::DryRun`] goes the same way, with [`plan_stack`] in place of
+/// [`deploy_stack`]: nothing before it runs docker or writes anything, so
+/// the dry run never does either.
 fn deploy(
     root: &Path,
     env_seed: EnvSeed<'_>,
-    stacks: Vec<String>,
-    changed_since: Option<&str>,
+    targets: Targets,
+    mode: Mode,
     stderr: &mut dyn Write,
 ) -> Result<(), CliError> {
     let seed = require_seed(root, env_seed)?;
     // With the seed, a passing check includes `store.verify_seed`.
     let checked = check_repo(root, Some(&seed), stderr)?;
     let store = &checked.store;
-    let names = match changed_since {
-        Some(rev) => changed_stacks(root, rev, &checked, stderr)?,
-        None => stacks.into_iter().collect(),
+    let names = match targets {
+        Targets::ChangedSince(rev) => changed_stacks(root, &rev, &checked, stderr)?,
+        // Every existing stack is a key of the files just checked.
+        Targets::All => checked.files.keys().cloned().collect(),
+        Targets::Stacks(stacks) => stacks.into_iter().collect(),
     };
     if names.is_empty() {
         note(stderr, "nothing to deploy");
@@ -930,17 +1123,41 @@ fn deploy(
     }
     let names_of = |ts: &[Stack]| ts.iter().map(|t| t.name.clone()).collect();
     for (i, s) in targets.iter().enumerate() {
-        let result = render_full(root, &seed, store, s)
-            .and_then(|rendered| deploy_stack(root, &s.name, rendered, stderr));
-        if let Err(e) = result {
-            return Err(CliError::DeployFailed {
-                failed: s.name.clone(),
-                deployed: names_of(&targets[..i]),
-                not_attempted: names_of(&targets[i + 1..]),
-                source: Box::new(e),
-            });
+        let result = render_full(root, &seed, store, s).and_then(|rendered| match mode {
+            Mode::Deploy => deploy_stack(root, &s.name, rendered, stderr),
+            Mode::DryRun => plan_stack(&s.name, &rendered, stderr),
+        });
+        match (result, mode) {
+            (Ok(()), Mode::Deploy) => note(stderr, &format!("deployed {}", s.name)),
+            (Ok(()), Mode::DryRun) => note(stderr, &format!("dry run: would deploy {}", s.name)),
+            (Err(e), Mode::Deploy) => {
+                return Err(CliError::DeployFailed {
+                    failed: s.name.clone(),
+                    deployed: names_of(&targets[..i]),
+                    not_attempted: names_of(&targets[i + 1..]),
+                    source: Box::new(e),
+                });
+            }
+            (Err(e), Mode::DryRun) => {
+                return Err(CliError::DryRunFailed {
+                    stack: s.name.clone(),
+                    source: Box::new(e),
+                });
+            }
         }
-        note(stderr, &format!("deployed {}", s.name));
+    }
+    Ok(())
+}
+
+/// Checks every service a step of `stack` targets as a compose service
+/// name ([`deploy::validate_service_name`]).
+fn validate_step_services(
+    stack: &str,
+    pre: &[xdeploy::Step],
+    post: &[xdeploy::Step],
+) -> Result<(), DeployError> {
+    for step in pre.iter().chain(post) {
+        deploy::validate_service_name(stack, &step.service)?;
     }
     Ok(())
 }
@@ -953,7 +1170,7 @@ fn deploy(
 ///    of its existing container is read (`docker ps`), before anything is
 ///    changed;
 /// 3. every `render:` file is written ([`deploy::write_rendered`]: only if
-///    its content or mode differs), with a `wrote <to>` / `mode fixed <to>`
+///    its content or mode differs), with a `wrote <to>` / `fixed the mode of <to>`
 ///    line;
 /// 4. the `pre` steps, in order;
 /// 5. `docker compose up` ([`deploy::run_compose`]);
@@ -980,9 +1197,7 @@ fn deploy_stack(
         post,
         hashes,
     } = rendered;
-    for step in pre.iter().chain(&post) {
-        deploy::validate_service_name(stack, &step.service)?;
-    }
+    validate_step_services(stack, &pre, &post)?;
     let on_change: BTreeSet<&str> = pre
         .iter()
         .chain(&post)
@@ -1000,7 +1215,7 @@ fn deploy_stack(
         let to = f.to.display();
         match deploy::write_rendered(&f.to, &f.contents, f.mode)? {
             WriteOutcome::Written => note(stderr, &format!("wrote {to}")),
-            WriteOutcome::ModeFixed => note(stderr, &format!("mode fixed {to}")),
+            WriteOutcome::ModeFixed => note(stderr, &format!("fixed the mode of {to}")),
             WriteOutcome::Unchanged => {}
         }
     }
@@ -1010,6 +1225,57 @@ fn deploy_stack(
     steps(Phase::Pre, pre, stderr).map_err(|source| CliError::PreFailed { source })?;
     deploy::run_compose(root, stack, &compose)?;
     steps(Phase::Post, post, stderr).map_err(|source| CliError::PostFailed { source })
+}
+
+/// `lst deploy --dry-run` for one rendered stack: what [`deploy_stack`]
+/// would do, one `would …` line per action, in the same order, changing
+/// nothing:
+/// 1. the step services are checked as in [`deploy_stack`];
+/// 2. no `docker ps`: an `on-change` step is reported as conditional;
+/// 3. each `render:` file is compared with its target, read-only
+///    ([`deploy::plan_rendered`]): `would write <to>` /
+///    `would fix the mode of <to>`, nothing if it is up to date; a target
+///    the deploy would refuse is the same error;
+/// 4. the `pre` steps, by index and service (never the command: it holds
+///    secrets);
+/// 5. the `docker compose … up` arguments (the compose file, which holds
+///    the secrets, goes to stdin, so they don't);
+/// 6. the `post` steps, like the `pre` steps.
+///
+/// Never runs docker and writes nothing.
+fn plan_stack(stack: &str, rendered: &Rendered, stderr: &mut dyn Write) -> Result<(), CliError> {
+    validate_step_services(stack, &rendered.pre, &rendered.post)?;
+    for f in &rendered.files {
+        let to = f.to.display();
+        match deploy::plan_rendered(&f.to, &f.contents, f.mode)? {
+            WriteOutcome::Written => note(stderr, &format!("would write {to}")),
+            WriteOutcome::ModeFixed => note(stderr, &format!("would fix the mode of {to}")),
+            WriteOutcome::Unchanged => {}
+        }
+    }
+    plan_steps(Phase::Pre, &rendered.pre, stderr);
+    let args = deploy::compose_args(stack, &Path::new(STACKS_DIR).join(stack));
+    let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+    note(stderr, &format!("would run docker {}", args.join(" ")));
+    plan_steps(Phase::Post, &rendered.post, stderr);
+    Ok(())
+}
+
+/// The `would run` lines of the `phase` steps, for [`plan_stack`].
+fn plan_steps(phase: Phase, steps: &[xdeploy::Step], stderr: &mut dyn Write) {
+    for (index, step) in steps.iter().enumerate() {
+        let service = &step.service;
+        let condition = match step.when {
+            When::Always => "",
+            When::OnChange => {
+                " unless its inputs are unchanged (when: on-change; a dry run doesn't check)"
+            }
+        };
+        note(
+            stderr,
+            &format!("would run x-deploy.{phase}[{index}] ({service}){condition}"),
+        );
+    }
 }
 
 /// Runs the `phase` steps of `stack` in order (see [`deploy_stack`]);
