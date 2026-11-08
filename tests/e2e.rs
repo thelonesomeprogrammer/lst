@@ -403,9 +403,9 @@ fn sync_and_render_report_unreadable_compose_files() {
     repo.compose("web", "a: 1\n");
     repo.write("stacks/web/compose.yaml", b"a: \xff\n");
     repo.lst(&["sync"])
-        .fails_with(&["stacks/web/compose.yaml: stream did not contain valid UTF-8"]);
+        .fails_with(&["stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"]);
     repo.lst(&["render", "web"])
-        .fails_with(&["stacks/web/compose.yaml: stream did not contain valid UTF-8"]);
+        .fails_with(&["stacks/web/compose.yaml: not valid UTF-8; convert the file to UTF-8"]);
 }
 
 #[test]

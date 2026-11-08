@@ -641,8 +641,12 @@ fn init_store(root: &Path, stderr: &mut dyn Write) -> Result<(), CliError> {
 /// messages.
 fn read_compose(stack: &Stack) -> Result<(String, Zeroizing<String>), CliError> {
     let path = format!("{STACKS_DIR}/{}/{COMPOSE_FILE}", stack.name);
-    let text = fs::read_to_string(&stack.compose).map_err(io_err(Path::new(&path)))?;
-    Ok((path, Zeroizing::new(text)))
+    let bytes = Zeroizing::new(fs::read(&stack.compose).map_err(io_err(Path::new(&path)))?);
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Err(ScanError::ComposeNotUtf8 { path }.into());
+    };
+    let text = Zeroizing::new(text.to_owned());
+    Ok((path, text))
 }
 
 /// The contents of a stack file (zeroized on drop: an uncommitted
