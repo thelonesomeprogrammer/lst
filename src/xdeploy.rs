@@ -327,7 +327,7 @@ impl Drop for Doc {
 }
 
 /// Zeroizes every string in `v` (keys included) and empties it.
-fn wipe(v: &mut Value) {
+pub(crate) fn wipe(v: &mut Value) {
     match v {
         Value::String(s) => s.zeroize(),
         Value::Sequence(seq) => seq.iter_mut().for_each(wipe),

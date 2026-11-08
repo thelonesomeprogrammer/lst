@@ -31,6 +31,8 @@ src/deploy.rs   x-deploy model; docker compose invocation
 src/git.rs      shell out to git: staged files, index rewrite (hash-object + update-index), ignore checks
 src/stack.rs    discover stacks/<name>/compose.yaml
 src/clipboard.rs  `lst get --copy`: pipe a value into wl-copy/xclip/xsel/pbcopy
+src/dotenv.rs   compose's KEY=VALUE files (.env, env_file:) → definitions; pure
+src/import.rs   `lst import`: plan the rewrite of ${VAR}/env_file: to <<secret:…>>; pure
 ```
 - `marker`, `crypto` and `format` are **pure**: no filesystem, no subprocesses, no environment variables. Keep them that way; that's what makes them testable.
 - Markers are parsed from **raw text**, never from parsed YAML. YAML parsing is only for `x-deploy`, `volumes:` and label injection (M4).
