@@ -6,12 +6,13 @@
 //! subprocesses or environment variables; `crypto` only uses the OS random
 //! generator). `git`, `stack`, `store::{load, read_files, save}`, the
 //! runners in `deploy` (`run_compose`, `run_pre`, `run_post`,
-//! `existing_hash`, `write_rendered`) and `cli` (the commands behind the
+//! `existing_hash`, `write_rendered`), `clipboard` and `cli` (the commands behind the
 //! binary) do the I/O.
 #![forbid(unsafe_code)]
 
 pub mod check;
 pub mod cli;
+pub mod clipboard;
 pub mod crypto;
 pub mod deploy;
 pub mod envfile;

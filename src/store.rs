@@ -162,6 +162,20 @@ pub enum StoreError {
     RotateOrphan { name: String },
     #[error("`{name}` has no entry in .sec/")]
     GcMissing { name: String },
+    #[error(
+        "`{name}` has no entry in .sec/ (if a marker uses it, run `lst sync` first); {file} has: {}",
+        if known.is_empty() { "no entries".to_owned() } else { known.join(", ") }
+    )]
+    GetMissing {
+        name: String,
+        file: String,
+        known: Vec<String>,
+    },
+    #[error(
+        "`{name}` exists both as <<gen:…>> and as <<secret:…>> in .sec/ and neither or both \
+         are in use, so lst cannot tell which one to show; run `lst sync` first"
+    )]
+    GetAmbiguous { name: String },
     #[error("`{name}` is in use, not an orphan; lst gc only removes orphans")]
     GcNotOrphan { name: String },
     #[error("`{name}`: {source}")]
@@ -432,6 +446,18 @@ pub struct Orphan {
     /// Full name (`web/old`, `shared/x`).
     pub name: String,
     pub kind: EntryKind,
+}
+
+/// What [`Store::get`] found. `Debug` never shows the value
+/// ([`SecretString`] redacts it).
+#[derive(Debug)]
+pub struct Got {
+    /// The full name.
+    pub name: String,
+    pub kind: EntryKind,
+    /// Whether no marker uses it any more.
+    pub orphan: bool,
+    pub value: SecretString,
 }
 
 /// An entry on its way to its new name.
@@ -912,6 +938,72 @@ impl Store {
             }
             MarkerKind::Set { .. } => Err(ResolveError::SetMarker { name: sc.full_name }),
         }
+    }
+
+    /// The value of the entry with full name `name` (`web/db`,
+    /// `shared/mq`), for `lst get`: derived for a generated secret,
+    /// decrypted for a manual one. Read-only; the raw value, exactly what a
+    /// `render:` file gets (no `$$` escaping).
+    ///
+    /// Orphans resolve too (an app may still use the old value). When the
+    /// name has both a gen and a secret entry (its marker switched kind),
+    /// the one in use is taken; if neither or both are, it is ambiguous.
+    pub fn get(&self, seed: &Seed, name: &str) -> Result<Got, ResolveError> {
+        self.verify_seed(seed)?;
+        let sc = parse_full_name(name)?;
+        let file = self.files.get(&sc.file);
+        let generated = file.and_then(|f| f.generated.get(&sc.key));
+        let secret = file.and_then(|f| f.secrets.get(&sc.key));
+        let pick = match (generated, secret) {
+            (Some(g), Some(s)) if g.orphan == s.orphan => {
+                return Err(StoreError::GetAmbiguous { name: sc.full_name }.into());
+            }
+            (Some(g), Some(_)) if !g.orphan => Moved::Gen(g.clone()),
+            (_, Some(s)) => Moved::Secret(s.clone()),
+            (Some(g), None) => Moved::Gen(g.clone()),
+            (None, None) => {
+                let mut known: Vec<String> = file
+                    .map(|f| {
+                        f.generated
+                            .keys()
+                            .chain(f.secrets.keys())
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                known.sort();
+                known.dedup();
+                return Err(StoreError::GetMissing {
+                    name: sc.full_name,
+                    file: format!(".sec/{}.toml", sc.file),
+                    known,
+                }
+                .into());
+            }
+        };
+        let (value, kind, orphan) = match pick {
+            Moved::Gen(e) => (
+                format::generate(e.format, &mut crypto::derive_gen(seed, &e.id)),
+                EntryKind::Gen,
+                e.orphan,
+            ),
+            Moved::Secret(e) => {
+                let key = crypto::encryption_key(seed);
+                let value = crypto::open(&key, &sc.full_name, &e.sealed).map_err(|source| {
+                    ResolveError::Decrypt {
+                        name: sc.full_name.clone(),
+                        source,
+                    }
+                })?;
+                (value, EntryKind::Secret, e.orphan)
+            }
+        };
+        Ok(Got {
+            name: sc.full_name,
+            kind,
+            orphan,
+            value,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2666,6 +2758,85 @@ orphan = false
             store.rotate("web/db"),
             Err(StoreError::RotateManual { .. })
         ));
+    }
+
+    // --- get -----------------------------------------------------------------
+
+    fn got(store: &Store, seed: &Seed, name: &str) -> (String, EntryKind, bool) {
+        let g = store.get(seed, name).unwrap();
+        assert_eq!(g.name, name);
+        (g.value.expose().to_owned(), g.kind, g.orphan)
+    }
+
+    #[test]
+    fn get_returns_what_resolve_returns() {
+        let (s1, store) = renamable();
+        let db = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        assert_eq!(got(&store, &s1, "web/db"), (db, EntryKind::Gen, false));
+        let api = resolved(&store, &s1, "api", &gen_m("db", "uuid"));
+        assert_eq!(got(&store, &s1, "api/db"), (api, EntryKind::Gen, false));
+        let x = resolved(&store, &s1, "web", &gen_m("shared/x", "alnum32"));
+        assert_eq!(got(&store, &s1, "shared/x"), (x, EntryKind::Gen, false));
+        assert_eq!(
+            got(&store, &s1, "web/cf"),
+            ("t0ken:value".into(), EntryKind::Secret, false)
+        );
+    }
+
+    #[test]
+    fn get_shows_orphans() {
+        let (s1, mut store) = renamable();
+        let other = resolved(&store, &s1, "web", &gen_m("other", "uuid"));
+        gen_entry_mut(&mut store, "web", "other").orphan = true;
+        assert_eq!(got(&store, &s1, "web/other"), (other, EntryKind::Gen, true));
+    }
+
+    #[test]
+    fn get_picks_the_entry_in_use_when_a_name_has_both_kinds() {
+        let (s1, mut store) = renamable();
+        let db = resolved(&store, &s1, "web", &gen_m("db", "hex64"));
+        store.set_secret(&s1, "web", "db", "v").unwrap();
+        secret_entry_mut(&mut store, "web", "db").orphan = true;
+        assert_eq!(got(&store, &s1, "web/db"), (db, EntryKind::Gen, false));
+        secret_entry_mut(&mut store, "web", "db").orphan = false;
+        gen_entry_mut(&mut store, "web", "db").orphan = true;
+        assert_eq!(
+            got(&store, &s1, "web/db"),
+            ("v".into(), EntryKind::Secret, false)
+        );
+        for orphan in [true, false] {
+            secret_entry_mut(&mut store, "web", "db").orphan = orphan;
+            gen_entry_mut(&mut store, "web", "db").orphan = orphan;
+            let err = store.get(&s1, "web/db").unwrap_err();
+            assert!(
+                matches!(err, ResolveError::Store(StoreError::GetAmbiguous { ref name }) if name == "web/db"),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_refuses_unknown_and_invalid_names_and_a_wrong_seed() {
+        let (s1, store) = renamable();
+        let err = store.get(&s1, "web/nope").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`web/nope` has no entry in .sec/ (if a marker uses it, run `lst sync` first); \
+             .sec/web.toml has: cf, db, other"
+        );
+        let err = store.get(&s1, "ghost/db").unwrap_err();
+        assert!(
+            err.to_string().ends_with(".sec/ghost.toml has: no entries"),
+            "{err}"
+        );
+        for bad in ["db", "/db", "web/", "web/a:b"] {
+            let err = store.get(&s1, bad).unwrap_err();
+            assert!(
+                matches!(err, ResolveError::Store(StoreError::InvalidFullName(_))),
+                "{bad}: {err:?}"
+            );
+        }
+        assert!(store.get(&seed(2), "web/db").is_err());
     }
 
     // --- orphans -------------------------------------------------------------
