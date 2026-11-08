@@ -950,7 +950,9 @@ mod tests {
         write(root, "c.log", "");
         write(root, "ignored-dir/x", "");
         write(root, "*", "");
-        sh_git(root, &["add", "-f", "c.log", "*"]);
+        // Literal pathspecs: without them, newer git (2.56) also expands `*`
+        // as a glob and tracks every file, a.log included.
+        sh_git(root, &["--literal-pathspecs", "add", "-f", "c.log", "*"]);
 
         assert!(is_ignored(root, Path::new("a.log")).unwrap());
         assert!(!is_ignored(root, Path::new("b.txt")).unwrap());
