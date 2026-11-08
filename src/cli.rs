@@ -1170,7 +1170,7 @@ fn validate_step_services(
 ///    of its existing container is read (`docker ps`), before anything is
 ///    changed;
 /// 3. every `render:` file is written ([`deploy::write_rendered`]: only if
-///    its content or mode differs), with a `wrote <to>` / `mode fixed <to>`
+///    its content or mode differs), with a `wrote <to>` / `fixed the mode of <to>`
 ///    line;
 /// 4. the `pre` steps, in order;
 /// 5. `docker compose up` ([`deploy::run_compose`]);
@@ -1215,7 +1215,7 @@ fn deploy_stack(
         let to = f.to.display();
         match deploy::write_rendered(&f.to, &f.contents, f.mode)? {
             WriteOutcome::Written => note(stderr, &format!("wrote {to}")),
-            WriteOutcome::ModeFixed => note(stderr, &format!("mode fixed {to}")),
+            WriteOutcome::ModeFixed => note(stderr, &format!("fixed the mode of {to}")),
             WriteOutcome::Unchanged => {}
         }
     }

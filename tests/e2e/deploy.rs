@@ -1309,7 +1309,7 @@ fn x_deploy_rewrites_changed_files_and_fixes_modes() {
     run.ok();
     assert!(
         run.stderr.contains(&format!(
-            "\nlst: wrote {}\nlst: mode fixed {}\n",
+            "\nlst: wrote {}\nlst: fixed the mode of {}\n",
             conf.display(),
             extra.display()
         )),
