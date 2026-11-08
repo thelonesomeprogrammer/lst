@@ -6,7 +6,8 @@
 //! [`step_args`], [`hash_query_args`], [`parse_hash_query`] and
 //! [`affected_stacks`] are pure. [`run_compose`], [`run_pre`], [`run_post`],
 //! [`existing_hash`] and [`write_rendered`] are the thin runners around
-//! them.
+//! them; [`plan_rendered`] is [`write_rendered`]'s read-only twin for
+//! `lst deploy --dry-run`.
 //!
 //! # Running compose
 //! Per stack, lst runs (an argument vector, never a shell string)
@@ -54,7 +55,7 @@
 //! nor a project directory.
 //!
 //! # Rendered files
-//! See [`write_rendered`].
+//! See [`write_rendered`] and [`plan_rendered`].
 //!
 //! # Affected stacks (`--changed-since REV`)
 //! See [`affected_stacks`].
@@ -630,6 +631,34 @@ pub fn write_rendered(
     write_rendered_with(path, contents, mode, |from, to| fs::rename(from, to))
 }
 
+/// What [`plan_rendered`] would do: [`write_rendered`] without writing.
+///
+/// Every check and comparison of [`write_rendered`] runs, read-only: the
+/// mode, the target's file type, its content and mode. An error is the one
+/// [`write_rendered`] would return before writing anything. (Errors it
+/// could only meet while writing, such as a parent directory it can't
+/// create, are not foreseen: a missing file is just
+/// [`WriteOutcome::Written`].) For `lst deploy --dry-run`.
+pub fn plan_rendered(
+    path: &Path,
+    contents: &SecretString,
+    mode: u32,
+) -> Result<WriteOutcome, DeployError> {
+    let io_err = |source| DeployError::RenderWrite {
+        path: path.to_owned(),
+        source,
+    };
+    let Some(meta) = existing_target(path, mode)? else {
+        return Ok(WriteOutcome::Written);
+    };
+    let outcome = match compare(path, &meta, contents, mode).map_err(io_err)? {
+        Comparison::Differs => WriteOutcome::Written,
+        Comparison::ModeDiffers(_) => WriteOutcome::ModeFixed,
+        Comparison::Same => WriteOutcome::Unchanged,
+    };
+    Ok(outcome)
+}
+
 /// [`write_rendered`] with the final rename injectable, so tests can make
 /// it fail after the temporary file exists.
 fn write_rendered_with(
@@ -642,6 +671,36 @@ fn write_rendered_with(
         path: path.to_owned(),
         source,
     };
+    let existing = existing_target(path, mode)?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match &existing {
+        Some(meta) => match compare(path, meta, contents, mode).map_err(io_err)? {
+            Comparison::Differs => {}
+            Comparison::Same => return Ok(WriteOutcome::Unchanged),
+            Comparison::ModeDiffers(file) => {
+                file.set_permissions(Permissions::from_mode(mode))
+                    .map_err(io_err)?;
+                return Ok(WriteOutcome::ModeFixed);
+            }
+        },
+        None => DirBuilder::new()
+            .recursive(true)
+            .mode(NEW_DIR_MODE)
+            .create(dir)
+            .map_err(io_err)?,
+    }
+    replace(path, dir, existing.as_ref(), contents, mode, rename).map_err(io_err)?;
+    Ok(WriteOutcome::Written)
+}
+
+/// The checks before anything is read or written: `mode` has permission
+/// bits only, `path` has a file name and is not a symbolic link, directory
+/// or other non-regular file. Returns the `symlink_metadata` of the
+/// existing regular file, or `None` if there is none.
+fn existing_target(path: &Path, mode: u32) -> Result<Option<fs::Metadata>, DeployError> {
     if mode & !MODE_BITS != 0 {
         return Err(DeployError::RenderMode {
             path: path.to_owned(),
@@ -653,52 +712,45 @@ fn write_rendered_with(
             path: path.to_owned(),
         });
     }
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let existing = match fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(DeployError::RenderSymlink {
-                path: path.to_owned(),
-            });
-        }
-        Ok(m) if !m.is_file() => {
-            return Err(DeployError::RenderNotFile {
-                path: path.to_owned(),
-            });
-        }
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_err(e)),
-    };
-    match &existing {
-        Some(meta) => {
-            if let Some(outcome) = same_content(path, meta, contents, mode).map_err(io_err)? {
-                return Ok(outcome);
-            }
-        }
-        None => DirBuilder::new()
-            .recursive(true)
-            .mode(NEW_DIR_MODE)
-            .create(dir)
-            .map_err(io_err)?,
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(DeployError::RenderSymlink {
+            path: path.to_owned(),
+        }),
+        Ok(m) if !m.is_file() => Err(DeployError::RenderNotFile {
+            path: path.to_owned(),
+        }),
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DeployError::RenderWrite {
+            path: path.to_owned(),
+            source: e,
+        }),
     }
-    replace(path, dir, existing.as_ref(), contents, mode, rename).map_err(io_err)?;
-    Ok(WriteOutcome::Written)
 }
 
-/// If the existing regular file at `path` (whose `symlink_metadata` is
-/// `meta`) already holds `contents`: fixes its mode if needed and says
-/// what it did. `None`: it must be (re)written. A file swapped for another
-/// one since `meta` was read counts as different, and is then replaced by
-/// a rename, which never follows a link.
-fn same_content(
+/// How an existing file compares with what [`write_rendered`] would put
+/// there.
+enum Comparison {
+    /// Other content (or another file than the one `meta` described): it
+    /// must be (re)written.
+    Differs,
+    /// The same content, but another mode; the file, opened for reading,
+    /// so the mode can be fixed on exactly the file that was compared.
+    ModeDiffers(File),
+    /// The same content and mode.
+    Same,
+}
+
+/// Compares the existing regular file at `path` (whose `symlink_metadata`
+/// is `meta`) with `contents` and `mode`. Read-only. A file swapped for
+/// another one since `meta` was read counts as different, and is then
+/// replaced by a rename, which never follows a link.
+fn compare(
     path: &Path,
     meta: &fs::Metadata,
     contents: &SecretString,
     mode: u32,
-) -> io::Result<Option<WriteOutcome>> {
+) -> io::Result<Comparison> {
     let mut file = File::open(path)?;
     let now = file.metadata()?;
     let same_file = now.dev() == meta.dev() && now.ino() == meta.ino() && now.is_file();
@@ -708,13 +760,12 @@ fn same_content(
     let mut old = Zeroizing::new(Vec::with_capacity(capacity));
     file.read_to_end(&mut old)?;
     if !same_file || old.as_slice() != contents.expose().as_bytes() {
-        return Ok(None);
+        Ok(Comparison::Differs)
+    } else if now.mode() & 0o7777 == mode {
+        Ok(Comparison::Same)
+    } else {
+        Ok(Comparison::ModeDiffers(file))
     }
-    if now.mode() & 0o7777 == mode {
-        return Ok(Some(WriteOutcome::Unchanged));
-    }
-    file.set_permissions(Permissions::from_mode(mode))?;
-    Ok(Some(WriteOutcome::ModeFixed))
 }
 
 /// Removes the temporary file on drop unless it was renamed into place.
@@ -2413,6 +2464,56 @@ mod tests {
         write_rendered(&fresh, &secret("x"), 0o600).unwrap();
         let new = fs::metadata(&fresh).unwrap();
         assert_eq!((new.uid(), new.gid()), owner);
+    }
+
+    /// Every outcome of `write_rendered`, foreseen by `plan_rendered`
+    /// without touching the file (content, mode, mtime, inode).
+    #[test]
+    fn plan_rendered_foresees_write_rendered_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = secret("PW-plan-value\n");
+        let untouched = |path: &Path, want: WriteOutcome, mode: u32| {
+            let before = fs::read(path).unwrap();
+            let (m, t, i) = (mode_of(path), mtime(path), ino(path));
+            assert_eq!(plan_rendered(path, &c, mode).unwrap(), want);
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert_eq!((mode_of(path), mtime(path), ino(path)), (m, t, i));
+            // And it is what write_rendered then does.
+            assert_eq!(write_rendered(path, &c, mode).unwrap(), want);
+        };
+        // Missing, with a missing parent: nothing is created.
+        let path = dir.path().join("new/dir/f");
+        assert_eq!(
+            plan_rendered(&path, &c, 0o600).unwrap(),
+            WriteOutcome::Written
+        );
+        assert!(entries(dir.path()).is_empty());
+        write_rendered(&path, &c, 0o600).unwrap();
+        age(&path);
+        untouched(&path, WriteOutcome::Unchanged, 0o600);
+        untouched(&path, WriteOutcome::ModeFixed, 0o640);
+        fs::write(&path, "other").unwrap();
+        age(&path);
+        untouched(&path, WriteOutcome::Written, 0o640);
+        assert_eq!(entries(&dir.path().join("new/dir")), ["f"]);
+
+        // The same refusals.
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        let err = plan_rendered(&link, &c, 0o640).unwrap_err();
+        assert!(matches!(err, DeployError::RenderSymlink { .. }), "{err:?}");
+        let err = plan_rendered(dir.path(), &c, 0o640).unwrap_err();
+        assert!(matches!(err, DeployError::RenderNotFile { .. }), "{err:?}");
+        let err = plan_rendered(&path, &c, 0o4600).unwrap_err();
+        assert!(matches!(err, DeployError::RenderMode { .. }), "{err:?}");
+        // A file that can't be read, and a parent that is a file: the
+        // error names the path only.
+        let content = "PW-plan-value";
+        let mem = Path::new("/proc/self/mem");
+        assert_write_error(&plan_rendered(mem, &c, 0o600).unwrap_err(), mem, content);
+        let under_file = path.join("x");
+        let err = plan_rendered(&under_file, &c, 0o600).unwrap_err();
+        assert_write_error(&err, &under_file, content);
     }
 
     // ---- rendered files under a umask, in a child process -------------------
