@@ -520,7 +520,10 @@ mod tests {
         let problems = resolution(&store, &seed(2), &f).unwrap();
         assert_eq!(
             messages(&problems),
-            ["wrong seed: its fingerprint does not match .sec/meta.toml"]
+            [
+                "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable"
+            ]
         );
     }
 

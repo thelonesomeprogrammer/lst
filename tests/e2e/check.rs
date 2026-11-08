@@ -333,7 +333,10 @@ fn the_seed_must_match() {
     let clone = repo.clone_repo();
     fails_exactly(
         &check_env(&clone, OTHER_SEED, &seed),
-        &["wrong seed: its fingerprint does not match .sec/meta.toml"],
+        &[
+            "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable",
+        ],
         "check failed: 1 problem",
     );
     // With .env as well, a different variable is an error before checking.

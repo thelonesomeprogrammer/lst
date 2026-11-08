@@ -151,7 +151,10 @@ fn a_wrong_env_seed_fails_loudly() {
     let repo = committed();
     let clone = repo.clone_repo();
     let run = clone.lst_env(&["render", "web"], OTHER_SEED);
-    run.fails_with(&["wrong seed: its fingerprint does not match .sec/meta.toml"]);
+    run.fails_with(&[
+        "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable",
+    ]);
     assert_clean(&run, OTHER_SEED);
 }
 

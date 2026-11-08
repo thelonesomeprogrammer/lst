@@ -101,7 +101,10 @@ pub enum StoreError {
     InvalidName(String),
     #[error("invalid full secret name {0:?} (expected <stack>/<name> or shared/<name>)")]
     InvalidFullName(String),
-    #[error("wrong seed: its fingerprint does not match .sec/meta.toml")]
+    #[error(
+        "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+         (from your password manager) in .env or the LST_SEED environment variable"
+    )]
     FingerprintMismatch,
     #[error("`{name}` is used with two different formats: {first} and {second}")]
     FormatConflict {

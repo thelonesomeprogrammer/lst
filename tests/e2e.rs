@@ -909,7 +909,10 @@ fn render_fails_with_the_wrong_seed() {
     let before = repo.snapshot();
     for cmd in [&["render", "web"][..], &["sync"]] {
         let run = repo.lst(cmd);
-        run.fails_with(&["wrong seed: its fingerprint does not match .sec/meta.toml"]);
+        run.fails_with(&[
+            "wrong seed: its fingerprint does not match .sec/meta.toml; use this repository's seed \
+             (from your password manager) in .env or the LST_SEED environment variable",
+        ]);
         assert_no_seed(&run, OTHER_SEED);
     }
     assert_eq!(repo.snapshot(), before);
