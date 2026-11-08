@@ -3,11 +3,12 @@
 //!
 //! Every command works on the git repository containing the current
 //! directory. Output rules:
-//! - stdout carries nothing but `lst render`'s rendered text and `lst gc`'s
-//!   list of orphans (`lst deploy` sends compose's own output to stderr
+//! - stdout carries nothing but `lst render`'s rendered text, `lst get`'s
+//!   value, `lst gc`'s list of orphans and `lst stacks-dir`'s directory (`lst deploy` sends compose's own output to stderr
 //!   too, see [`crate::deploy`]);
 //! - diagnostics go to stderr, prefixed `lst: `;
-//! - no secret value and never the seed appear in any message: errors name
+//! - no secret value and never the seed appear in any message (only on
+//!   stdout, where `render` and `get` are asked for them): errors name
 //!   secrets (`stack/name`) and files (`path:line:col`), nothing else.
 //!
 //! `.env` is only read or written after the gitignore guard has passed
@@ -28,6 +29,7 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use crate::check::{self, Problem};
+use crate::clipboard::{self, ClipboardError};
 use crate::crypto::{self, CryptoError, Seed};
 use crate::deploy::{self, DeployError, Phase, StepCommand, WriteOutcome};
 use crate::envfile::{self, EnvError};
@@ -126,6 +128,24 @@ pub enum Command {
         /// The new stacks directory, relative to the repository root.
         #[arg(value_name = "DIR")]
         dir: Option<String>,
+    },
+    /// Print the value of one secret to stdout (or copy it).
+    ///
+    /// For logging in to an app with a generated or manual secret (the admin
+    /// password, the database password). Needs the seed. Read-only. Prints
+    /// the raw value followed by a newline: what a render: file or a step
+    /// gets, without the `$$` escaping of `lst render <stack>`. Orphans can
+    /// be shown too (an app may still use the old value).
+    Get {
+        /// The full name: <stack>/<name> or shared/<name>.
+        name: String,
+        /// Copy the value to the clipboard (wl-copy, xclip, xsel or pbcopy)
+        /// instead of printing it.
+        #[arg(long)]
+        copy: bool,
+        /// Print the value without the trailing newline.
+        #[arg(short = 'n', long, conflicts_with = "copy")]
+        no_newline: bool,
     },
     /// Print the resolved compose file of a stack to stdout.
     ///
@@ -322,6 +342,10 @@ pub enum CliError {
         file: String,
         known: Vec<String>,
     },
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+    #[error(transparent)]
+    Clipboard(#[from] ClipboardError),
     #[error("could not write to stdout: {0}")]
     Stdout(io::Error),
     #[error(transparent)]
@@ -387,7 +411,7 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> CliError + '_ {
 /// so nothing below `run` looks at the process environment for it.
 type EnvSeed<'a> = Option<&'a [u8]>;
 
-/// Runs `cli` in the repository containing `cwd`. Only `render` and `gc`
+/// Runs `cli` in the repository containing `cwd`. Only `render`, `get` and `gc`
 /// write to `stdout`; diagnostics go to `stderr`.
 ///
 /// `env_seed` is the value of the `LST_SEED` environment variable, if set
@@ -411,6 +435,11 @@ pub fn run(
             rename(&root, env_seed, &from, &to, replace, stderr)
         }
         Command::Rotate { name } => rotate(&root, env_seed, &name, stderr),
+        Command::Get {
+            name,
+            copy,
+            no_newline,
+        } => get(&root, env_seed, &name, copy, no_newline, stdout, stderr),
         Command::Gc { remove, names } => gc(&root, env_seed, remove, &names, stdout, stderr),
         Command::Render { stack, file } => {
             render_stack(&root, env_seed, &stack, file.as_deref(), stdout, stderr)
@@ -962,6 +991,49 @@ fn gc(
     }
     note(stderr, "commit .sec/");
     Ok(())
+}
+
+/// `lst get NAME [--copy | -n]`: one value on `stdout`, or in the
+/// clipboard. The value goes nowhere else: `stderr` only gets its name.
+fn get(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    name: &str,
+    copy: bool,
+    no_newline: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (seed, store) = open_store(root, env_seed)?;
+    let got = store.get(&seed, name)?;
+    if got.orphan {
+        note(
+            stderr,
+            &format!(
+                "note: {} is an orphan (no marker uses it any more; `lst gc` lists orphans)",
+                got.name
+            ),
+        );
+    }
+    if copy {
+        let tool = clipboard::copy(got.value.expose())?;
+        note(
+            stderr,
+            &format!("copied {} to the clipboard ({tool})", got.name),
+        );
+        return Ok(());
+    }
+    stdout
+        .write_all(got.value.expose().as_bytes())
+        .and_then(|()| {
+            if no_newline {
+                Ok(())
+            } else {
+                stdout.write_all(b"\n")
+            }
+        })
+        .and_then(|()| stdout.flush())
+        .map_err(CliError::Stdout)
 }
 
 /// `lst render STACK [--file FROM]`: the rendered compose file, or one

@@ -2246,8 +2246,13 @@ mod tests {
                 write_rendered(&path, &c, mode).unwrap(),
                 WriteOutcome::Written
             );
-            assert_eq!(fs::read(&path).unwrap(), c.expose().as_bytes());
             assert_eq!(mode_of(&path), mode, "{mode:o}");
+            // Without root, a file without the owner read bit (0o000) can't
+            // be read back: add it after checking the mode.
+            if mode & 0o400 == 0 {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode | 0o400)).unwrap();
+            }
+            assert_eq!(fs::read(&path).unwrap(), c.expose().as_bytes());
         }
         // No temporary file left behind.
         assert_eq!(entries(dir.path()), ["mosquitto.conf"]);

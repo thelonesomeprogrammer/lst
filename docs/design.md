@@ -126,6 +126,15 @@ _Started 2026-11-06. Own tool, written in Rust. Status: M0–M5 implemented. Bin
   - *`--changed-since`:* paths are classified under the current root; a `meta.toml` change deploys every stack, which covers a root move. Dot-directories below the root are never stacks, so they are no longer listed as "not a valid stack name" (all layouts). With `.` only: a top-level directory with an invalid stack name is just a directory (not listed), and a top-level directory that doesn't exist as a stack is reported as deleted only if one of its compose files changed (otherwise every change to `docs/` would be "a deleted stack").
   - *Not supported:* one compose file at the repository root (repo = one stack), stacks nested more than one level, per-stack arbitrary paths (Portainer/Komodo style).
 
+### `lst get` (requested by tlp 2026-11-08; details pending review)
+- **Why:** reading a secret back ("what's the Vaultwarden admin password?") otherwise means `lst render <stack> | grep`. It reveals nothing new: whoever has the seed can already render.
+- **Implementation choices (Claude Code, pending review by tlp):**
+  - *`lst get <full name>`* (`web/db`, `shared/mq`) prints the value plus a newline on stdout (`-n`: no newline). The raw value, as a `render:` file gets it, not the `$$`-escaped form `lst render <stack>` shows. stderr only ever gets the name.
+  - *Same guards as rotate/gc:* the `.env` ignore guard, the seed and its fingerprint. Read-only; reads `.sec/` as it is (no check that it is current), so a marker not synced yet hints at `lst sync`.
+  - *Orphans* are shown too (an app may still use the old value), with a note on stderr. A name with both a gen and a secret entry (its marker switched kind) shows the one in use; neither or both in use is refused as ambiguous.
+  - *Unknown name:* the error lists the names in that `.sec/` file (names aren't secret).
+  - *`--copy`* hands the value (no newline) to the first clipboard tool that works, on its stdin: `wl-copy`, `xclip -selection clipboard`, `xsel --clipboard --input`, `pbcopy`. No clipboard crate and no auto-clear; a clipboard manager may keep a history.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).

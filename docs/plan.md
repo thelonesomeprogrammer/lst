@@ -62,6 +62,7 @@ lst/
 | `lst rotate <stack>/<name>` | New id → new value |
 | `lst gc` | List or remove orphans (explicit) |
 | `lst stacks-dir [DIR]` | Show or set the stacks directory (`stacks_dir` in `.sec/meta.toml`) |
+| `lst get <stack>/<name>` | Print one secret's value (`--copy`: to the clipboard) |
 
 ## Milestones
 
