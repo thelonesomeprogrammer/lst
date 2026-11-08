@@ -1065,3 +1065,6 @@ fn exit_codes_0_and_1() {
 
 #[path = "e2e/import.rs"]
 mod import;
+
+#[path = "e2e/import_compose.rs"]
+mod import_compose;
