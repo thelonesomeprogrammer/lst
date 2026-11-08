@@ -38,6 +38,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # lst import against compose itself: `docker compose config` (no
+      # daemon needed) must read the same before and after an import.
+      - run: docker compose version
+      - run: cargo test --locked --test e2e -- --ignored compose_config
 
   image:
     needs: test

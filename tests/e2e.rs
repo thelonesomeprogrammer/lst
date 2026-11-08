@@ -1065,3 +1065,9 @@ fn exit_codes_0_and_1() {
     assert_eq!(repo.lst(&["init"]).code, Some(0));
     assert_eq!(repo.lst(&["render", "nope"]).code, Some(1));
 }
+
+#[path = "e2e/import.rs"]
+mod import;
+
+#[path = "e2e/import_compose.rs"]
+mod import_compose;
