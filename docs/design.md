@@ -125,6 +125,24 @@ _Started 2026-11-06. Own tool, written in Rust. Status: M0–M5 implemented. Bin
   - *Unknown name:* the error lists the names in that `.sec/` file (names aren't secret).
   - *`--copy`* hands the value (no newline) to the first clipboard tool that works, on its stdin: `wl-copy`, `xclip -selection clipboard`, `xsel --clipboard --input`, `pbcopy`. No clipboard crate and no auto-clear; a clipboard manager may keep a history.
 
+### `lst import` (decided 2026-11-08 by tlp)
+- **Why:** migrating a running stack meant hand-writing `<<set:…>>` for every existing password. `lst import <stack>` reads the stack's `.env` (compose's interpolation file) and every `env_file:`, and turns the values into manual secrets.
+- **Decided by tlp:**
+  - *Seal directly:* import calls `Store::set_secret` itself (a second write path into `.sec/`, beside the hook's `<<set:…>>`), with the same guards as `rename`/`rotate` (`.env` ignore guard, seed, fingerprint). No value ever goes into a compose file or a Git blob.
+  - *`env_file:` blocks:* replaced blindly, as text, by an `environment:` block; the result is checked with the parser, and a block that fails is printed (markers only) for the user to replace by hand, with a message that automatic replacement failed.
+  - *Which variables:* all of them, minus `--exclude VAR`.
+  - *Old lines:* the imported lines are removed from the env files.
+- **Implementation choices (raised by Claude Code, pending review by tlp):**
+  - *Name:* the variable name in lowercase, in the stack's scope (`DB_PASSWORD` → `web/db_password`). Refused, before anything is written: a name that isn't valid, two variables with one name, one variable with different values in two files, a name that exists as a gen entry, or as a secret with a different value (the same value is a no-op). A `<<set:` in `compose.yaml` is refused too (commit it first).
+  - *Interpolation:* `$VAR`, `${VAR}`, `${VAR-…}`, `${VAR:-…}`, `${VAR?…}`, `${VAR:?…}` become `<<secret:var>>`; `${VAR+…}`/`${VAR:+…}` and `$$` are left alone. Only for variables of the stack's `.env` (lst deploys with `--project-directory stacks/<stack>`); shell variables and `--env-file` are out of scope.
+  - *The check:* every edit (one `${…}` or one `env_file:` block) is kept only if the stack means the same to compose afterwards. Meaning = the text rendered in memory as lst would (raw path: `render_compose` then YAML; `x-deploy` path: YAML, then markers substituted in string scalars, `x-deploy` strings raw and not interpolated), merge keys applied, values interpolated with compose's rules, every readable `env_file:` merged into `environment` (normalised to a map; `environment` wins). Unknown values (shell variables, skipped values) are opaque tokens keyed by their text, the same on both sides. Edits are tried one at a time in text order, each with the ones already kept. The rendered values exist only in memory; YAML errors show line and column only.
+  - *`env_file:` text:* the `env_file:` key line plus its deeper lines (or same-indent `- ` items). Without an `environment:` in the service it becomes `environment:` with `KEY: '<<secret:key>>'` entries (a `|-` block scalar if the value has `'`). With a block-style map or list `environment:`, the entries are appended to it (list: `- 'KEY=<<secret:key>>'`) and the `env_file:` removed; keys it already sets are not imported (they override the file anyway). A flow-style or empty `environment:`, an unknown service, or a file still holding a variable that isn't imported (excluded or skipped) makes the block manual. Entries of `env_file:` other than a path, a list of paths or `{path, required}` (e.g. `format:`), absolute paths, `..`, `$`, symlinks (also a symlinked directory on the way), non-UTF-8 and missing required files leave the block alone and import nothing from it.
+  - *What is sealed:* a variable used by a kept edit, or by a printed manual block (so its markers resolve). One whose every `${…}` failed the check is not sealed.
+  - *Env-file syntax (`dotenv.rs`):* `KEY=VALUE`, `export `, `'…'` literal, `"…"` with `\\`, `\"`, `\'`; unquoted values end at ` #`. A value compose would interpolate (`$` unquoted or double-quoted), other escapes and multi-line values are skipped with the reason (their lines stay); a line that isn't a definition is an error naming the line.
+  - *Line removal:* a sealed variable's lines are removed from a file only if no `env_file:` still names that file and, for `.env`, no `${…}` still references the variable. A file left with only blank and comment lines is deleted. If any `env_file:` path can't be followed (`$`), no env file is edited.
+  - *Order of writes:* `.sec/` first, then `compose.yaml`, then the env files, so an interrupted import leaves at most unused entries, and a second run finishes it.
+  - *Output:* names, files and positions only, on stderr; `--dry-run` prints the same with "would". Warnings for env files that are tracked (rotate those values) or not gitignored.
+
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
   - On commit, the pre-commit hook stores VALUE encrypted in `.sec/` and rewrites the marker to `<<secret:name>>` (strips `:VALUE`).
@@ -204,4 +222,4 @@ _(Example updated 2026-11-07: since Mosquitto 2.1, `mosquitto_passwd -c` refuses
 - Marked files aren't valid until rendered, so deploy only goes through the tool.
 
 ## Status
-- Design complete. Implementation plan: `docs/plan.md`. M0–M5 implemented (2026-11-08).
+- Design complete. Implementation plan: `docs/plan.md`. M0–M6 implemented (2026-11-08). Migration guide: `docs/migration.md`.

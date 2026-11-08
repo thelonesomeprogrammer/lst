@@ -1096,7 +1096,7 @@ fn import_stack(
                 shown(&e.file)
             ),
             None => format!(
-                "{would}delete {} (only {} was left in it)",
+                "{would}delete {} (it held only {})",
                 shown(&e.file),
                 e.removed.join(", ")
             ),

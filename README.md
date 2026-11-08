@@ -114,6 +114,7 @@ When a service's rendered inputs change, `lst` changes a `lst.render-hash` label
 | `lst rotate <stack>/<name>` | Give a generated secret a new value |
 | `lst gc [--remove [NAME…]]` | List orphaned secrets, or remove them |
 | `lst get <stack>/<name>` | Print one secret's value, e.g. to log in (`--copy`: to the clipboard) |
+| `lst import <stack>` | Turn a running stack's `.env` / `env_file:` values into manual secrets (`--exclude VAR`, `--dry-run`) |
 
 ## Setup
 
@@ -122,6 +123,8 @@ lst init                     # on the first machine (also installs the pre-commi
 # save the seed from .env in your password manager (this is also your backup)
 # on each other machine: clone, put the seed in .env, run `lst hook install` (or `lst init`)
 ```
+
+**Existing stacks:** [`docs/migration.md`](docs/migration.md) walks through bringing running stacks under `lst` (`lst import`, the order to do it in, and how to rotate an existing password into a `<<gen:…>>` one).
 
 ## Usage
 
@@ -162,6 +165,7 @@ lst gc                       # list orphaned secrets; lst gc --remove deletes th
 - **`lst rename <from> <to> [--replace]`** renames an entry in `.sec/` without changing its value: a generated secret keeps its id, a manual secret is re-encrypted under the new name. `<from>` is a full name (`web/db`, `shared/mqtt`); `<to>` is a full name too, or a name without `/` in the same stack (or `shared`). Moving between a stack and `shared/` works. If `<to>` already exists (typically because a sync or commit just gave it a fresh id) pass `--replace`. It does not edit your files: change the markers yourself.
 - **`lst rotate <name>`** gives a generated secret a new value: a new random id, the same format. `<name>` is a full name (`web/db`, `shared/mqtt`). It only rotates a `<<gen:…>>` name that is in use: a manual secret is refused (write `<<set:name:VALUE>>` to replace it), and so is an orphan (nothing uses it; `lst gc` removes it). A name with no entry in `.sec/` hints at `lst sync`. It needs the seed, like `lst sync` and `lst rename`, and changes nothing else. Commit `.sec/` afterwards, then deploy the stacks it names (the stacks whose files use the name). **An app that only reads a password on first start keeps the old one**: a database's initial password (`POSTGRES_PASSWORD`, `MONGO_INITDB_ROOT_PASSWORD`, …) is only applied when the data directory is created, so after a rotation the database keeps the old password while the services that connect to it get the new one. Change the password inside the app too (in Postgres, `ALTER USER … PASSWORD …`).
 - **`lst get <name>`** prints the value of one secret on stdout, for logging in to the app it belongs to (`lst get web/admin`, `lst get shared/mqtt`). `<name>` is a full name. It needs the seed, like `lst render` (which shows the same values), and is read-only. The output is the raw value plus a newline (`-n` leaves the newline off): what a `render:` file gets, so a `$` is not doubled as in `lst render <stack>`. Orphans can be shown too (with a note on stderr), since an app may still use the old value. A name with no entry lists the names that do exist in that stack. `--copy` puts the value (without a newline) in the clipboard instead of printing it, through the first of `wl-copy`, `xclip`, `xsel` and `pbcopy` that works; a clipboard manager may keep it in its history.
+- **`lst import <stack> [--exclude VAR]… [--dry-run]`** brings a running stack's existing values under `lst` (see [`docs/migration.md`](docs/migration.md)). It reads `stacks/<stack>/.env` (compose's interpolation file) and every file an `env_file:` names, stores the values encrypted in `.sec/` as manual secrets (name: the variable name in lowercase, `DB_PASSWORD` → `web/db_password`), and rewrites `compose.yaml`: `${VAR}` (also `$VAR`, `${VAR:-…}`, `${VAR:?…}`) becomes `<<secret:var>>`, and an `env_file:` becomes an `environment:` block of `<<secret:…>>` entries (or is added to the service's block-style `environment:`). Every rewrite is kept only if compose would read exactly the same values afterwards (checked by rendering, parsing and interpolating in memory); one that isn't is left as it was and reported, an `env_file:` with the entries to write by hand. The imported lines are then removed from the env files, and a file left with nothing but blank and comment lines is deleted. `--exclude VAR` leaves a variable where it is; `--dry-run` writes nothing. It refuses a name that is a generated secret or stored with a different value, two variables that would share a name, and an env-file line that isn't `KEY=VALUE`. Values it can't reproduce exactly (with `$`, escapes or several lines) are skipped with the reason. It never prints a value, needs the seed, and warns about env files that are tracked or not gitignored. Unlike `<<set:…>>` it writes no value into a Git blob. Running it again finishes what's left.
 - **`lst gc [--remove [NAME…]]`** deals with orphans (entries no marker uses any more, which `lst sync` and the hook mark but never delete):
   - `lst gc` lists them on stdout, one bare full name per line, sorted (`web/old`, `shared/x`), so the list can be piped into `lst gc --remove`. It is read-only; with no orphans stdout stays empty and stderr says so.
   - `lst gc --remove` deletes every orphan from `.sec/`; `lst gc --remove NAME…` only the named ones. Each name must be an orphan, otherwise nothing is removed. Commit `.sec/` afterwards.
@@ -232,6 +236,7 @@ stacks/<stack>/config/…      # optional template files with markers
 - [x] M3: `deploy` + `check` + CI (example pipeline in `docs/examples/woodpecker.yml`; first real Gitea/Woodpecker run still to be confirmed)
 - [x] M4: `x-deploy`
 - [x] M5: `rotate`, `gc`, `--all`, `--dry-run`
+- [x] M6: migration (`lst import`, [`docs/migration.md`](docs/migration.md))
 
 ## License
 

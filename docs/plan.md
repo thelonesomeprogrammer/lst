@@ -62,6 +62,7 @@ lst/
 | `lst rotate <stack>/<name>` | New id → new value |
 | `lst gc` | List or remove orphans (explicit) |
 | `lst get <stack>/<name>` | Print one secret's value (`--copy`: to the clipboard) |
+| `lst import <stack>` | Turn a stack's existing `.env` / `env_file:` values into manual secrets |
 
 ## Milestones
 
@@ -107,7 +108,14 @@ lst/
 - `lst rotate`, `lst gc`, `lst deploy --all`, good error messages, `--dry-run` for deploy.
 - _Done 2026-11-08._ Decisions and implementation choices in design.md "M5 lifecycle".
 
+### M6 — Migration
+- `lst import <stack> [--exclude VAR]… [--dry-run]`: existing `.env` / `env_file:` values → manual secrets, `${VAR}` and `env_file:` rewritten to `<<secret:…>>`, imported lines removed. Decisions in design.md "`lst import`".
+- `docs/migration.md`: the migration order below, written up for users, plus gen vs. secret and rotating an existing password into gen.
+- _Done 2026-11-08._
+
 ## Migration order (pilot → core)
+_Written up for users in [`docs/migration.md`](migration.md)._
+
 1. **Throwaway test stack** (Postgres + whoami/adminer): M1–M3.
 2. **Linkding** (playground, low stakes).
 3. **Mosquitto + Zigbee2MQTT + AppDaemon** (`shared/` names and a `pre` hasher, M4).
