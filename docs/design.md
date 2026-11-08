@@ -1,6 +1,6 @@
 # Lazy Secret Tool (`lst`) — design notes
 
-_Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in progress. Binary name: `lst`._
+_Started 2026-11-06. Own tool, written in Rust. Status: M0–M5 implemented. Binary name: `lst`._
 
 ## Requirements (tlp)
 1. tlp is never the source of randomness.
@@ -75,7 +75,7 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
 - **Seed in CI:** if the `LST_SEED` environment variable is set, lst uses it (same 64-lowercase-hex rules) and never writes it to disk. If `.env` also holds a seed, both must match. The `.env` ignore guard still runs whenever `.env` is read. `lst init` refuses to run while `LST_SEED` is set (init manages `.env`).
 - **`lst check`** lists every problem at once: `.sec/` is current for the working tree (a dry-run sync changes nothing); no `<<set:` in any blob of the `HEAD` tree (it's in history: rotate the secret); every `<<secret:…>>` has an entry. Without a seed it stops there (structural, e.g. for PR pipelines); with a seed it also checks the fingerprint and that every marker resolves (every ciphertext decrypts).
 - **`lst deploy <stack>…`** runs the full check once, then per stack (sorted): render `compose.yaml` and pipe it into `docker compose -p <stack> --project-directory stacks/<stack> -f - up -d --wait --remove-orphans`. Stops at the first failure and says which stacks were deployed. A stack name that isn't a valid compose project name (`[a-z0-9][a-z0-9_-]*`) is an error, not silently lowercased.
-- **`lst deploy --changed-since REV`** deploys the stacks affected by `REV..HEAD`: any change under `stacks/<s>/` or in `.sec/<s>.toml`; a change in `.sec/shared.toml` affects only the stacks using a shared name whose entry changed; a change in `.sec/meta.toml` affects every stack. Deleted stacks are reported, not torn down (M5). Can't be combined with explicit stacks.
+- **`lst deploy --changed-since REV`** deploys the stacks affected by `REV..HEAD`: any change under `stacks/<s>/` or in `.sec/<s>.toml`; a change in `.sec/shared.toml` affects only the stacks using a shared name whose entry changed; a change in `.sec/meta.toml` affects every stack. Deleted stacks are reported, not torn down. Can't be combined with explicit stacks.
 - **Woodpecker:** the example pipeline (`docs/examples/woodpecker.yml`) builds lst with `cargo install --locked --git … --tag …` (cached) and deploys with the Docker socket mounted (trusted repo), `LST_SEED` from a Woodpecker secret. Publishing a prebuilt image is left for later.
 
 ### x-deploy details (decided 2026-11-07, before M4)
@@ -101,6 +101,20 @@ _Started 2026-11-06. Own tool, written in Rust. Status: design complete, M0 in p
   - *Errors:* every unresolved name of a stack (compose, commands, `render:` files) is reported in one list under the stack's `compose.yaml`; a user-set `lst.render-hash` label is an error on any service.
   - *Deploy wiring (part Z):* stacks are still rendered one at a time inside the deploy loop (as in M3), so "up front" checks of a stack (its steps' service names against compose's `[a-zA-Z0-9._-]+`) happen before anything runs *for that stack*, not before earlier stacks deploy. The `docker ps` hash reads go in sorted service order, once per service with an `on-change` step, before any file is written. An `on-change` step is skipped only if the existing label is present and equal to the new hash. Messages: `wrote <to>`, `mode fixed <to>`, `skipped x-deploy.<phase>[i] (<service>): inputs unchanged`; a failing `pre` adds "so `docker compose up` did not run for this stack", a failing `post` "the stack is up …", both inside the usual deployed/failed/not-attempted summary.
   - *Found with real Docker (part Z):* Mosquitto 2.1's `mosquitto_passwd -c` refuses an existing file, so the `pre` example above fails from the second deploy on; it needs `rm -f <file> &&` first (README shows that). The 2.1 image's entrypoint also no longer chowns `/mosquitto`, so the root-created `0600` password file needs a `chown mosquitto:mosquitto` step. Compose interpolates `$` in every value of the file it reads, so a manual secret with `$` arrived changed; tlp decided to escape it (see "`$` in values" below).
+
+### M5 lifecycle (decided 2026-11-08)
+- **Decided 2026-11-08 by tlp:**
+  - *`lst rotate <full name>`* only rotates a generated secret that is in use: a new random id, the same format (so a new value). A manual secret is refused with a hint to write `<<set:name:VALUE>>`; an orphan is refused (nothing uses it; the message points at `lst gc --remove`); a name with no entry hints at `lst sync`. It touches no other entry. Afterwards: commit `.sec/`, deploy the stacks that use the name. Apps that only read a value on first start (a database's initial password) keep the old one; documented, not handled.
+  - *`lst gc`* lists the orphans (read-only); `lst gc --remove` deletes all of them from `.sec/`, `lst gc --remove NAME…` only the named ones. All-or-nothing: each name must exist and be an orphan, otherwise nothing is removed. A removed gen name whose marker comes back gets a new id.
+  - *`lst deploy --dry-run` never invokes docker*, so it can't read the existing containers' `lst.render-hash`: `on-change` steps are reported as conditional, not as run or skipped.
+  - *No teardown in M5:* a stack deleted under `--changed-since` stays reported, not torn down (`docker compose -p <s> down` by hand).
+- **Implementation choices (raised by Claude Code during M5, pending review by tlp):**
+  - *Stale-orphan guard:* `lst gc` (list and `--remove`) refuses while the orphan flags in `.sec/` aren't current for the working tree (a dry-run sync would orphan or un-orphan a name) and asks for `lst sync`. Otherwise it could delete a name whose marker came back since the last sync, and the next sync would give it a new value.
+  - *Same guards as sync/rename:* `gc` and `rotate` need the seed and check its fingerprint (and the `.env` ignore guard), although neither derives anything. So `lst gc` doesn't run in a seedless CI step.
+  - *Emptied stack file:* a `.sec/<stack>.toml` that loses its last entry (gc, as after `rename`) is kept, written as just the header.
+  - *gc's output:* the list goes to stdout as bare full names, one per line, sorted, so it can be piped into `lst gc --remove`; "no orphans" and the `--remove` report go to stderr.
+  - *Dry run:* runs everything a deploy runs before docker (seed, full check, target selection, rendering, step service names, the read-only comparison of each `render:` file with its target) and prints `would …` lines on stderr in deploy order. It is silent for `render:` files that are up to date, and never prints a value or a step's command, only `x-deploy.<phase>[i] (<service>)` and the compose arguments. A failure is reported with its own wording (stopped at stack X; nothing was run or written) instead of the deploy's deployed/failed/not-attempted summary.
+  - *`--all`* deploys every existing stack, sorted, and is exclusive with explicit stacks and `--changed-since` (one target form per call).
 
 ## Manual secrets (decided 2026-11-06)
 - **Enter or replace inline:** write `<<set:name:VALUE>>` in the compose file.
@@ -172,7 +186,7 @@ _(Example updated 2026-11-07: since Mosquitto 2.1, `mosquitto_passwd -c` refuses
 - **Pre-commit hook:** runs `lst`. If `.sec/` is current, it exits silently; if missing or stale, `lst` rewrites it and `git add`s it into the same commit. It also processes `<<set:…>>` markers.
   - Must read the *staged* compose content, not the working tree.
 - **Deploy (Woodpecker):** verify `.sec/` is current and that no `<<set:` is committed (backstop for `--no-verify` and fresh clones without the hook), then `lst deploy`. Writes no state.
-- **Orphans:** names that vanish from compose are marked as orphans, never deleted automatically (the DB still uses the old password). Removed only by an explicit cleanup command.
+- **Orphans:** names that vanish from compose are marked as orphans, never deleted automatically (the DB still uses the old password). Removed only by an explicit cleanup command (`lst gc --remove`, M5).
 - **Rename hint:** if one name disappears and one appears in the same stack, print a hint; don't block the commit.
 
 ## Guardrails
@@ -181,4 +195,4 @@ _(Example updated 2026-11-07: since Mosquitto 2.1, `mosquitto_passwd -c` refuses
 - Marked files aren't valid until rendered, so deploy only goes through the tool.
 
 ## Status
-- Design complete. Implementation plan: `docs/plan.md`. M0 (core library) in progress in Claude Code.
+- Design complete. Implementation plan: `docs/plan.md`. M0–M5 implemented (2026-11-08).
