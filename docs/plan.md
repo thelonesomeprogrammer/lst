@@ -61,6 +61,7 @@ lst/
 | `lst rename <stack>/<old> <new>` | Rename keeping the value (`--replace` if the target exists) |
 | `lst rotate <stack>/<name>` | New id → new value |
 | `lst gc` | List or remove orphans (explicit) |
+| `lst get <stack>/<name>` | Print one secret's value (`--copy`: to the clipboard) |
 
 ## Milestones
 
