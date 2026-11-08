@@ -729,6 +729,67 @@ fn merge_env_files(doc: &mut Value, files: &BTreeMap<String, Parsed>) {
     }
 }
 
+/// What an ambiguous value is replaced with for the typing check: an
+/// integer to serde_yaml_ng as a plain scalar, a string anywhere else.
+const PROBE: &str = "1";
+
+/// Whether `v`, as a whole plain YAML scalar, might not be a string for
+/// some YAML parser (1.1 or 1.2): empty, a null or bool spelling (`~`,
+/// `null`, `yes`, `off`, …), or something shaped like a number, timestamp
+/// or special float: after an optional sign it starts with a digit or `.`
+/// and holds nothing but hex digits, `x o . _ : + - t z n i` (either case)
+/// and spaces (`0777`, `0x1F`, `1e3`, `12:30`, `2001-12-14`, `.NaN`).
+/// Conservative: a false positive only costs the probe check; `0ld-pw`
+/// or `9lives` are plain strings everywhere and pass.
+fn type_ambiguous(v: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "", "~", "null", "Null", "NULL", "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO",
+        "true", "True", "TRUE", "false", "False", "FALSE", "on", "On", "ON", "off", "Off", "OFF",
+        "=",
+    ];
+    let t = v.trim();
+    if WORDS.contains(&t) {
+        return true;
+    }
+    let t = t.strip_prefix(['-', '+']).unwrap_or(t);
+    t.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && t.chars()
+            .all(|c| c.is_ascii_hexdigit() || "xXoO._:+-tTzZnNiI ".contains(c))
+}
+
+/// `files` with the values of the variables in `vars` replaced by [`PROBE`].
+fn probe_files(
+    files: &BTreeMap<String, Parsed>,
+    vars: &BTreeSet<String>,
+) -> BTreeMap<String, Parsed> {
+    files
+        .iter()
+        .map(|(rel, p)| {
+            let p = match p {
+                Parsed::Missing => Parsed::Missing,
+                Parsed::Unusable(why) => Parsed::Unusable(why.clone()),
+                Parsed::Defs(d) => Parsed::Defs(Defs {
+                    vars: d
+                        .vars
+                        .iter()
+                        .map(|(k, v)| {
+                            let v = match v {
+                                Ok(_) if vars.contains(k) => {
+                                    Ok(SecretString::new(PROBE.to_owned()))
+                                }
+                                v => v.clone(),
+                            };
+                            (k.clone(), v)
+                        })
+                        .collect(),
+                    lines: d.lines.clone(),
+                }),
+            };
+            (rel.clone(), p)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The text of env_file: blocks
 // ---------------------------------------------------------------------------
@@ -1160,6 +1221,7 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
             });
         }
     }
+    let crlf = text.contains("\r\n");
     let mut snippets: Vec<String> = vec![String::new(); tblocks.len()];
     // Per block: the variables its replacement (or snippet) uses.
     let mut block_used: Vec<Vec<String>> = vec![Vec::new(); tblocks.len()];
@@ -1262,6 +1324,12 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
             }
             pieces.push((tb.span.clone(), new));
         }
+        if crlf {
+            // New lines follow the file's line ending.
+            for (_, s) in &mut pieces {
+                *s = s.replace('\n', "\r\n");
+            }
+        }
         edits.push(Edit {
             pieces,
             what: EditOf::Block(bi),
@@ -1269,16 +1337,52 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
     }
 
     // Try each edit, in text order.
-    let base = meaning(text, &values, &env, &files).map_err(|why| ImportError::Compose {
+    let compose_err = |why| ImportError::Compose {
         path: compose_path.clone(),
         why,
-    })?;
+    };
+    let base = meaning(text, &values, &env, &files).map_err(compose_err)?;
+    // A value some YAML parser could read as something other than a string
+    // when it is a whole plain scalar (`0777` is octal to compose's parser,
+    // a string to serde_yaml_ng) gets a second check, with a probe value
+    // that serde_yaml_ng itself types as an integer there: the edit is kept
+    // only where the marker ends up inside a string either way.
+    let ambiguous: BTreeSet<String> = cands
+        .iter()
+        .filter(|(_, c)| type_ambiguous(c.value.expose()))
+        .map(|(v, _)| v.clone())
+        .collect();
+    let probe = if ambiguous.is_empty() {
+        None
+    } else {
+        let p = SecretString::new(PROBE.to_owned());
+        let p_values: BTreeMap<String, SecretString> = values
+            .iter()
+            .map(|(name, v)| {
+                let probed = names.get(name).is_some_and(|var| ambiguous.contains(var));
+                (name.clone(), if probed { p.clone() } else { v.clone() })
+            })
+            .collect();
+        let p_env: Env = env
+            .iter()
+            .map(|(k, v)| {
+                let probed = ambiguous.contains(k) && v.is_some();
+                (k.clone(), if probed { Some(p.clone()) } else { v.clone() })
+            })
+            .collect();
+        let p_files = probe_files(&files, &ambiguous);
+        let p_base = meaning(text, &p_values, &p_env, &p_files).map_err(compose_err)?;
+        Some((p_values, p_env, p_files, p_base))
+    };
     edits.sort_by_key(|e| e.pieces[0].0.start);
     let mut accepted: Vec<usize> = Vec::new();
     for i in 0..edits.len() {
-        let ok = apply(text, accepted.iter().chain([&i]).map(|&j| &edits[j]))
-            .and_then(|cand| meaning(&cand, &values, &env, &files).ok())
-            .is_some_and(|d| d == base);
+        let ok = apply(text, accepted.iter().chain([&i]).map(|&j| &edits[j])).is_some_and(|cand| {
+            meaning(&cand, &values, &env, &files).is_ok_and(|d| d == base)
+                && probe.as_ref().is_none_or(|(pv, pe, pf, pb)| {
+                    meaning(&cand, pv, pe, pf).is_ok_and(|d| d == *pb)
+                })
+        });
         if ok {
             accepted.push(i);
         }
@@ -1383,23 +1487,38 @@ pub fn plan(input: &Input<'_>) -> Result<Plan, ImportError> {
     })
 }
 
-/// Every stack-relative file the `env_file:` entries of `compose` name, or
-/// `None` if one of them can't be followed (it might name any file).
+/// Every stack-relative file an `env_file:` key anywhere in `compose` names
+/// (services, but also anchors and extension fields that merge keys bring
+/// into services), or `None` if one of them can't be followed (it might
+/// name any file).
 fn env_file_refs_all(compose: &str) -> Option<BTreeSet<String>> {
-    let doc = serde_yaml_ng::from_str::<Value>(compose).ok().map(Doc)?;
-    let mut out = BTreeSet::new();
-    for svc in services(&doc.0) {
-        if let Some(ef) = svc.get("env_file") {
-            for r in env_refs(ef)? {
-                if r.raw.contains('$') {
-                    return None;
+    fn walk(v: &Value, out: &mut BTreeSet<String>) -> Option<()> {
+        match v {
+            Value::Mapping(m) => {
+                for (k, v) in m {
+                    if k.as_str() == Some("env_file") {
+                        for r in env_refs(v)? {
+                            if r.raw.contains('$') {
+                                return None;
+                            }
+                            if let Some(p) = normalize_path(&r.raw) {
+                                out.insert(p);
+                            }
+                        }
+                    } else {
+                        walk(v, out)?;
+                    }
                 }
-                if let Some(p) = normalize_path(&r.raw) {
-                    out.insert(p);
-                }
+                Some(())
             }
+            Value::Sequence(seq) => seq.iter().try_for_each(|v| walk(v, out)),
+            Value::Tagged(t) => walk(&t.value, out),
+            _ => Some(()),
         }
     }
+    let doc = serde_yaml_ng::from_str::<Value>(compose).ok().map(Doc)?;
+    let mut out = BTreeSet::new();
+    walk(&doc.0, &mut out)?;
     Some(out)
 }
 

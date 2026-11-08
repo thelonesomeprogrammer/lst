@@ -2,23 +2,29 @@
 //! `${VAR}` interpolation) and the files named by `env_file:`. Pure: text in,
 //! definitions out. Used by `lst import` only.
 //!
-//! The syntax is the common subset of compose's dotenv format:
+//! The rules follow what `docker compose config` (Compose v5) does with each
+//! form, checked against it by the `compose_config` e2e tests:
+//! - a UTF-8 BOM at the start is ignored; a trailing `\r` is stripped;
 //! - blank lines and lines starting with `#` (after whitespace) are skipped;
-//! - `KEY=VALUE`, optionally prefixed with `export `; whitespace around the
-//!   key and around `=` is ignored; a trailing `\r` is stripped;
-//! - `KEY` is `[A-Za-z_][A-Za-z0-9_.-]*`;
-//! - an unquoted value ends at the end of the line or at a `#` that follows
-//!   whitespace (a comment); surrounding whitespace is trimmed;
-//! - `'single quoted'` is literal; `"double quoted"` knows `\\`, `\"` and
-//!   `\'`; after the closing quote only whitespace or a comment may follow.
+//! - `KEY=VALUE` or `KEY: VALUE` (whichever separator comes first),
+//!   optionally prefixed with `export `; whitespace around the key and the
+//!   separator is ignored. `KEY` is `[A-Za-z0-9_.-]+`;
+//! - an unquoted value is trimmed and ends at a `#` that follows a space (a
+//!   tab before `#` doesn't start a comment); backslashes are literal;
+//! - a `'single quoted'` value is literal except that `\'` is a quote; a
+//!   quote closes the value unless an odd number of backslashes precede it;
+//! - a `"double quoted"` value turns `\\`, `\"` and `\$` into `\`, `"` and
+//!   `$`; a backslash before any other non-alphanumeric character stays
+//!   (`\'` is two characters).
 //!
-//! A value lst can't reproduce exactly is a [`Skip`], not an error, so the
-//! rest of the file can still be imported: compose would interpolate a `$`
-//! in an unquoted or double-quoted value, a double-quoted value may contain
-//! other escapes (`\n`, …), and a quote may span lines. A line that is
-//! not a definition at all (`KEY` without `=`, a bad key, an unclosed quote)
-//! is an [`DotenvError`]: lst would otherwise guess what compose does with
-//! it.
+//! A definition lst can't reproduce exactly is a [`Skip`], not an error, so
+//! the rest of the file can still be imported: compose would interpolate a
+//! `$` in an unquoted or double-quoted value; a double-quoted value with a
+//! letter or digit escape (`\n`, `\t`, `\0`, …); a value spanning lines;
+//! text after the closing quote (compose ignores some of it and rejects
+//! some); a `KEY` without a value (compose takes it from its own
+//! environment). A line that isn't a definition at all (a key with spaces or
+//! quotes in it) is a [`DotenvError`].
 //!
 //! Errors and skips carry the variable name and a line number (1-based),
 //! never the value.
@@ -46,10 +52,14 @@ pub enum Value {
 pub enum Skip {
     /// An unquoted or double-quoted value with `$`: compose interpolates it.
     Dollar,
-    /// A double-quoted value with an escape other than `\\`, `\"`, `\'`.
+    /// A double-quoted value with a letter or digit escape (`\n`, …).
     Escape,
     /// A quoted value that doesn't end on its line (multi-line).
     MultiLine,
+    /// Text after the closing quote.
+    AfterQuote,
+    /// `KEY` alone: compose takes the value from its own environment.
+    NoValue,
 }
 
 impl std::fmt::Display for Skip {
@@ -58,6 +68,8 @@ impl std::fmt::Display for Skip {
             Skip::Dollar => "its value contains `$`, which compose would interpolate",
             Skip::Escape => "its value uses an escape sequence such as `\\n`",
             Skip::MultiLine => "its value spans more than one line",
+            Skip::AfterQuote => "its line has more text after the closing quote",
+            Skip::NoValue => "it has no value here (compose takes it from its own environment)",
         })
     }
 }
@@ -66,13 +78,12 @@ impl std::fmt::Display for Skip {
 pub enum DotenvError {
     #[error("line {line}: not a KEY=VALUE line (lst import can't tell what compose makes of it)")]
     NotADefinition { line: usize },
-    #[error("line {line}: {key}: unexpected text after the closing quote")]
-    AfterQuote { line: usize, key: String },
 }
 
 /// Parses `text`. Definitions come in file order; a key defined twice
 /// appears twice (the last one wins, as in compose).
 pub fn parse(text: &str) -> Result<Vec<Def>, DotenvError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut out = Vec::new();
     let mut lines = text.split('\n').enumerate();
     while let Some((i, raw)) = lines.next() {
@@ -81,35 +92,39 @@ pub fn parse(text: &str) -> Result<Vec<Def>, DotenvError> {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        let l = l.strip_prefix("export ").map_or(l, str::trim_start);
-        let Some((key, rest)) = l.split_once('=') else {
-            return Err(DotenvError::NotADefinition { line });
+        let l = match l.strip_prefix("export") {
+            Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start(),
+            _ => l,
+        };
+        let (key, rest) = match l.find(['=', ':']) {
+            Some(i) => (&l[..i], Some(&l[i + 1..])),
+            None => (l, None),
         };
         let key = key.trim_end();
         if !is_key(key) {
             return Err(DotenvError::NotADefinition { line });
         }
-        let rest = rest.trim_start();
-        let value = match rest.chars().next() {
-            Some(q @ ('\'' | '"')) => match quoted(&rest[1..], q) {
-                Some((value, after)) => {
-                    let after = after.trim_start();
-                    if !(after.is_empty() || after.starts_with('#')) {
-                        return Err(DotenvError::AfterQuote {
-                            line,
-                            key: key.to_owned(),
-                        });
+        let value = match rest.map(str::trim_start) {
+            None => Value::Skip(Skip::NoValue),
+            Some(rest) => match rest.chars().next() {
+                Some(q @ ('\'' | '"')) => match quoted(&rest[1..], q) {
+                    Some((value, after)) => {
+                        let after = after.trim_start();
+                        if after.is_empty() || after.starts_with('#') {
+                            value
+                        } else {
+                            Value::Skip(Skip::AfterQuote)
+                        }
                     }
-                    value
-                }
-                None => {
-                    // The quote continues on later lines: skip to its end so
-                    // its continuation lines aren't read as definitions.
-                    skip_continuation(&mut lines, q);
-                    Value::Skip(Skip::MultiLine)
-                }
+                    None => {
+                        // The quote continues on later lines: skip to its end
+                        // so its continuation lines aren't read as definitions.
+                        skip_continuation(&mut lines, q);
+                        Value::Skip(Skip::MultiLine)
+                    }
+                },
+                _ => unquoted(rest),
             },
-            _ => unquoted(rest),
         };
         out.push(Def {
             key: key.to_owned(),
@@ -120,80 +135,75 @@ pub fn parse(text: &str) -> Result<Vec<Def>, DotenvError> {
     Ok(out)
 }
 
-/// `[A-Za-z_][A-Za-z0-9_.-]*`.
+/// `[A-Za-z0-9_.-]+`.
 fn is_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-/// An unquoted value: up to a `#` after whitespace, trimmed.
+/// An unquoted value: up to a `#` after a space, trimmed.
 fn unquoted(rest: &str) -> Value {
-    let mut end = rest.len();
-    let mut prev_space = false;
-    for (i, c) in rest.char_indices() {
-        if c == '#' && prev_space {
-            end = i;
-            break;
-        }
-        prev_space = c == ' ' || c == '\t';
-    }
-    let v = rest[..end].trim_end();
+    let end = rest.find(" #").unwrap_or(rest.len());
+    let v = rest[..end].trim();
     if v.contains('$') {
         return Value::Skip(Skip::Dollar);
     }
     Value::Ok(SecretString::new(v.to_owned()))
 }
 
+/// The byte index in `s` of the first `q` not escaped by an odd number of
+/// backslashes.
+fn closing(s: &str, q: char) -> Option<usize> {
+    let mut backslashes = 0;
+    for (i, c) in s.char_indices() {
+        if c == q && backslashes % 2 == 0 {
+            return Some(i);
+        }
+        backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+    }
+    None
+}
+
 /// The quoted value after the opening quote `q`, and the text after the
 /// closing quote; `None` if it doesn't close on this line.
 fn quoted(s: &str, q: char) -> Option<(Value, &str)> {
+    let end = closing(s, q)?;
+    let (body, after) = (&s[..end], &s[end + 1..]);
     if q == '\'' {
-        let end = s.find('\'')?;
-        let v = SecretString::new(s[..end].to_owned());
-        return Some((Value::Ok(v), &s[end + 1..]));
+        let v = SecretString::new(body.replace("\\'", "'"));
+        return Some((Value::Ok(v), after));
     }
-    let mut out = SecretString::new(String::with_capacity(s.len()));
-    let mut skip = None;
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
+    let mut out = SecretString::new(String::with_capacity(body.len()));
+    let o = out.as_mut_string();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
         match c {
-            '"' => {
-                let value = match skip {
-                    Some(s) => Value::Skip(s),
-                    None => Value::Ok(out),
-                };
-                return Some((value, &s[i + 1..]));
-            }
             '\\' => match chars.next() {
-                Some((_, e @ ('\\' | '"' | '\''))) => out.as_mut_string().push(e),
-                Some(_) => skip = skip.or(Some(Skip::Escape)),
-                None => return None,
+                Some(e @ ('\\' | '"' | '$')) => o.push(e),
+                Some(e) if e.is_ascii_alphanumeric() => {
+                    return Some((Value::Skip(Skip::Escape), after));
+                }
+                Some(e) => {
+                    o.push('\\');
+                    o.push(e);
+                }
+                // `closing` never ends the body on an odd backslash.
+                None => o.push('\\'),
             },
-            '$' => {
-                skip = skip.or(Some(Skip::Dollar));
-            }
-            c => out.as_mut_string().push(c),
+            '$' => return Some((Value::Skip(Skip::Dollar), after)),
+            c => o.push(c),
         }
     }
-    None
+    Some((Value::Ok(out), after))
 }
 
 /// Consumes lines up to and including the one that closes quote `q`.
 fn skip_continuation<'a>(lines: &mut impl Iterator<Item = (usize, &'a str)>, q: char) {
     for (_, l) in lines.by_ref() {
-        let mut escaped = false;
-        for c in l.chars() {
-            if q == '"' && c == '\\' && !escaped {
-                escaped = true;
-                continue;
-            }
-            if c == q && !escaped {
-                return;
-            }
-            escaped = false;
+        if closing(l, q).is_some() {
+            return;
         }
     }
 }
@@ -201,6 +211,7 @@ fn skip_continuation<'a>(lines: &mut impl Iterator<Item = (usize, &'a str)>, q: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn defs(text: &str) -> Vec<(String, usize, Result<String, Skip>)> {
         parse(text)
@@ -216,10 +227,101 @@ mod tests {
             .collect()
     }
 
-    fn one(text: &str) -> Result<String, Skip> {
+    fn one(text: &str) -> (String, Result<String, Skip>) {
         let mut d = defs(text);
         assert_eq!(d.len(), 1, "{text:?}");
-        d.remove(0).2
+        let (k, _, v) = d.remove(0);
+        (k, v)
+    }
+
+    /// Each line as `docker compose config` (Compose v5.6.1) reads it in an
+    /// env_file, probed by hand on 2026-11-08: (line, key, value). Where
+    /// compose reads a value lst won't reproduce, the expected result is a
+    /// skip instead.
+    #[test]
+    fn matches_compose() {
+        let ok = |v: &str| Ok::<String, Skip>(v.to_owned());
+        let cases: &[(&str, &str, Result<String, Skip>)] = &[
+            // Single quotes: literal, `\'` is a quote.
+            (r"K='a\\b'", "K", ok(r"a\\b")),
+            (r"K='a\nb'", "K", ok(r"a\nb")),
+            (r"K='a\'b'", "K", ok("a'b")),
+            (r"K='a\''", "K", ok("a'")),
+            (r"K='\\\''", "K", ok(r"\\'")),
+            (r"K='a\\'", "K", ok(r"a\\")),
+            ("K='a$b'", "K", ok("a$b")),
+            ("K='$$'", "K", ok("$$")),
+            ("K='a#b' # c", "K", ok("a#b")),
+            // Double quotes.
+            (r#"K="a\\b""#, "K", ok(r"a\b")),
+            (r#"K="a\"b""#, "K", ok("a\"b")),
+            (r#"K="a\'b""#, "K", ok(r"a\'b")),
+            (r#"K="a\$b""#, "K", ok("a$b")),
+            (r#"K="a\/b""#, "K", ok(r"a\/b")),
+            (r#"K="a\#b""#, "K", ok(r"a\#b")),
+            (r#"K="a\ b""#, "K", ok(r"a\ b")),
+            (r#"K="a\\""#, "K", ok(r"a\")),
+            (r#"K="a\\\"b""#, "K", ok(r#"a\"b"#)),
+            (r##"K="a#b"#c"##, "K", ok("a#b")),
+            (r#"K=" #x""#, "K", ok(" #x")),
+            (r#"K="  sp  ""#, "K", ok("  sp  ")),
+            (r#"K="a b" "#, "K", ok("a b")),
+            (r#"K="x" # c"#, "K", ok("x")),
+            // Unquoted: trimmed, ` #` comments, backslashes literal.
+            ("K=a #b", "K", ok("a")),
+            ("K=a  #c", "K", ok("a")),
+            ("K=a #c#d", "K", ok("a")),
+            ("K=a\t#b", "K", ok("a\t#b")),
+            ("K=a#b", "K", ok("a#b")),
+            ("K=#x", "K", ok("#x")),
+            ("K= #x", "K", ok("#x")),
+            ("K=a b # c", "K", ok("a b")),
+            (r"K=a\nb", "K", ok(r"a\nb")),
+            (r"K=a\'b", "K", ok(r"a\'b")),
+            (r"K=a\", "K", ok(r"a\")),
+            ("K=x\"", "K", ok("x\"")),
+            ("K=it's", "K", ok("it's")),
+            ("K=`x`", "K", ok("`x`")),
+            ("K= lead", "K", ok("lead")),
+            ("K=\ty", "K", ok("y")),
+            ("K=x\t", "K", ok("x")),
+            ("K=", "K", ok("")),
+            ("K==x", "K", ok("=x")),
+            ("K==", "K", ok("=")),
+            ("K=a:b", "K", ok("a:b")),
+            ("K=été", "K", ok("été")),
+            // Keys and separators.
+            ("K = spaced ", "K", ok("spaced")),
+            ("K\t=tab", "K", ok("tab")),
+            ("export K=e", "K", ok("e")),
+            ("export  K=e2", "K", ok("e2")),
+            ("export=1", "export", ok("1")),
+            ("KEY:v", "KEY", ok("v")),
+            ("KEY : v", "KEY", ok("v")),
+            ("K: yamlish", "K", ok("yamlish")),
+            ("K:a=b", "K", ok("a=b")),
+            ("K.DOT-dash=1", "K.DOT-dash", ok("1")),
+            ("1K=x", "1K", ok("x")),
+            (" K=lead", "K", ok("lead")),
+            ("K=crlf\r", "K", ok("crlf")),
+            ("\u{feff}K=bom", "K", ok("bom")),
+            // Skips: compose reads something lst doesn't reproduce.
+            ("K=$$", "K", Err(Skip::Dollar)),
+            ("K=a$b", "K", Err(Skip::Dollar)),
+            (r#"K="a$b""#, "K", Err(Skip::Dollar)),
+            (r#"K="a\nb""#, "K", Err(Skip::Escape)),
+            (r#"K="a\tb""#, "K", Err(Skip::Escape)),
+            (r#"K="a\0""#, "K", Err(Skip::Escape)),
+            (r#"K="a\xb""#, "K", Err(Skip::Escape)),
+            (r#"K="x"y"#, "K", Err(Skip::AfterQuote)),
+            ("K='x'y", "K", Err(Skip::AfterQuote)),
+            ("K='x' y", "K", Err(Skip::AfterQuote)),
+            ("K", "K", Err(Skip::NoValue)),
+            ("export K", "K", Err(Skip::NoValue)),
+        ];
+        for (line, key, want) in cases {
+            assert_eq!(one(line), (key.to_string(), want.clone()), "{line:?}");
+        }
     }
 
     #[test]
@@ -241,61 +343,68 @@ mod tests {
     }
 
     #[test]
-    fn comments_and_hashes() {
-        assert_eq!(one("A=abc # note"), Ok("abc".into()));
-        assert_eq!(one("A=abc#not-a-comment"), Ok("abc#not-a-comment".into()));
-        assert_eq!(one("A='x # y' # z"), Ok("x # y".into()));
-        assert_eq!(one("A=\"x # y\"#z"), Ok("x # y".into()));
-    }
-
-    #[test]
-    fn quotes() {
-        assert_eq!(one("A='it\\s $raw'"), Ok("it\\s $raw".into()));
-        assert_eq!(one(r#"A="a\"b\\c\'d""#), Ok(r#"a"b\c'd"#.into()));
-        assert_eq!(one("A=''"), Ok(String::new()));
-        assert_eq!(one("A=\"pw with 'q'\""), Ok("pw with 'q'".into()));
-    }
-
-    #[test]
-    fn skips() {
-        assert_eq!(one("A=$HOME"), Err(Skip::Dollar));
-        assert_eq!(one("A=\"x${B}\""), Err(Skip::Dollar));
-        assert_eq!(one("A=\"a\\nb\""), Err(Skip::Escape));
+    fn multi_line_values_are_skipped_whole() {
         let d = defs("A=\"line1\nB=not a def\nline3\"\nC=ok\n");
         assert_eq!(d.len(), 2);
         assert_eq!(d[0].2, Err(Skip::MultiLine));
         assert_eq!((d[1].0.as_str(), d[1].1), ("C", 4));
-        let d = defs("A='open\nstill\n");
-        assert_eq!(d.len(), 1);
+        let d = defs("A='open\nB=x\\'still\nend'\nC=1\n");
+        assert_eq!(d.len(), 2);
         assert_eq!(d[0].2, Err(Skip::MultiLine));
+        assert_eq!(d[1].0, "C");
+        // Never closed: the rest of the file belongs to it.
+        let d = defs("A='open\nB=1\n");
+        assert_eq!(d.len(), 1);
     }
 
     #[test]
     fn duplicates_are_kept_in_order() {
         let d = defs("A=1\nA=2\n");
         assert_eq!(d.len(), 2);
+        assert_eq!((d[0].1, d[1].1), (1, 2));
         assert_eq!(d[1].2, Ok("2".into()));
     }
 
     #[test]
     fn errors_name_lines_not_values() {
-        assert_eq!(
-            parse("A=1\nhunter2\n").unwrap_err(),
-            DotenvError::NotADefinition { line: 2 }
-        );
-        assert_eq!(
-            parse("1A=x").unwrap_err(),
-            DotenvError::NotADefinition { line: 1 }
-        );
-        let e = parse("PW='hunter2'oops").unwrap_err();
-        assert_eq!(
-            e,
-            DotenvError::AfterQuote {
-                line: 1,
-                key: "PW".into()
+        for (text, line) in [
+            ("A=1\nhunter 2\n", 2),
+            ("'K'=x", 1),
+            ("K K=x", 1),
+            ("=x", 1),
+            ("pass\"word\n", 1),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert_eq!(e, DotenvError::NotADefinition { line }, "{text:?}");
+            for word in ["hunter", "pass", "word"] {
+                assert!(!e.to_string().contains(word));
             }
-        );
-        assert!(!e.to_string().contains("hunter2"));
-        assert!(!e.to_string().contains("oops"));
+        }
+    }
+
+    proptest! {
+        /// Any text: no panic, and an error never quotes it.
+        #[test]
+        fn never_panics_or_leaks(text in "\\PC{0,80}", secret in "[a-z]{12}") {
+            let text = format!("{text}\nX{secret}Y Z={secret}\n");
+            match parse(&text) {
+                Ok(_) => {}
+                Err(e) => prop_assert!(!e.to_string().contains(&secret)),
+            }
+        }
+
+        /// A value written as `K='…'` (no `'` inside) reads back exactly.
+        #[test]
+        fn single_quoted_round_trip(v in "[^'\n\r]{0,40}") {
+            let (k, got) = one(&format!("K='{v}'"));
+            prop_assert_eq!(k, "K");
+            // A trailing odd backslash escapes the closing quote.
+            let odd = v.len() - v.trim_end_matches('\\').len();
+            if odd % 2 == 1 {
+                prop_assert_eq!(got, Err(Skip::MultiLine));
+            } else {
+                prop_assert_eq!(got, Ok(v.replace("\\'", "'")));
+            }
+        }
     }
 }
