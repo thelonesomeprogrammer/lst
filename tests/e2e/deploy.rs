@@ -397,10 +397,7 @@ fn an_invalid_project_name_deploys_nothing() {
         run.fails_with(&[&format!(
             "stack name {name:?} is not a valid docker compose project name"
         )]);
-        assert!(
-            run.stderr
-                .contains(&format!("rename the directory stacks/{name}"))
-        );
+        assert!(run.stderr.contains("rename the stack's directory"));
     }
     // Picked by --changed-since: the same.
     deploy(&repo, &fake, &["--changed-since", "HEAD~1"], &seed, DEFAULT)
@@ -770,9 +767,9 @@ fn changed_since_a_deleted_stack_with_an_orphaned_shared_name() {
     // shared.toml only changed in orphan flags: nobody is redeployed.
     assert_eq!(
         changed_since(&repo, &fake, "HEAD~1"),
-        "lst: not deploying c: it changed but has no stacks/c/compose.yaml any more (lst does \
+        "lst: not deploying c: it changed but stacks/c/ has no compose file any more (lst does \
          not tear stacks down; run `docker compose -p c down` if it should go)\n\
-         lst: not deploying d: it changed but has no stacks/d/compose.yaml any more (lst does \
+         lst: not deploying d: it changed but stacks/d/ has no compose file any more (lst does \
          not tear stacks down; run `docker compose -p d down` if it should go)\n\
          lst: nothing to deploy\n"
     );

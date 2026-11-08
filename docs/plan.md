@@ -35,7 +35,7 @@ lst/
 - Dev: `proptest` for the marker parser, `tempfile` for end-to-end repos.
 
 ## `.sec/` on-disk format
-- `.sec/meta.toml`: format version + seed fingerprint.
+- `.sec/meta.toml`: format version + seed fingerprint (+ `stacks_dir`, only when it isn't the default `stacks`).
 - `.sec/<stack>.toml` (+ `.sec/shared.toml`): one file per stack keeps diffs small and avoids merge conflicts.
   ```toml
   [gen.db]
@@ -61,6 +61,7 @@ lst/
 | `lst rename <stack>/<old> <new>` | Rename keeping the value (`--replace` if the target exists) |
 | `lst rotate <stack>/<name>` | New id → new value |
 | `lst gc` | List or remove orphans (explicit) |
+| `lst stacks-dir [DIR]` | Show or set the stacks directory (`stacks_dir` in `.sec/meta.toml`) |
 | `lst get <stack>/<name>` | Print one secret's value (`--copy`: to the clipboard) |
 
 ## Milestones

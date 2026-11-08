@@ -4,7 +4,7 @@
 //! details".
 //!
 //! # Which stacks take the YAML path ([`detect`])
-//! A stack whose `compose.yaml` has a line starting with `x-deploy:`
+//! A stack whose compose file has a line starting with `x-deploy:`
 //! (quoted `"x-deploy":` / `'x-deploy':` too, spaces before the `:`
 //! allowed) takes the YAML path. Every other stack keeps the raw-text
 //! rendering of M1–M3 byte for byte, and its YAML is never parsed, so a
@@ -82,7 +82,7 @@ use crate::crypto::{KeyedHasher, RenderHashKey, SecretString};
 use crate::marker::{self, MarkerKind, ParseError, ParseErrorKind};
 use crate::render::{self, RenderError, Unresolved};
 use crate::scan::{self, ScanError};
-use crate::stack::{COMPOSE_FILE, STACKS_DIR};
+use crate::stack::Layout;
 
 /// The top-level compose key.
 pub const KEY: &str = "x-deploy";
@@ -260,10 +260,6 @@ impl<E> From<ScanError> for Failure<E> {
     }
 }
 
-fn compose_path(stack: &str) -> String {
-    format!("{STACKS_DIR}/{stack}/{COMPOSE_FILE}")
-}
-
 fn invalid(path: &str, at: impl Into<String>, problem: impl Into<String>) -> XDeployError {
     XDeployError::Invalid {
         path: path.to_owned(),
@@ -376,11 +372,13 @@ fn is_plain(s: &str) -> bool {
 }
 
 fn parse<'f, B: AsRef<[u8]>>(
+    layout: &Layout,
     stack: &str,
+    path: &str,
     text: &str,
     files: &'f [(String, B)],
 ) -> Result<Parsed<'f>, XDeployError> {
-    let path = compose_path(stack);
+    let path = path.to_owned();
     let mut doc = parse_yaml(&path, text)?;
     let Some(top) = doc.0.as_mapping_mut() else {
         return Err(invalid(&path, "the document", "must be a mapping"));
@@ -390,7 +388,7 @@ fn parse<'f, B: AsRef<[u8]>>(
     };
     let section = Doc(section);
     let services = service_names(&path, top)?;
-    let prefix = format!("{STACKS_DIR}/{stack}/");
+    let prefix = layout.stack_prefix(stack);
     let stack_files: BTreeMap<&str, &[u8]> = files
         .iter()
         .filter_map(|(p, b)| Some((p.strip_prefix(&prefix)?, b.as_ref())))
@@ -721,17 +719,19 @@ fn parse_run(path: &str, at: &str, v: &Value) -> Result<Run, XDeployError> {
     }
 }
 
-/// Validates the `x-deploy` section of a stack's `compose.yaml` (`text`,
+/// Validates the `x-deploy` section of a stack's compose file at `path` (`text`,
 /// raw) without rendering anything: YAML, the model, service references,
 /// `render:` sources and labels. `files` are the stack's files as `lst
 /// sync` reads them (repo-relative path, contents), the scope `from:` must
 /// be in. For `lst check`; [`render`] runs the same checks.
 pub fn check<B: AsRef<[u8]>>(
+    layout: &Layout,
     stack: &str,
+    path: &str,
     text: &str,
     files: &[(String, B)],
 ) -> Result<XDeploy, XDeployError> {
-    Ok(parse(stack, text, files)?.model)
+    Ok(parse(layout, stack, path, text, files)?.model)
 }
 
 /// `s` normalised as a `from:` path, for comparing a `from` given on the
@@ -850,12 +850,14 @@ fn render_steps<E, F: FnMut(&MarkerKind) -> Result<SecretString, E>>(
     Ok(out)
 }
 
-/// Renders an `x-deploy` stack: `text` is its raw `compose.yaml`, `files`
+/// Renders an `x-deploy` stack: `text` is its raw compose file (at `path`), `files`
 /// its files as `lst sync` reads them (repo-relative path, contents), `key`
 /// the render-hash key and `resolve` the same resolver as for
 /// [`render::render`]. See the module docs for the steps.
 pub fn render<B, E, F>(
+    layout: &Layout,
     stack: &str,
+    path: &str,
     text: &str,
     files: &[(String, B)],
     key: &RenderHashKey,
@@ -865,13 +867,13 @@ where
     B: AsRef<[u8]>,
     F: FnMut(&MarkerKind) -> Result<SecretString, E>,
 {
-    let path = compose_path(stack);
+    let path = path.to_owned();
     marker::parse(text).map_err(|e| scan::parse_error(&path, text, e))?;
     let Parsed {
         mut doc,
         model,
         sources,
-    } = parse(stack, text, files)?;
+    } = parse(layout, stack, &path, text, files)?;
 
     let mut r = Resolver {
         resolve,
@@ -883,7 +885,11 @@ where
     let mut rendered_files = Vec::with_capacity(model.render.len());
     for (f, source) in model.render.into_iter().zip(sources) {
         let contents = r.text(source, false).map_err(|e| {
-            scan::parse_error(&format!("{STACKS_DIR}/{stack}/{}", f.from), source, e)
+            scan::parse_error(
+                &format!("{}{}", layout.stack_prefix(stack), f.from),
+                source,
+                e,
+            )
         })?;
         rendered_files.push(RenderedFile {
             from: f.from,
@@ -1188,7 +1194,15 @@ mod tests {
         extra: &Files,
         k: &RenderHashKey,
     ) -> Result<Rendered, Failure<String>> {
-        render(STACK, text, &with_compose(text, extra), k, resolve)
+        render(
+            &Layout::default(),
+            STACK,
+            COMPOSE,
+            text,
+            &with_compose(text, extra),
+            k,
+            resolve,
+        )
     }
 
     #[track_caller]
@@ -1245,7 +1259,14 @@ mod tests {
     #[track_caller]
     fn invalid_model(text: &str, extra: &Files) -> String {
         let msg = fails(text, extra);
-        let checked = check(STACK, text, &with_compose(text, extra)).unwrap_err();
+        let checked = check(
+            &Layout::default(),
+            STACK,
+            COMPOSE,
+            text,
+            &with_compose(text, extra),
+        )
+        .unwrap_err();
         assert_eq!(checked.to_string(), msg);
         msg
     }
@@ -1631,7 +1652,14 @@ x-deploy:
     - {exec: mongo, run: echo hi, when: always}
 ",
         );
-        let model = check(STACK, &text, &with_compose(&text, &conf())).unwrap();
+        let model = check(
+            &Layout::default(),
+            STACK,
+            COMPOSE,
+            &text,
+            &with_compose(&text, &conf()),
+        )
+        .unwrap();
         assert_eq!(
             model.render,
             [
@@ -1701,7 +1729,14 @@ x-deploy:
         // Empty sections are fine.
         for section in ["  {}\n", "  render: []\n  pre: []\n  post: []\n"] {
             let text = stack(section);
-            let m = check(STACK, &text, &with_compose(&text, &Files::new())).unwrap();
+            let m = check(
+                &Layout::default(),
+                STACK,
+                COMPOSE,
+                &text,
+                &with_compose(&text, &Files::new()),
+            )
+            .unwrap();
             assert!(m.render.is_empty() && m.pre.is_empty() && m.post.is_empty());
         }
         assert_eq!(When::OnChange.as_str(), "on-change");
@@ -1860,7 +1895,13 @@ x-deploy:
         };
         fn entry_mode(section: &str) -> Result<u32, String> {
             let text = stack(section);
-            match check(STACK, &text, &with_compose(&text, &conf())) {
+            match check(
+                &Layout::default(),
+                STACK,
+                COMPOSE,
+                &text,
+                &with_compose(&text, &conf()),
+            ) {
                 Ok(m) => Ok(m.render[0].mode),
                 Err(e) => Err(e.to_string()),
             }
@@ -2009,7 +2050,14 @@ x-deploy:
         // Similar labels are fine, also on services with no inputs.
         let text = "x-deploy: {}\nservices:\n  a:\n    labels: [lst.render-hashes=1, 5, x]\n  \
                     b:\n    labels: {lst.render-hash.x: 1}\n  c:\n    labels: x\n  d: ~\n";
-        check(STACK, text, &with_compose(text, &Files::new())).unwrap();
+        check(
+            &Layout::default(),
+            STACK,
+            COMPOSE,
+            text,
+            &with_compose(text, &Files::new()),
+        )
+        .unwrap();
         render_ok(text, &Files::new());
         assert_eq!(normalize_from("./a//b/./c"), Some("a/b/c".into()));
         assert_eq!(normalize_from("../a"), None);

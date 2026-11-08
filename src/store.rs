@@ -1,7 +1,8 @@
 //! The `.sec/` store: names → generated-secret ids and sealed manual secrets.
 //!
 //! # Layout
-//! - `.sec/meta.toml`: `version = 1` and the seed `fingerprint`.
+//! - `.sec/meta.toml`: `version = 1`, the seed `fingerprint` and, only when it
+//!   isn't the default `stacks`, the `stacks_dir` ([`Layout`]).
 //! - `.sec/<stack>.toml` per stack, and `.sec/shared.toml` for `shared/…`
 //!   names:
 //!   ```toml
@@ -47,6 +48,7 @@ use serde::Serialize;
 use crate::crypto::{self, CryptoError, GenId, NONCE_LEN, Sealed, SecretString, Seed};
 use crate::format::{self, Format};
 use crate::marker::{self, MarkerKind};
+use crate::stack::Layout;
 
 /// The `.sec/` format version this build reads and writes.
 pub const VERSION: i64 = 1;
@@ -308,6 +310,9 @@ fn is_valid_name(name: &str) -> bool {
 pub struct Meta {
     /// Seed fingerprint, 32 lowercase hex characters.
     pub fingerprint: String,
+    /// Where the stacks live (`stacks_dir`; written only when it isn't the
+    /// default `stacks`, so older files stay byte-identical).
+    pub layout: Layout,
 }
 
 /// A generated secret: its value is derived from `seed || id`.
@@ -485,6 +490,7 @@ impl Store {
         Store {
             meta: Meta {
                 fingerprint: crypto::fingerprint(seed),
+                layout: Layout::default(),
             },
             files: BTreeMap::new(),
         }
@@ -492,6 +498,16 @@ impl Store {
 
     pub fn meta(&self) -> &Meta {
         &self.meta
+    }
+
+    /// Where the stacks live ([`Meta::layout`]).
+    pub fn layout(&self) -> &Layout {
+        &self.meta.layout
+    }
+
+    /// Sets where the stacks live. Changes only `meta.toml`.
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.meta.layout = layout;
     }
 
     /// File stem → contents.
@@ -1124,6 +1140,8 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
 struct RawMeta {
     version: i64,
     fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stacks_dir: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1240,6 +1258,15 @@ impl<'a> Fields<'a> {
         }
     }
 
+    /// A string field that may be missing.
+    fn optional_string(&mut self, field: &str) -> Result<Option<String>, StoreError> {
+        if self.table.contains_key(field) {
+            self.string(field).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn bool(&mut self, field: &str) -> Result<bool, StoreError> {
         match self.take(field, "boolean")? {
             toml::Value::Boolean(b) => Ok(b),
@@ -1276,6 +1303,7 @@ impl Meta {
         to_toml_with_header(&RawMeta {
             version: VERSION,
             fingerprint: self.fingerprint.clone(),
+            stacks_dir: (!self.layout.is_default()).then(|| self.layout.root().to_owned()),
         })
     }
 
@@ -1295,8 +1323,15 @@ impl Meta {
                 "field `fingerprint` must be {FINGERPRINT_HEX_LEN} lowercase hex characters"
             )));
         }
+        let layout = match f.optional_string("stacks_dir")? {
+            None => Layout::default(),
+            Some(dir) => Layout::new(&dir).map_err(|e| f.err(e.to_string()))?,
+        };
         f.finish()?;
-        Ok(Meta { fingerprint })
+        Ok(Meta {
+            fingerprint,
+            layout,
+        })
     }
 }
 
@@ -1580,7 +1615,25 @@ orphan = false
         let text = format!("{HEADER}\nversion = 1\nfingerprint = \"{FP}\"\n");
         let meta = Meta::parse(&text).unwrap();
         assert_eq!(meta.fingerprint, FP);
+        assert!(meta.layout.is_default());
         assert_eq!(meta.to_toml(), text);
+    }
+
+    #[test]
+    fn meta_with_a_stacks_dir_round_trips() {
+        for dir in [".", "apps", "a/b"] {
+            let text =
+                format!("{HEADER}\nversion = 1\nfingerprint = \"{FP}\"\nstacks_dir = \"{dir}\"\n");
+            let meta = Meta::parse(&text).unwrap();
+            assert_eq!(meta.layout.root(), dir);
+            assert_eq!(meta.to_toml(), text);
+        }
+        // The default is never written, so setting it back restores the
+        // old bytes.
+        let text =
+            format!("{HEADER}\nversion = 1\nfingerprint = \"{FP}\"\nstacks_dir = \"stacks\"\n");
+        let canonical = format!("{HEADER}\nversion = 1\nfingerprint = \"{FP}\"\n");
+        assert_eq!(Meta::parse(&text).unwrap().to_toml(), canonical);
     }
 
     #[test]
@@ -1792,6 +1845,14 @@ orphan = false
                 bad_fp,
             ),
             (format!("version = 1\nfingerprint = \"{FP}00\"\n"), bad_fp),
+            (
+                format!("version = 1\n{fp}stacks_dir = 1\n"),
+                ".sec/meta.toml: top level: field `stacks_dir` must be a string",
+            ),
+            (
+                format!("version = 1\n{fp}stacks_dir = \"../x\"\n"),
+                ".sec/meta.toml: top level: invalid stacks directory \"../x\"",
+            ),
             (
                 format!("version = 1\n{fp}extra = true\n"),
                 ".sec/meta.toml: top level: unknown field \"extra\"",
@@ -3416,7 +3477,7 @@ orphan = false
             fp in any::<[u8; 16]>(),
             files in proptest::collection::btree_map(any_stem(), any_stack_file(), 0..4),
         ) {
-            let store = Store { meta: Meta { fingerprint: hex(&fp) }, files };
+            let store = Store { meta: Meta { fingerprint: hex(&fp), layout: Layout::default() }, files };
             let out = store.to_files();
             let back = Store::from_files(&out["meta.toml"], &stems_of(&out)).unwrap();
             prop_assert_eq!(back.to_files(), out);

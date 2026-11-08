@@ -27,6 +27,9 @@ mod xdeploy;
 #[path = "e2e/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "e2e/layout.rs"]
+mod layout;
+
 #[path = "e2e/get.rs"]
 mod get;
 
