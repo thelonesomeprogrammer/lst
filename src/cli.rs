@@ -35,6 +35,7 @@ use crate::deploy::{self, DeployError, Phase, StepCommand, WriteOutcome};
 use crate::envfile::{self, EnvError};
 use crate::git::{self, ENV_FILE, GitError, IgnoreOutcome};
 use crate::hook::{self, HookError, Role};
+use crate::import::{self, BlockOutcome, FileState, ImportError};
 use crate::marker::MarkerKind;
 use crate::render::{self, RenderError};
 use crate::scan::{self, ScanError};
@@ -115,6 +116,29 @@ pub enum Command {
         /// remove; needs --remove.
         #[arg(value_name = "NAME", requires = "remove")]
         names: Vec<String>,
+    },
+    /// Turn a stack's existing .env / env_file values into manual secrets.
+    ///
+    /// For migrating a running stack. Reads stacks/<STACK>/.env (compose's
+    /// interpolation file) and every file an env_file: names, stores their
+    /// values encrypted in .sec/ (secret name: the variable name in
+    /// lowercase) and rewrites compose.yaml: ${VAR} becomes
+    /// <<secret:var>>, and each env_file: becomes an environment: block of
+    /// <<secret:…>> entries. Every rewrite is checked: it is kept only if
+    /// compose would read exactly the same values afterwards; one that
+    /// isn't is left as it was and reported (with the block to write by
+    /// hand, for env_file:). Then the imported lines are removed from the
+    /// env files (a file left empty is deleted). Never prints a value.
+    /// Needs the seed. Commit the result; the values stay the same.
+    Import {
+        /// The stack: stacks/<STACK>/compose.yaml.
+        stack: String,
+        /// Don't import this variable (repeat for more): it stays where it is.
+        #[arg(long, value_name = "VAR")]
+        exclude: Vec<String>,
+        /// Only show what would be done; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print the value of one secret to stdout (or copy it).
     ///
@@ -312,6 +336,27 @@ pub enum CliError {
          <<secret:{name}>>"
     )]
     SetInWorkingTree { path: String, name: String },
+    #[error(transparent)]
+    Import(#[from] ImportError),
+    #[error(
+        "{path} has a <<set:{name}:…>>: commit it first (the pre-commit hook stores the value), \
+         then run lst import"
+    )]
+    ImportSet { path: String, name: String },
+    #[error(
+        "{name} is already a generated secret (<<gen:…>>) in .sec/; pass --exclude {var}, or \
+         rename one of them first"
+    )]
+    ImportGenExists { name: String, var: String },
+    #[error(
+        "{name} is already stored with a different value than {var} has in {file}; pass \
+         --exclude {var}, or replace the stored value with <<set:…>>"
+    )]
+    ImportDiffers {
+        name: String,
+        var: String,
+        file: String,
+    },
     #[error("{path}: {source}")]
     Render {
         path: String,
@@ -427,6 +472,11 @@ pub fn run(
             no_newline,
         } => get(&root, env_seed, &name, copy, no_newline, stdout, stderr),
         Command::Gc { remove, names } => gc(&root, env_seed, remove, &names, stdout, stderr),
+        Command::Import {
+            stack,
+            exclude,
+            dry_run,
+        } => import_stack(&root, env_seed, &stack, &exclude, dry_run, stderr),
         Command::Render { stack, file } => {
             render_stack(&root, env_seed, &stack, file.as_deref(), stdout)
         }
@@ -854,6 +904,278 @@ fn rotate(
         stderr,
         "note: an app that only reads it on first start (e.g. a database's initial password) \
          keeps the old value; change it inside the app too",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// import
+// ---------------------------------------------------------------------------
+
+/// The state of the env file `rel` of stack `s` for [`import::plan`]. A
+/// symlink (also a symlinked directory on the way), a non-file and a
+/// non-UTF-8 file are not used: lst would edit or delete it.
+fn read_env_file(s: &Stack, rel: &str) -> Result<FileState, CliError> {
+    let mut path = s.dir.clone();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        path.push(part);
+        let shown = import::stack_path(&s.name, rel);
+        let Some(meta) = git::lstat(&path).map_err(io_err(Path::new(&shown)))? else {
+            return Ok(FileState::Missing);
+        };
+        if meta.file_type().is_symlink() {
+            return Ok(FileState::Unusable(
+                "a symlink (lst doesn't follow it)".into(),
+            ));
+        }
+        if i + 1 == parts.len() && !meta.is_file() {
+            return Ok(FileState::Unusable("not a regular file".into()));
+        }
+    }
+    let shown = import::stack_path(&s.name, rel);
+    let bytes = Zeroizing::new(fs::read(&path).map_err(io_err(Path::new(&shown)))?);
+    match std::str::from_utf8(&bytes) {
+        Ok(t) => Ok(FileState::Text(crypto::SecretString::new(t.to_owned()))),
+        Err(_) => Ok(FileState::Unusable("not UTF-8".into())),
+    }
+}
+
+/// `lst import <stack> [--exclude VAR]… [--dry-run]`: plans with
+/// [`import::plan`], checks the plan against `.sec/`, prints it (names,
+/// files and positions only), then seals the values, saves `.sec/`, writes
+/// `compose.yaml` and edits the env files, in that order (so an
+/// interrupted import leaves at most unused entries in `.sec/`, and running
+/// it again finishes the job).
+fn import_stack(
+    root: &Path,
+    env_seed: EnvSeed<'_>,
+    name: &str,
+    exclude: &[String],
+    dry_run: bool,
+    stderr: &mut dyn Write,
+) -> Result<(), CliError> {
+    let (seed, mut store) = open_store(root, env_seed)?;
+    let s = stack::find(root, name)?;
+    let (compose_path, compose) = read_compose(&s)?;
+    let set = scan::scan_file(&s.name, &compose_path, compose.as_bytes())?
+        .into_iter()
+        .find(|m| matches!(m, MarkerKind::Set { .. }));
+    if let Some(m) = set {
+        return Err(CliError::ImportSet {
+            path: compose_path,
+            name: m.name().to_owned(),
+        });
+    }
+
+    let mut wanted = import::env_file_paths(&compose);
+    wanted.insert(import::DOT_ENV.to_owned());
+    let mut files = BTreeMap::new();
+    for rel in &wanted {
+        files.insert(rel.clone(), read_env_file(&s, rel)?);
+    }
+    let exclude: BTreeSet<String> = exclude.iter().cloned().collect();
+    let plan = import::plan(&import::Input {
+        stack: &s.name,
+        compose: &compose,
+        files: &files,
+        exclude: &exclude,
+    })?;
+
+    // Against .sec/: never overwrite a different value, never shadow a gen.
+    for i in &plan.secrets {
+        let sc = store::scope(&s.name, &i.name)?;
+        let file = store.files().get(&sc.file);
+        if file.is_some_and(|f| f.generated.contains_key(&sc.key)) {
+            return Err(CliError::ImportGenExists {
+                name: sc.full_name,
+                var: i.var.clone(),
+            });
+        }
+        if file.is_some_and(|f| f.secrets.contains_key(&sc.key)) {
+            let got = store.get(&seed, &sc.full_name)?;
+            if got.value.expose() != i.value.expose() {
+                return Err(CliError::ImportDiffers {
+                    name: sc.full_name,
+                    var: i.var.clone(),
+                    file: import::stack_path(&s.name, &i.files[0]),
+                });
+            }
+        }
+    }
+
+    let would = if dry_run { "would " } else { "" };
+    let shown = |rel: &str| import::stack_path(&s.name, rel);
+    let changes =
+        !plan.secrets.is_empty() || plan.compose != *compose || !plan.env_files.is_empty();
+    for i in &plan.secrets {
+        let from: Vec<String> = i.files.iter().map(|f| shown(f)).collect();
+        note(
+            stderr,
+            &format!(
+                "{would}import {}/{} (from {} in {})",
+                s.name,
+                i.name,
+                i.var,
+                from.join(", ")
+            ),
+        );
+    }
+    for site in &plan.sites {
+        let at = format!("{compose_path}:{}:{}", site.line, site.col);
+        let marker = format!("<<secret:{}>>", site.var.to_lowercase());
+        if site.replaced {
+            note(
+                stderr,
+                &format!("{would}replace ${{{}}} with {marker} at {at}", site.var),
+            );
+        } else {
+            note(
+                stderr,
+                &format!(
+                    "warning: {at}: left ${{{}}} as it is: with the value written there, compose \
+                     would read something else (it probably needs YAML quoting: put the scalar \
+                     in single quotes and run lst import again)",
+                    site.var
+                ),
+            );
+        }
+    }
+    for b in &plan.blocks {
+        let of = match &b.service {
+            Some(svc) => format!("the env_file of service {svc} ({compose_path}:{})", b.line),
+            None => format!("the env_file at {compose_path}:{}", b.line),
+        };
+        match &b.outcome {
+            BlockOutcome::Replaced => {
+                note(
+                    stderr,
+                    &format!("{would}replace {of} with an environment: block"),
+                );
+            }
+            BlockOutcome::Merged => {
+                note(
+                    stderr,
+                    &format!("{would}move {of} into the service's environment:"),
+                );
+            }
+            BlockOutcome::Manual { why, snippet } => {
+                note(
+                    stderr,
+                    &format!(
+                        "warning: automatic replacement failed for {of}: {why}. Replace it by \
+                         hand (remove the env_file and add these entries to the service's \
+                         environment:; the values are imported, so the markers resolve):"
+                    ),
+                );
+                for l in snippet.lines() {
+                    let _ = writeln!(stderr, "    {l}");
+                }
+            }
+            BlockOutcome::LeftAlone { why } => {
+                note(stderr, &format!("left {of} alone: {why}"));
+            }
+        }
+    }
+    for n in &plan.not_imported {
+        let file = if n.file.starts_with("env_file of ") {
+            n.file.clone()
+        } else {
+            shown(&n.file)
+        };
+        note(
+            stderr,
+            &format!("not imported: {} ({file}): {}", n.var, n.why),
+        );
+    }
+    for e in &plan.env_files {
+        let msg = match e.contents {
+            Some(_) => format!(
+                "{would}remove {} from {}",
+                e.removed.join(", "),
+                shown(&e.file)
+            ),
+            None => format!(
+                "{would}delete {} (only {} was left in it)",
+                shown(&e.file),
+                e.removed.join(", ")
+            ),
+        };
+        note(stderr, &msg);
+    }
+    let unignored = |rel: &str| -> Result<Option<&str>, CliError> {
+        let path = PathBuf::from(shown(rel));
+        if git::is_tracked(root, &path)? {
+            Ok(Some(
+                "is tracked by git, so its values are in the history: once the import \
+                     works, give them new values (<<set:name:VALUE>>)",
+            ))
+        } else if !git::is_ignored(root, &path)? {
+            Ok(Some(
+                "is not gitignored: don't commit it (add it to .gitignore)",
+            ))
+        } else {
+            Ok(None)
+        }
+    };
+    for (rel, state) in &files {
+        if !matches!(state, FileState::Text(_)) {
+            continue;
+        }
+        let deleted = plan
+            .env_files
+            .iter()
+            .any(|e| e.file == *rel && e.contents.is_none());
+        let tracked = git::is_tracked(root, &PathBuf::from(shown(rel)))?;
+        if deleted && !tracked {
+            continue;
+        }
+        if let Some(what) = unignored(rel)? {
+            note(stderr, &format!("warning: {} {what}", shown(rel)));
+        }
+    }
+    if !changes {
+        note(stderr, &format!("nothing to import in stack {}", s.name));
+        return Ok(());
+    }
+    if dry_run {
+        note(stderr, "dry run: nothing was written");
+        return Ok(());
+    }
+
+    for i in &plan.secrets {
+        store.set_secret(&seed, &s.name, &i.name, i.value.expose())?;
+    }
+    store.save(&root.join(SEC_DIR))?;
+    if plan.compose != *compose {
+        let perms = fs::metadata(&s.compose)
+            .map_err(io_err(Path::new(&compose_path)))?
+            .permissions();
+        write_atomic(&s.compose, plan.compose.as_bytes(), |p| *p = perms)
+            .map_err(io_err(Path::new(&compose_path)))?;
+    }
+    for e in &plan.env_files {
+        let path = s.dir.join(&e.file);
+        let rel = shown(&e.file);
+        match &e.contents {
+            Some(text) => {
+                let perms = fs::metadata(&path)
+                    .map_err(io_err(Path::new(&rel)))?
+                    .permissions();
+                write_atomic(&path, text.expose().as_bytes(), |p| *p = perms)
+                    .map_err(io_err(Path::new(&rel)))?;
+            }
+            None => fs::remove_file(&path).map_err(io_err(Path::new(&rel)))?,
+        }
+    }
+    note(
+        stderr,
+        &format!(
+            "next: review the changes (git diff), commit them (the hook updates .sec/), then \
+             run `lst check` and `lst deploy {}`. The values are the same, so the containers \
+             keep their configuration",
+            s.name
+        ),
     );
     Ok(())
 }
